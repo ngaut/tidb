@@ -14,6 +14,8 @@
 package executor
 
 import (
+	"sync"
+
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
@@ -27,10 +29,18 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
 func (b *executorBuilder) buildPointGet(p *plan.PointGetPlan) Executor {
+	runnerMu.Lock()
+	if !isRunning {
+		go RunBatchReadonlyTxnGetWorker(b.ctx.GetStore())
+		isRunning = true
+	}
+	runnerMu.Unlock()
+
 	return &PointGetExecutor{
 		ctx:     b.ctx,
 		schema:  p.Schema(),
@@ -56,14 +66,77 @@ type PointGetExecutor struct {
 	done     bool
 }
 
+var (
+	runnerMu  sync.Mutex
+	isRunning = false
+)
+
 // Open implements the Executor interface.
-func (e *PointGetExecutor) Open(context.Context) error {
+func (e *PointGetExecutor) Open(ctx context.Context) error {
 	return nil
 }
 
 // Close implements the Executor interface.
 func (e *PointGetExecutor) Close() error {
 	return nil
+}
+
+type request struct {
+	key   []byte
+	wg    *sync.WaitGroup
+	err   error
+	value []byte
+}
+
+var pointgetChan = make(chan *request, 100)
+
+func readonlyPointGet(key []byte) ([]byte, error) {
+	req := &request{key: key, wg: &sync.WaitGroup{}}
+	req.wg.Add(1)
+	pointgetChan <- req
+	req.wg.Wait()
+	return req.value, req.err
+
+}
+
+func RunBatchReadonlyTxnGetWorker(store kv.Storage) {
+	//call BatchGet and dispatch
+	snap, err := store.GetSnapshot(kv.MaxVersion)
+	if err != nil {
+		//TODO: handle error
+		log.Fatal(err)
+	}
+
+	for {
+		req := <-pointgetChan
+		length := len(pointgetChan) + 1
+		if length > 1000 {
+			length = 1000
+		}
+		keys := make([]kv.Key, 0, length)
+		reqs := make([]*request, 0, length)
+
+		keys = append(keys, req.key)
+		reqs = append(reqs, req)
+		for i := 0; i < length-1; i++ {
+			req := <-pointgetChan
+			keys = append(keys, req.key)
+			reqs = append(reqs, req)
+		}
+
+		func([]kv.Key, kv.Snapshot, []*request) {
+			kvs, err := snap.BatchGet(keys)
+			if err != nil {
+				//TODO: handle error
+				log.Fatal(err)
+			}
+			for _, req := range reqs {
+				req.err = err
+				req.value = kvs[string(req.key)]
+				req.wg.Done()
+			}
+		}(keys, snap, reqs)
+	}
 }
 
 // Next implements the Executor interface.
@@ -131,7 +204,8 @@ func (e *PointGetExecutor) get(key kv.Key) (val []byte, err error) {
 	if txn != nil && txn.Valid() && !txn.IsReadOnly() {
 		return txn.Get(key)
 	}
-	return e.snapshot.Get(key)
+	//return e.snapshot.Get(key)
+	return readonlyPointGet(key)
 }
 
 func (e *PointGetExecutor) decodeRowValToChunk(rowVal []byte, chk *chunk.Chunk) error {
