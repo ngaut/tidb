@@ -358,7 +358,8 @@ func (p *basePlan) statsInfo() *statsInfo {
 }
 
 func (p *basePlan) ExplainID() string {
-	return fmt.Sprintf("%s_%d", p.tp, p.id)
+	return ""
+	//return fmt.Sprintf("%s_%d", p.tp, p.id)
 }
 
 // Schema implements Plan Schema interface.

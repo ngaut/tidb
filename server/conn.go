@@ -962,7 +962,7 @@ func (cc *clientConn) writeResultset(ctx context.Context, rs ResultSet, binary b
 }
 
 func (cc *clientConn) writeColumnInfo(columns []*ColumnInfo, serverStatus uint16) error {
-	data := make([]byte, 4, 1024)
+	data := cc.alloc.AllocWithLen(4, 1024)
 	data = dumpLengthEncodedInt(data, uint64(len(columns)))
 	if err := cc.writePacket(data); err != nil {
 		return errors.Trace(err)
@@ -984,7 +984,7 @@ func (cc *clientConn) writeColumnInfo(columns []*ColumnInfo, serverStatus uint16
 // binary specifies the way to dump data. It throws any error while dumping data.
 // serverStatus, a flag bit represents server information
 func (cc *clientConn) writeChunks(ctx context.Context, rs ResultSet, binary bool, serverStatus uint16) error {
-	data := make([]byte, 4, 1024)
+	data := cc.alloc.AllocWithLen(4, 1024)
 	chk := rs.NewChunk()
 	gotColumnInfo := false
 	for {

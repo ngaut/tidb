@@ -439,7 +439,7 @@ func (b *executorBuilder) buildPrepare(v *plan.Prepare) Executor {
 
 func (b *executorBuilder) buildExecute(v *plan.Execute) Executor {
 	e := &ExecuteExec{
-		baseExecutor: newBaseExecutor(b.ctx, v.Schema(), v.ExplainID()),
+		baseExecutor: newBaseExecutor(b.ctx, v.Schema(), "" /*v.ExplainID()*/),
 		is:           b.is,
 		name:         v.Name,
 		usingVars:    v.UsingVars,

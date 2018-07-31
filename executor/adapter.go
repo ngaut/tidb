@@ -112,9 +112,9 @@ func (a *recordSet) NewChunk() *chunk.Chunk {
 func (a *recordSet) Close() error {
 	err := a.executor.Close()
 	a.stmt.logSlowQuery(a.txnStartTS, a.lastErr == nil)
-	if a.processinfo != nil {
-		a.processinfo.SetProcessInfo("")
-	}
+	// if a.processinfo != nil {
+	// 	a.processinfo.SetProcessInfo("")
+	// }
 	return errors.Trace(err)
 }
 

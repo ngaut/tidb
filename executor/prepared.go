@@ -17,7 +17,6 @@ import (
 	"math"
 	"sort"
 
-	"fmt"
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/config"
@@ -350,11 +349,11 @@ func ResetStmtCtx(ctx sessionctx.Context, s ast.StmtNode) (err error) {
 		sessVars.LastInsertID = 0
 	}
 	sessVars.ResetPrevAffectedRows()
-	err = sessVars.SetSystemVar("warning_count", fmt.Sprintf("%d", sessVars.StmtCtx.NumWarnings(false)))
+	err = sessVars.SetSystemVar("warning_count" /*fmt.Sprintf("%d", sessVars.StmtCtx.NumWarnings(false))*/, "0")
 	if err != nil {
 		return errors.Trace(err)
 	}
-	err = sessVars.SetSystemVar("error_count", fmt.Sprintf("%d", sessVars.StmtCtx.NumWarnings(true)))
+	err = sessVars.SetSystemVar("error_count" /*fmt.Sprintf("%d", sessVars.StmtCtx.NumWarnings(true))*/, "0")
 	if err != nil {
 		return errors.Trace(err)
 	}

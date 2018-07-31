@@ -88,7 +88,7 @@ type request struct {
 	value []byte
 }
 
-var pointgetChan = make(chan *request, 100)
+var pointgetChan = make(chan *request, 1000)
 
 func readonlyPointGet(key []byte) ([]byte, error) {
 	req := &request{key: key, wg: &sync.WaitGroup{}}
@@ -110,8 +110,8 @@ func RunBatchReadonlyTxnGetWorker(store kv.Storage) {
 	for {
 		req := <-pointgetChan
 		length := len(pointgetChan) + 1
-		if length > 1000 {
-			length = 1000
+		if length > 512 {
+			length = 512
 		}
 		keys := make([]kv.Key, 0, length)
 		reqs := make([]*request, 0, length)
