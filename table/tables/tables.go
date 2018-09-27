@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/model"
@@ -39,7 +40,6 @@ import (
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/kvcache"
 	binlog "github.com/pingcap/tipb/go-binlog"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/spaolacci/murmur3"
 	"golang.org/x/net/context"
@@ -150,7 +150,6 @@ func initTableCommon(t *tableCommon, tblInfo *model.TableInfo, physicalTableID i
 	t.writableColumns = t.WritableCols()
 	t.writableIndices = t.WritableIndices()
 	t.recordPrefix = tablecodec.GenTableRecordPrefix(physicalTableID)
-	t.indexPrefix = tablecodec.GenTableIndexPrefix(physicalTableID)
 }
 
 // initTableIndices initializes the indices of the tableCommon.
@@ -250,11 +249,6 @@ func (t *tableCommon) WritableCols() []*table.Column {
 // RecordPrefix implements table.Table interface.
 func (t *tableCommon) RecordPrefix() kv.Key {
 	return t.recordPrefix
-}
-
-// IndexPrefix implements table.Table interface.
-func (t *tableCommon) IndexPrefix() kv.Key {
-	return t.indexPrefix
 }
 
 // RecordKey implements table.Table interface.
