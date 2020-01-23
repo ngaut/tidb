@@ -422,17 +422,17 @@ func (trs *tidbResultSet) Columns() []*ColumnInfo {
 
 func convertColumnInfo(fld *ast.ResultField) (ci *ColumnInfo) {
 	ci = &ColumnInfo{
-		Name:    fld.ColumnAsName.O,
+		Name:    []byte(fld.ColumnAsName.O),
 		OrgName: []byte(fld.Column.Name.O),
 		Table:   []byte(fld.TableAsName.O),
-		Schema:  fld.DBName.O,
+		Schema:  []byte(fld.DBName.O),
 		Flag:    uint16(fld.Column.Flag),
 		Charset: uint16(mysql.CharsetNameToID(fld.Column.Charset)),
 		Type:    fld.Column.Tp,
 	}
 
 	if fld.Table != nil {
-		ci.OrgTable = fld.Table.Name.O
+		ci.OrgTable = []byte(fld.Table.Name.O)
 	}
 	if fld.Column.Flen == types.UnspecifiedLength {
 		ci.ColumnLength = 0

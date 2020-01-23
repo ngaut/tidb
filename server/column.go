@@ -19,10 +19,10 @@ import (
 
 // ColumnInfo contains information of a column
 type ColumnInfo struct {
-	Schema             string
+	Schema             []byte
 	Table              []byte
-	OrgTable           string
-	Name               string
+	OrgTable           []byte
+	Name               []byte
 	OrgName            []byte
 	ColumnLength       uint32
 	Charset            uint16
@@ -36,10 +36,10 @@ type ColumnInfo struct {
 // Dump dumps ColumnInfo to bytes.
 func (column *ColumnInfo) Dump(buffer []byte) []byte {
 	buffer = dumpLengthEncodedString(buffer, []byte("def"))
-	buffer = dumpLengthEncodedString(buffer, []byte(column.Schema))
+	buffer = dumpLengthEncodedString(buffer, column.Schema)
 	buffer = dumpLengthEncodedString(buffer, column.Table)
-	buffer = dumpLengthEncodedString(buffer, []byte(column.OrgTable))
-	buffer = dumpLengthEncodedString(buffer, []byte(column.Name))
+	buffer = dumpLengthEncodedString(buffer, column.OrgTable)
+	buffer = dumpLengthEncodedString(buffer, column.Name)
 	buffer = dumpLengthEncodedString(buffer, column.OrgName)
 
 	buffer = append(buffer, 0x0c)
