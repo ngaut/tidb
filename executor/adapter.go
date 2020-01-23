@@ -867,6 +867,7 @@ func getPlanDigest(sctx sessionctx.Context, p plannercore.Plan) (normalized, pla
 
 // SummaryStmt collects statements for performance_schema.events_statements_summary_by_digest
 func (a *ExecStmt) SummaryStmt() {
+	return
 	sessVars := a.Ctx.GetSessionVars()
 	// Internal SQLs must also be recorded to keep the consistency of `PrevStmt` and `PrevStmtDigest`.
 	if !stmtsummary.StmtSummaryByDigestMap.Enabled() {

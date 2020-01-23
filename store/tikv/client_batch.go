@@ -573,28 +573,31 @@ func sendBatchRequest(
 		canceled: 0,
 		err:      nil,
 	}
-	ctx1, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	select {
-	case batchConn.batchCommandsCh <- entry:
-	case <-ctx1.Done():
-		logutil.BgLogger().Warn("send request is cancelled",
-			zap.String("to", addr), zap.String("cause", ctx1.Err().Error()))
-		return nil, errors.Trace(ctx1.Err())
-	}
 
-	select {
-	case res, ok := <-entry.res:
-		if !ok {
-			return nil, errors.Trace(entry.err)
-		}
-		return tikvrpc.FromBatchCommandsResponse(res), nil
-	case <-ctx1.Done():
-		atomic.StoreInt32(&entry.canceled, 1)
-		logutil.BgLogger().Warn("wait response is cancelled",
-			zap.String("to", addr), zap.String("cause", ctx1.Err().Error()))
-		return nil, errors.Trace(ctx1.Err())
-	}
+	batchConn.batchCommandsCh <- entry
+	return tikvrpc.FromBatchCommandsResponse(<-entry.res), nil
+	// ctx1, cancel := context.WithTimeout(ctx, timeout)
+	// defer cancel()
+	// select {
+	// case batchConn.batchCommandsCh <- entry:
+	// case <-ctx1.Done():
+	// 	logutil.BgLogger().Warn("send request is cancelled",
+	// 		zap.String("to", addr), zap.String("cause", ctx1.Err().Error()))
+	// 	return nil, errors.Trace(ctx1.Err())
+	// }
+
+	// select {
+	// case res, ok := <-entry.res:
+	// 	if !ok {
+	// 		return nil, errors.Trace(entry.err)
+	// 	}
+	// 	return tikvrpc.FromBatchCommandsResponse(res), nil
+	// case <-ctx1.Done():
+	// 	atomic.StoreInt32(&entry.canceled, 1)
+	// 	logutil.BgLogger().Warn("wait response is cancelled",
+	// 		zap.String("to", addr), zap.String("cause", ctx1.Err().Error()))
+	// 	return nil, errors.Trace(ctx1.Err())
+	// }
 }
 
 func (c *rpcClient) recycleIdleConnArray() {

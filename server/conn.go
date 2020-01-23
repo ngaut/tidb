@@ -281,6 +281,7 @@ func (cc *clientConn) writePacket(data []byte) error {
 
 // getSessionVarsWaitTimeout get session variable wait_timeout
 func (cc *clientConn) getSessionVarsWaitTimeout(ctx context.Context) uint64 {
+	return variable.DefWaitTimeout
 	valStr, exists := cc.ctx.GetSessionVars().GetSystemVar(variable.WaitTimeout)
 	if !exists {
 		return variable.DefWaitTimeout
@@ -646,19 +647,19 @@ func (cc *clientConn) Run(ctx context.Context) {
 
 		cc.alloc.Reset()
 		// close connection when idle time is more than wait_timeout
-		waitTimeout := cc.getSessionVarsWaitTimeout(ctx)
-		cc.pkt.setReadTimeout(time.Duration(waitTimeout) * time.Second)
-		start := time.Now()
+		//waitTimeout := cc.getSessionVarsWaitTimeout(ctx)
+		//cc.pkt.setReadTimeout(time.Duration(waitTimeout) * time.Second)
+		//start := time.Now()
 		data, err := cc.readPacket()
 		if err != nil {
 			if terror.ErrorNotEqual(err, io.EOF) {
 				if netErr, isNetErr := errors.Cause(err).(net.Error); isNetErr && netErr.Timeout() {
-					idleTime := time.Since(start)
-					logutil.Logger(ctx).Info("read packet timeout, close this connection",
-						zap.Duration("idle", idleTime),
-						zap.Uint64("waitTimeout", waitTimeout),
-						zap.Error(err),
-					)
+					// idleTime := time.Since(start)
+					// logutil.Logger(ctx).Info("read packet timeout, close this connection",
+					// 	zap.Duration("idle", idleTime),
+					// 	zap.Uint64("waitTimeout", waitTimeout),
+					// 	zap.Error(err),
+					// )
 				} else {
 					errStack := errors.ErrorStack(err)
 					if !strings.Contains(errStack, "use of closed network connection") {
@@ -674,10 +675,10 @@ func (cc *clientConn) Run(ctx context.Context) {
 			return
 		}
 
-		startTime := time.Now()
+		//	startTime := time.Now()
 		if err = cc.dispatch(ctx, data); err != nil {
 			if terror.ErrorEqual(err, io.EOF) {
-				cc.addMetrics(data[0], startTime, nil)
+				//	cc.addMetrics(data[0], startTime, nil)
 				return
 			} else if terror.ErrResultUndetermined.Equal(err) {
 				logutil.Logger(ctx).Error("result undetermined, close this connection", zap.Error(err))
@@ -706,7 +707,7 @@ func (cc *clientConn) Run(ctx context.Context) {
 			err1 := cc.writeError(err)
 			terror.Log(err1)
 		}
-		cc.addMetrics(data[0], startTime, err)
+		//cc.addMetrics(data[0], startTime, err)
 		cc.pkt.sequence = 0
 	}
 }
