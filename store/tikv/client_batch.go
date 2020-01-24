@@ -255,7 +255,7 @@ func (c *batchCommandsClient) failPendingRequests(err error) {
 		entry, _ := value.(*batchCommandsEntry)
 		entry.err = err
 		c.batched.Delete(id)
-		close(entry.res)
+		entry.wg.Done()
 		return true
 	})
 }
@@ -348,7 +348,8 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 			//logutil.Eventf(entry.ctx, "receive %T response with other %d batched requests from %s", responses[i].GetCmd(), len(responses), c.target)
 			if atomic.LoadInt32(&entry.canceled) == 0 {
 				// Put the response only if the request is not canceled.
-				entry.res <- responses[i]
+				entry.res = responses[i]
+				entry.wg.Done()
 			}
 			c.batched.Delete(requestID)
 		}
@@ -387,7 +388,8 @@ func (c *batchCommandsClient) reCreateStreamingClient(err error) (stopped bool) 
 type batchCommandsEntry struct {
 	ctx context.Context
 	req *tikvpb.BatchCommandsRequest_Request
-	res chan *tikvpb.BatchCommandsResponse_Response
+	res *tikvpb.BatchCommandsResponse_Response
+	wg  sync.WaitGroup
 
 	// canceled indicated the request is canceled or not.
 	canceled int32
@@ -494,7 +496,7 @@ func (a *batchConn) getClientAndSend(entries []*batchCommandsEntry, requests []*
 		for _, entry := range entries {
 			// Please ensure the error is handled in region cache correctly.
 			entry.err = errors.New("no available connections")
-			close(entry.res)
+			entry.wg.Done()
 		}
 		return
 	}
@@ -567,15 +569,14 @@ func sendBatchRequest(
 	timeout time.Duration,
 ) (*tikvrpc.Response, error) {
 	entry := &batchCommandsEntry{
-		ctx:      ctx,
-		req:      req,
-		res:      make(chan *tikvpb.BatchCommandsResponse_Response, 1),
-		canceled: 0,
-		err:      nil,
+		ctx: ctx,
+		req: req,
+		wg:  sync.WaitGroup{},
 	}
-
+	entry.wg.Add(1)
 	batchConn.batchCommandsCh <- entry
-	return tikvrpc.FromBatchCommandsResponse(<-entry.res), nil
+	entry.wg.Wait()
+	return tikvrpc.FromBatchCommandsResponse(entry.res), nil
 	// ctx1, cancel := context.WithTimeout(ctx, timeout)
 	// defer cancel()
 	// select {
