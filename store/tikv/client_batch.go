@@ -434,7 +434,7 @@ func (a *batchConn) batchSendLoop(cfg config.TiKVClient) {
 	requests := make([]*tikvpb.BatchCommandsRequest_Request, 0, cfg.MaxBatchSize)
 	requestIDs := make([]uint64, 0, cfg.MaxBatchSize)
 
-	var bestBatchWaitSize = cfg.BatchWaitSize
+	//var bestBatchWaitSize = cfg.BatchWaitSize
 	for {
 		// NOTE: We can't simply set entries = entries[:0] here.
 		// The data in the cap part of the slice would reference the prewrite keys whose
@@ -447,25 +447,25 @@ func (a *batchConn) batchSendLoop(cfg config.TiKVClient) {
 		a.pendingRequests.Set(float64(len(a.batchCommandsCh)))
 		a.fetchAllPendingRequests(int(cfg.MaxBatchSize), &entries, &requests)
 
-		if len(entries) < int(cfg.MaxBatchSize) && cfg.MaxBatchWaitTime > 0 {
-			// If the target TiKV is overload, wait a while to collect more requests.
-			if atomic.LoadUint64(&a.tikvTransportLayerLoad) >= uint64(cfg.OverloadThreshold) {
-				fetchMorePendingRequests(
-					a.batchCommandsCh, int(cfg.MaxBatchSize), int(bestBatchWaitSize),
-					cfg.MaxBatchWaitTime, &entries, &requests,
-				)
-			}
-		}
-		length := len(requests)
-		if uint(length) == 0 {
-			// The batch command channel is closed.
-			return
-		} else if uint(length) < bestBatchWaitSize && bestBatchWaitSize > 1 {
-			// Waits too long to collect requests, reduce the target batch size.
-			bestBatchWaitSize--
-		} else if uint(length) > bestBatchWaitSize+4 && bestBatchWaitSize < cfg.MaxBatchSize {
-			bestBatchWaitSize++
-		}
+		// if len(entries) < int(cfg.MaxBatchSize) && cfg.MaxBatchWaitTime > 0 {
+		// 	// If the target TiKV is overload, wait a while to collect more requests.
+		// 	if atomic.LoadUint64(&a.tikvTransportLayerLoad) >= uint64(cfg.OverloadThreshold) {
+		// 		fetchMorePendingRequests(
+		// 			a.batchCommandsCh, int(cfg.MaxBatchSize), int(bestBatchWaitSize),
+		// 			cfg.MaxBatchWaitTime, &entries, &requests,
+		// 		)
+		// 	}
+		// }
+		// length := len(requests)
+		// if uint(length) == 0 {
+		// 	// The batch command channel is closed.
+		// 	return
+		// } else if uint(length) < bestBatchWaitSize && bestBatchWaitSize > 1 {
+		// 	// Waits too long to collect requests, reduce the target batch size.
+		// 	bestBatchWaitSize--
+		// } else if uint(length) > bestBatchWaitSize+4 && bestBatchWaitSize < cfg.MaxBatchSize {
+		// 	bestBatchWaitSize++
+		// }
 
 		entries, requests = removeCanceledRequests(entries, requests)
 		if len(entries) == 0 {
