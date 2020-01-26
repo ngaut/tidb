@@ -822,14 +822,15 @@ func (cc *clientConn) dispatch(ctx context.Context, data []byte) error {
 		ctx = pprof.WithLabels(ctx, pprof.Labels("sql", parser.Normalize(lastSQL)))
 		pprof.SetGoroutineLabels(ctx)
 	}
-	token := cc.server.getToken()
+	//token := cc.server.getToken()
 	defer func() {
 		// if handleChangeUser failed, cc.ctx may be nil
 		if cc.ctx != nil {
-			cc.ctx.SetProcessInfo("", t, mysql.ComSleep, 0)
+			// not sure why we need this
+			//cc.ctx.SetProcessInfo("", t, mysql.ComSleep, 0)
 		}
 
-		cc.server.releaseToken(token)
+		//	cc.server.releaseToken(token)
 		span.Finish()
 	}()
 
