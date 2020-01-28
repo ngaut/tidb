@@ -840,12 +840,12 @@ func (cc *clientConn) dispatch(ctx context.Context, data []byte) error {
 		cc.ctx.SetCommandValue(cmd)
 	}
 
-	dataStr := string(hack.String(data))
 	switch cmd {
 	case mysql.ComPing, mysql.ComStmtClose, mysql.ComStmtSendLongData, mysql.ComStmtReset,
 		mysql.ComSetOption, mysql.ComChangeUser:
 		cc.ctx.SetProcessInfo("", t, cmd, 0)
 	case mysql.ComInitDB:
+		dataStr := string(hack.String(data))
 		cc.ctx.SetProcessInfo("use "+dataStr, t, cmd, 0)
 	}
 
@@ -858,6 +858,7 @@ func (cc *clientConn) dispatch(ctx context.Context, data []byte) error {
 	case mysql.ComQuit:
 		return io.EOF
 	case mysql.ComQuery: // Most frequently used command.
+		dataStr := string(hack.String(data))
 		// For issue 1989
 		// Input payload may end with byte '\0', we didn't find related mysql document about it, but mysql
 		// implementation accept that case. So trim the last '\0' here as if the payload an EOF string.
@@ -870,13 +871,16 @@ func (cc *clientConn) dispatch(ctx context.Context, data []byte) error {
 	case mysql.ComPing:
 		return cc.writeOK()
 	case mysql.ComInitDB:
+		dataStr := string(hack.String(data))
 		if err := cc.useDB(ctx, dataStr); err != nil {
 			return err
 		}
 		return cc.writeOK()
 	case mysql.ComFieldList:
+		dataStr := string(hack.String(data))
 		return cc.handleFieldList(dataStr)
 	case mysql.ComStmtPrepare:
+		dataStr := string(hack.String(data))
 		return cc.handleStmtPrepare(dataStr)
 	case mysql.ComStmtExecute:
 		return cc.handleStmtExecute(ctx, data)

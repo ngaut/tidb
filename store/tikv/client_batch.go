@@ -336,7 +336,9 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 		}
 
 		responses := resp.GetResponses()
-		for i, requestID := range resp.GetRequestIds() {
+		reqs := resp.GetRequestIds()
+		respbuf := make([]tikvrpc.Response, len(reqs))
+		for i, requestID := range reqs {
 			value, ok := c.batched.Load(requestID)
 			if !ok {
 				// There shouldn't be any unknown responses because if the old entries
@@ -344,13 +346,12 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 				// so that old responses will be never received.
 				panic("batchRecvLoop receives a unknown response")
 			}
+
+			tikvrpc.FromBatchCommandsResponse(&respbuf[i], responses[i])
 			entry := value.(*batchCommandsEntry)
-			//logutil.Eventf(entry.ctx, "receive %T response with other %d batched requests from %s", responses[i].GetCmd(), len(responses), c.target)
-			if atomic.LoadInt32(&entry.canceled) == 0 {
-				// Put the response only if the request is not canceled.
-				entry.res = responses[i]
-				entry.wg.Done()
-			}
+			entry.resp = &respbuf[i]
+			entry.wg.Done()
+
 			c.batched.Delete(requestID)
 		}
 
@@ -386,18 +387,12 @@ func (c *batchCommandsClient) reCreateStreamingClient(err error) (stopped bool) 
 }
 
 type batchCommandsEntry struct {
-	ctx context.Context
-	req *tikvpb.BatchCommandsRequest_Request
-	res *tikvpb.BatchCommandsResponse_Response
-	wg  sync.WaitGroup
+	ctx  context.Context
+	req  *tikvpb.BatchCommandsRequest_Request
+	resp *tikvrpc.Response
+	wg   sync.WaitGroup
 
-	// canceled indicated the request is canceled or not.
-	canceled int32
-	err      error
-}
-
-func (b *batchCommandsEntry) isCanceled() bool {
-	return atomic.LoadInt32(&b.canceled) == 1
+	err error
 }
 
 const idleTimeout = 3 * time.Minute
@@ -434,7 +429,6 @@ func (a *batchConn) batchSendLoop(cfg config.TiKVClient) {
 	requests := make([]*tikvpb.BatchCommandsRequest_Request, 0, cfg.MaxBatchSize)
 	requestIDs := make([]uint64, 0, cfg.MaxBatchSize)
 
-	//var bestBatchWaitSize = cfg.BatchWaitSize
 	for {
 		// NOTE: We can't simply set entries = entries[:0] here.
 		// The data in the cap part of the slice would reference the prewrite keys whose
@@ -446,32 +440,6 @@ func (a *batchConn) batchSendLoop(cfg config.TiKVClient) {
 
 		a.pendingRequests.Set(float64(len(a.batchCommandsCh)))
 		a.fetchAllPendingRequests(int(cfg.MaxBatchSize), &entries, &requests)
-
-		// if len(entries) < int(cfg.MaxBatchSize) && cfg.MaxBatchWaitTime > 0 {
-		// 	// If the target TiKV is overload, wait a while to collect more requests.
-		// 	if atomic.LoadUint64(&a.tikvTransportLayerLoad) >= uint64(cfg.OverloadThreshold) {
-		// 		fetchMorePendingRequests(
-		// 			a.batchCommandsCh, int(cfg.MaxBatchSize), int(bestBatchWaitSize),
-		// 			cfg.MaxBatchWaitTime, &entries, &requests,
-		// 		)
-		// 	}
-		// }
-		// length := len(requests)
-		// if uint(length) == 0 {
-		// 	// The batch command channel is closed.
-		// 	return
-		// } else if uint(length) < bestBatchWaitSize && bestBatchWaitSize > 1 {
-		// 	// Waits too long to collect requests, reduce the target batch size.
-		// 	bestBatchWaitSize--
-		// } else if uint(length) > bestBatchWaitSize+4 && bestBatchWaitSize < cfg.MaxBatchSize {
-		// 	bestBatchWaitSize++
-		// }
-
-		entries, requests = removeCanceledRequests(entries, requests)
-		if len(entries) == 0 {
-			continue // All requests are canceled.
-		}
-
 		a.getClientAndSend(entries, requests, requestIDs)
 	}
 }
@@ -547,20 +515,6 @@ func (a *batchConn) Close() {
 	close(a.closed)
 }
 
-// removeCanceledRequests removes canceled requests before sending.
-func removeCanceledRequests(entries []*batchCommandsEntry,
-	requests []*tikvpb.BatchCommandsRequest_Request) ([]*batchCommandsEntry, []*tikvpb.BatchCommandsRequest_Request) {
-	validEntries := entries[:0]
-	validRequests := requests[:0]
-	for _, e := range entries {
-		if !e.isCanceled() {
-			validEntries = append(validEntries, e)
-			validRequests = append(validRequests, e.req)
-		}
-	}
-	return validEntries, validRequests
-}
-
 func sendBatchRequest(
 	ctx context.Context,
 	addr string,
@@ -571,34 +525,11 @@ func sendBatchRequest(
 	entry := &batchCommandsEntry{
 		ctx: ctx,
 		req: req,
-		wg:  sync.WaitGroup{},
 	}
 	entry.wg.Add(1)
 	batchConn.batchCommandsCh <- entry
 	entry.wg.Wait()
-	return tikvrpc.FromBatchCommandsResponse(entry.res), nil
-	// ctx1, cancel := context.WithTimeout(ctx, timeout)
-	// defer cancel()
-	// select {
-	// case batchConn.batchCommandsCh <- entry:
-	// case <-ctx1.Done():
-	// 	logutil.BgLogger().Warn("send request is cancelled",
-	// 		zap.String("to", addr), zap.String("cause", ctx1.Err().Error()))
-	// 	return nil, errors.Trace(ctx1.Err())
-	// }
-
-	// select {
-	// case res, ok := <-entry.res:
-	// 	if !ok {
-	// 		return nil, errors.Trace(entry.err)
-	// 	}
-	// 	return tikvrpc.FromBatchCommandsResponse(res), nil
-	// case <-ctx1.Done():
-	// 	atomic.StoreInt32(&entry.canceled, 1)
-	// 	logutil.BgLogger().Warn("wait response is cancelled",
-	// 		zap.String("to", addr), zap.String("cause", ctx1.Err().Error()))
-	// 	return nil, errors.Trace(ctx1.Err())
-	// }
+	return entry.resp, nil
 }
 
 func (c *rpcClient) recycleIdleConnArray() {

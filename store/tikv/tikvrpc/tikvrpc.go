@@ -426,60 +426,61 @@ type Response struct {
 }
 
 // FromBatchCommandsResponse converts a BatchCommands response to Response.
-func FromBatchCommandsResponse(res *tikvpb.BatchCommandsResponse_Response) *Response {
+func FromBatchCommandsResponse(resp *Response, res *tikvpb.BatchCommandsResponse_Response) {
 	switch res := res.GetCmd().(type) {
 	case *tikvpb.BatchCommandsResponse_Response_Get:
-		return &Response{Resp: res.Get}
+		resp.Resp = res.Get
 	case *tikvpb.BatchCommandsResponse_Response_Scan:
-		return &Response{Resp: res.Scan}
+		resp.Resp = res.Scan
 	case *tikvpb.BatchCommandsResponse_Response_Prewrite:
-		return &Response{Resp: res.Prewrite}
+		resp.Resp = res.Prewrite
 	case *tikvpb.BatchCommandsResponse_Response_Commit:
-		return &Response{Resp: res.Commit}
+		resp.Resp = res.Commit
 	case *tikvpb.BatchCommandsResponse_Response_Cleanup:
-		return &Response{Resp: res.Cleanup}
+		resp.Resp = res.Cleanup
 	case *tikvpb.BatchCommandsResponse_Response_BatchGet:
-		return &Response{Resp: res.BatchGet}
+		resp.Resp = res.BatchGet
 	case *tikvpb.BatchCommandsResponse_Response_BatchRollback:
-		return &Response{Resp: res.BatchRollback}
+		resp.Resp = res.BatchRollback
 	case *tikvpb.BatchCommandsResponse_Response_ScanLock:
-		return &Response{Resp: res.ScanLock}
+		resp.Resp = res.ScanLock
 	case *tikvpb.BatchCommandsResponse_Response_ResolveLock:
-		return &Response{Resp: res.ResolveLock}
+		resp.Resp = res.ResolveLock
 	case *tikvpb.BatchCommandsResponse_Response_GC:
-		return &Response{Resp: res.GC}
+		resp.Resp = res.GC
 	case *tikvpb.BatchCommandsResponse_Response_DeleteRange:
-		return &Response{Resp: res.DeleteRange}
+		resp.Resp = res.DeleteRange
 	case *tikvpb.BatchCommandsResponse_Response_RawGet:
-		return &Response{Resp: res.RawGet}
+		resp.Resp = res.RawGet
 	case *tikvpb.BatchCommandsResponse_Response_RawBatchGet:
-		return &Response{Resp: res.RawBatchGet}
+		resp.Resp = res.RawBatchGet
 	case *tikvpb.BatchCommandsResponse_Response_RawPut:
-		return &Response{Resp: res.RawPut}
+		resp.Resp = res.RawPut
 	case *tikvpb.BatchCommandsResponse_Response_RawBatchPut:
-		return &Response{Resp: res.RawBatchPut}
+		resp.Resp = res.RawBatchPut
 	case *tikvpb.BatchCommandsResponse_Response_RawDelete:
-		return &Response{Resp: res.RawDelete}
+		resp.Resp = res.RawDelete
 	case *tikvpb.BatchCommandsResponse_Response_RawBatchDelete:
-		return &Response{Resp: res.RawBatchDelete}
+		resp.Resp = res.RawBatchDelete
 	case *tikvpb.BatchCommandsResponse_Response_RawDeleteRange:
-		return &Response{Resp: res.RawDeleteRange}
+		resp.Resp = res.RawDeleteRange
 	case *tikvpb.BatchCommandsResponse_Response_RawScan:
-		return &Response{Resp: res.RawScan}
+		resp.Resp = res.RawScan
 	case *tikvpb.BatchCommandsResponse_Response_Coprocessor:
-		return &Response{Resp: res.Coprocessor}
+		resp.Resp = res.Coprocessor
 	case *tikvpb.BatchCommandsResponse_Response_PessimisticLock:
-		return &Response{Resp: res.PessimisticLock}
+		resp.Resp = res.PessimisticLock
 	case *tikvpb.BatchCommandsResponse_Response_PessimisticRollback:
-		return &Response{Resp: res.PessimisticRollback}
+		resp.Resp = res.PessimisticRollback
 	case *tikvpb.BatchCommandsResponse_Response_Empty:
-		return &Response{Resp: res.Empty}
+		resp.Resp = res.Empty
 	case *tikvpb.BatchCommandsResponse_Response_TxnHeartBeat:
-		return &Response{Resp: res.TxnHeartBeat}
+		resp.Resp = res.TxnHeartBeat
 	case *tikvpb.BatchCommandsResponse_Response_CheckTxnStatus:
-		return &Response{Resp: res.CheckTxnStatus}
+		resp.Resp = res.CheckTxnStatus
+	default:
+		panic("")
 	}
-	return nil
 }
 
 // CopStreamResponse combinates tikvpb.Tikv_CoprocessorStreamClient and the first Recv() result together.
