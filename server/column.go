@@ -74,10 +74,10 @@ func dumpFlag(tp byte, flag uint16) uint16 {
 }
 
 func dumpType(tp byte) byte {
-	switch tp {
-	case mysql.TypeSet, mysql.TypeEnum:
+	// use if instead of switch, so that compiler can inline this function
+	if tp == mysql.TypeSet || tp == mysql.TypeEnum {
 		return mysql.TypeString
-	default:
-		return tp
 	}
+
+	return tp
 }
