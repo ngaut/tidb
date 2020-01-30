@@ -218,6 +218,7 @@ func (sc *StatementContext) AffectedRows() uint64 {
 // FoundRows gets found rows.
 func (sc *StatementContext) FoundRows() uint64 {
 	sc.mu.Lock()
+	//TODO: use atomic integer instead of using lock
 	rows := sc.mu.foundRows
 	sc.mu.Unlock()
 	return rows
