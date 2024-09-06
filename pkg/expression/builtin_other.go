@@ -16,8 +16,10 @@ package expression
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
+	"context"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/expression/contextopt"
@@ -30,6 +32,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/set"
 	"github.com/pingcap/tidb/pkg/util/stringutil"
 	"github.com/pingcap/tipb/go-tipb"
+	"github.com/sashabaranov/go-openai"
 )
 
 var (
@@ -46,6 +49,7 @@ var (
 	_ functionClass = &valuesFunctionClass{}
 	_ functionClass = &bitCountFunctionClass{}
 	_ functionClass = &getParamFunctionClass{}
+	_ functionClass = &aiProcessFunctionClass{}
 )
 
 var (
@@ -57,6 +61,7 @@ var (
 	_ builtinFunc = &builtinInTimeSig{}
 	_ builtinFunc = &builtinInDurationSig{}
 	_ builtinFunc = &builtinInJSONSig{}
+	_ builtinFunc = &builtinInVectorFloat32Sig{}
 	_ builtinFunc = &builtinRowSig{}
 	_ builtinFunc = &builtinSetStringVarSig{}
 	_ builtinFunc = &builtinSetIntVarSig{}
@@ -78,6 +83,7 @@ var (
 	_ builtinFunc = &builtinValuesJSONSig{}
 	_ builtinFunc = &builtinBitCountSig{}
 	_ builtinFunc = &builtinGetParamStringSig{}
+	_ builtinFunc = &builtinAIProcessSig{}
 )
 
 type inFunctionClass struct {
@@ -91,17 +97,17 @@ func (c *inFunctionClass) getFunction(ctx BuildContext, args []Expression) (sig 
 	}
 	argTps := make([]types.EvalType, len(args))
 	for i := range args {
-		argTps[i] = args[0].GetType().EvalType()
+		argTps[i] = args[0].GetType(ctx.GetEvalCtx()).EvalType()
 	}
 	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, argTps...)
 	if err != nil {
 		return nil, err
 	}
 	for i := 1; i < len(args); i++ {
-		DisableParseJSONFlag4Expr(args[i])
+		DisableParseJSONFlag4Expr(ctx.GetEvalCtx(), args[i])
 	}
 	bf.tp.SetFlen(1)
-	switch args[0].GetType().EvalType() {
+	switch args[0].GetType(ctx.GetEvalCtx()).EvalType() {
 	case types.ETInt:
 		inInt := builtinInIntSig{baseInSig: baseInSig{baseBuiltinFunc: bf}}
 		err := inInt.buildHashMapForConstArgs(ctx)
@@ -153,12 +159,17 @@ func (c *inFunctionClass) getFunction(ctx BuildContext, args []Expression) (sig 
 	case types.ETJson:
 		sig = &builtinInJSONSig{baseBuiltinFunc: bf}
 		sig.setPbCode(tipb.ScalarFuncSig_InJson)
+	case types.ETVectorFloat32:
+		sig = &builtinInVectorFloat32Sig{baseBuiltinFunc: bf}
+		// sig.setPbCode(tipb.ScalarFuncSig_InVectorFloat32)
+	default:
+		return nil, errors.Errorf("%s is not supported for IN()", args[0].GetType(ctx.GetEvalCtx()).EvalType())
 	}
 	return sig, nil
 }
 
 func (c *inFunctionClass) verifyArgs(ctx BuildContext, args []Expression) ([]Expression, error) {
-	columnType := args[0].GetType()
+	columnType := args[0].GetType(ctx.GetEvalCtx())
 	validatedArgs := make([]Expression, 0, len(args))
 	for _, arg := range args {
 		if constant, ok := arg.(*Constant); ok {
@@ -207,7 +218,7 @@ func (b *builtinInIntSig) buildHashMapForConstArgs(ctx BuildContext) error {
 				b.hasNull = true
 				continue
 			}
-			b.hashSet[val] = mysql.HasUnsignedFlag(b.args[i].GetType().GetFlag())
+			b.hashSet[val] = mysql.HasUnsignedFlag(b.args[i].GetType(ctx.GetEvalCtx()).GetFlag())
 		} else {
 			b.nonConstArgsIdx = append(b.nonConstArgsIdx, i)
 		}
@@ -230,7 +241,7 @@ func (b *builtinInIntSig) evalInt(ctx EvalContext, row chunk.Row) (int64, bool, 
 	if isNull0 || err != nil {
 		return 0, isNull0, err
 	}
-	isUnsigned0 := mysql.HasUnsignedFlag(b.args[0].GetType().GetFlag())
+	isUnsigned0 := mysql.HasUnsignedFlag(b.args[0].GetType(ctx).GetFlag())
 
 	args := b.args[1:]
 	if len(b.hashSet) != 0 {
@@ -258,7 +269,7 @@ func (b *builtinInIntSig) evalInt(ctx EvalContext, row chunk.Row) (int64, bool, 
 			hasNull = true
 			continue
 		}
-		isUnsigned := mysql.HasUnsignedFlag(arg.GetType().GetFlag())
+		isUnsigned := mysql.HasUnsignedFlag(arg.GetType(ctx).GetFlag())
 		if isUnsigned0 && isUnsigned {
 			if evaledArg == arg0 {
 				return 1, false, nil
@@ -681,6 +692,39 @@ func (b *builtinInJSONSig) evalInt(ctx EvalContext, row chunk.Row) (int64, bool,
 	return 0, hasNull, nil
 }
 
+type builtinInVectorFloat32Sig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinInVectorFloat32Sig) Clone() builtinFunc {
+	newSig := &builtinInVectorFloat32Sig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+func (b *builtinInVectorFloat32Sig) evalInt(ctx EvalContext, row chunk.Row) (int64, bool, error) {
+	arg0, isNull0, err := b.args[0].EvalVectorFloat32(ctx, row)
+	if isNull0 || err != nil {
+		return 0, isNull0, err
+	}
+	var hasNull bool
+	for _, arg := range b.args[1:] {
+		evaledArg, isNull, err := arg.EvalVectorFloat32(ctx, row)
+		if err != nil {
+			return 0, true, err
+		}
+		if isNull {
+			hasNull = true
+			continue
+		}
+		result := arg0.Compare(evaledArg)
+		if result == 0 {
+			return 1, false, nil
+		}
+	}
+	return 0, hasNull, nil
+}
+
 type rowFunctionClass struct {
 	baseFunctionClass
 }
@@ -690,8 +734,8 @@ func (c *rowFunctionClass) getFunction(ctx BuildContext, args []Expression) (sig
 		return nil, err
 	}
 	argTps := make([]types.EvalType, len(args))
-	for i := range argTps {
-		argTps[i] = args[i].GetType().EvalType()
+	for i := range args {
+		argTps[i] = args[i].GetType(ctx.GetEvalCtx()).EvalType()
 	}
 	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETString, argTps...)
 	if err != nil {
@@ -724,7 +768,7 @@ func (c *setVarFunctionClass) getFunction(ctx BuildContext, args []Expression) (
 	if err = c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	argTp := args[1].GetType().EvalType()
+	argTp := args[1].GetType(ctx.GetEvalCtx()).EvalType()
 	if argTp == types.ETTimestamp || argTp == types.ETDuration || argTp == types.ETJson {
 		argTp = types.ETString
 	}
@@ -732,7 +776,7 @@ func (c *setVarFunctionClass) getFunction(ctx BuildContext, args []Expression) (
 	if err != nil {
 		return nil, err
 	}
-	bf.tp.SetFlenUnderLimit(args[1].GetType().GetFlen())
+	bf.tp.SetFlenUnderLimit(args[1].GetType(ctx.GetEvalCtx()).GetFlen())
 	switch argTp {
 	case types.ETString:
 		sig = &builtinSetStringVarSig{baseBuiltinFunc: bf}
@@ -1265,6 +1309,10 @@ func (c *valuesFunctionClass) getFunction(ctx BuildContext, args []Expression) (
 		sig = &builtinValuesDurationSig{baseBuiltinFunc: bf, offset: c.offset}
 	case types.ETJson:
 		sig = &builtinValuesJSONSig{baseBuiltinFunc: bf, offset: c.offset}
+	case types.ETVectorFloat32:
+		sig = &builtinValuesVectorFloat32Sig{baseBuiltinFunc: bf, offset: c.offset}
+	default:
+		return nil, errors.Errorf("%s is not supported for VALUES()", c.tp.EvalType())
 	}
 	return sig, nil
 }
@@ -1554,6 +1602,43 @@ func (b *builtinValuesJSONSig) evalJSON(ctx EvalContext, _ chunk.Row) (types.Bin
 	return types.BinaryJSON{}, true, errors.Errorf("Session current insert values len %d and column's offset %v don't match", row.Len(), b.offset)
 }
 
+type builtinValuesVectorFloat32Sig struct {
+	baseBuiltinFunc
+	contextopt.SessionVarsPropReader
+
+	offset int
+}
+
+func (b *builtinValuesVectorFloat32Sig) Clone() builtinFunc {
+	newSig := &builtinValuesVectorFloat32Sig{offset: b.offset}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+func (b *builtinValuesVectorFloat32Sig) RequiredOptionalEvalProps() OptionalEvalPropKeySet {
+	return b.SessionVarsPropReader.RequiredOptionalEvalProps()
+}
+
+// evalVectorFloat32 evals a builtinValuesVectorFloat32Sig.
+// See https://dev.mysql.com/doc/refman/5.7/en/miscellaneous-functions.html#function_values
+func (b *builtinValuesVectorFloat32Sig) evalVectorFloat32(ctx EvalContext, _ chunk.Row) (types.VectorFloat32, bool, error) {
+	sessionvar, err := b.GetSessionVars(ctx)
+	if err != nil {
+		return types.ZeroVectorFloat32, true, err
+	}
+	row := sessionvar.CurrInsertValues
+	if row.IsEmpty() {
+		return types.ZeroVectorFloat32, true, nil
+	}
+	if b.offset < row.Len() {
+		if row.IsNull(b.offset) {
+			return types.ZeroVectorFloat32, true, nil
+		}
+		return row.GetVectorFloat32(b.offset), false, nil
+	}
+	return types.ZeroVectorFloat32, true, errors.Errorf("Session current insert values len %d and column's offset %v don't match", row.Len(), b.offset)
+}
+
 type bitCountFunctionClass struct {
 	baseFunctionClass
 }
@@ -1616,7 +1701,6 @@ func (c *getParamFunctionClass) getFunction(ctx BuildContext, args []Expression)
 
 type builtinGetParamStringSig struct {
 	baseBuiltinFunc
-	contextopt.SessionVarsPropReader
 }
 
 func (b *builtinGetParamStringSig) Clone() builtinFunc {
@@ -1625,24 +1709,98 @@ func (b *builtinGetParamStringSig) Clone() builtinFunc {
 	return newSig
 }
 
-func (b *builtinGetParamStringSig) RequiredOptionalEvalProps() OptionalEvalPropKeySet {
-	return b.SessionVarsPropReader.RequiredOptionalEvalProps()
-}
-
 func (b *builtinGetParamStringSig) evalString(ctx EvalContext, row chunk.Row) (string, bool, error) {
-	sessionVars, err := b.GetSessionVars(ctx)
-	if err != nil {
-		return "", true, err
-	}
 	idx, isNull, err := b.args[0].EvalInt(ctx, row)
 	if isNull || err != nil {
 		return "", isNull, err
 	}
-	v := sessionVars.PlanCacheParams.GetParamValue(int(idx))
+
+	v, err := ctx.GetParamValue(int(idx))
+	if err != nil {
+		return "", true, err
+	}
 
 	str, err := v.ToString()
 	if err != nil {
 		return "", true, nil
 	}
 	return str, false, nil
+}
+
+
+type aiProcessFunctionClass struct {
+    baseFunctionClass
+}
+
+type builtinAIProcessSig struct {
+    baseBuiltinFunc
+}
+
+func (c *aiProcessFunctionClass) getFunction(ctx BuildContext, args []Expression) (builtinFunc, error) {
+    if err := c.verifyArgs(args); err != nil {
+        return nil, err
+    }
+    bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETString, types.ETString, types.ETString)
+    if err != nil {
+        return nil, err
+    }
+    sig := &builtinAIProcessSig{bf}
+    return sig, nil
+}
+
+func (b *builtinAIProcessSig) Clone() builtinFunc {
+    newSig := &builtinAIProcessSig{}
+    newSig.cloneFrom(&b.baseBuiltinFunc)
+    return newSig
+}
+
+
+func (b *builtinAIProcessSig) evalString(ctx EvalContext, row chunk.Row) (string, bool, error) {
+    data, isNull, err := b.args[0].EvalString(ctx, row)
+    if isNull || err != nil {
+        return "", true, err
+    }
+    taskDescription, isNull, err := b.args[1].EvalString(ctx, row)
+    if isNull || err != nil {
+        return "", true, err
+    }
+    
+    // Get the API key from env variable
+    apiKey := os.Getenv("OPENAI_API_KEY")
+    if apiKey == "" {
+        return "", true, errors.New("OPENAI_API_KEY is not set")
+    }
+
+    // Create a new context for the API calls
+    apiCtx := context.Background()
+
+    // Initialize OpenAI client
+    client := openai.NewClient(apiKey)
+
+    // Generate content
+    prompt := fmt.Sprintf("Process the following data: %s\nTask description: %s\n", data, taskDescription)
+    resp, err := client.CreateChatCompletion(
+        apiCtx,
+        openai.ChatCompletionRequest{
+            Model: openai.GPT4oMini,
+            Messages: []openai.ChatCompletionMessage{
+                {
+                    Role:    openai.ChatMessageRoleUser,
+                    Content: prompt,
+                },
+            },
+        },
+    )
+
+    if err != nil {
+        return "", true, fmt.Errorf("failed to generate content: %v", err)
+    }
+
+    // Extract the generated text from the response
+    if len(resp.Choices) == 0 {
+        return "", true, errors.New("no content generated")
+    }
+    generatedText := resp.Choices[0].Message.Content
+
+    return generatedText, false, nil
 }

@@ -348,12 +348,23 @@ const (
 	JSONMergePreserve = "json_merge_preserve"
 	JSONPretty        = "json_pretty"
 	JSONQuote         = "json_quote"
+	JSONSchemaValid   = "json_schema_valid"
 	JSONSearch        = "json_search"
 	JSONStorageFree   = "json_storage_free"
 	JSONStorageSize   = "json_storage_size"
 	JSONDepth         = "json_depth"
 	JSONKeys          = "json_keys"
 	JSONLength        = "json_length"
+
+	// vector functions (tidb extension)
+	VecDims                 = "vec_dims"
+	VecL1Distance           = "vec_l1_distance"
+	VecL2Distance           = "vec_l2_distance"
+	VecNegativeInnerProduct = "vec_negative_inner_product"
+	VecCosineDistance       = "vec_cosine_distance"
+	VecL2Norm               = "vec_l2_norm"
+	VecFromText             = "vec_from_text"
+	VecAsText               = "vec_as_text"
 
 	// TiDB internal function.
 	TiDBDecodeKey       = "tidb_decode_key"
@@ -366,6 +377,9 @@ const (
 	NextVal = "nextval"
 	LastVal = "lastval"
 	SetVal  = "setval"
+
+	// New builtin function
+	AIProcess = "ai_process"
 )
 
 type FuncCallExprType int8
@@ -1167,4 +1181,47 @@ func (n *GetFormatSelectorExpr) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	return v.Leave(n)
+}
+
+
+// AiProcess is the function for AI processing
+type AiProcess struct {
+    funcNode
+    Data            ExprNode
+    TaskDescription ExprNode
+}
+
+// Restore implements Node interface.
+func (n *AiProcess) Restore(ctx *format.RestoreCtx) error {
+    ctx.WriteKeyWord("AI_PROCESS")
+    ctx.WritePlain("(")
+    if err := n.Data.Restore(ctx); err != nil {
+        return errors.Annotate(err, "An error occurred while restoring AiProcess Data")
+    }
+    ctx.WritePlain(", ")
+    if err := n.TaskDescription.Restore(ctx); err != nil {
+        return errors.Annotate(err, "An error occurred while restoring AiProcess TaskDescription")
+    }
+    ctx.WritePlain(")")
+    return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *AiProcess) Accept(v Visitor) (Node, bool) {
+    newNode, skipChildren := v.Enter(n)
+    if skipChildren {
+        return v.Leave(newNode)
+    }
+    n = newNode.(*AiProcess)
+    node, ok := n.Data.Accept(v)
+    if !ok {
+        return n, false
+    }
+    n.Data = node.(ExprNode)
+    node, ok = n.TaskDescription.Accept(v)
+    if !ok {
+        return n, false
+    }
+    n.TaskDescription = node.(ExprNode)
+    return v.Leave(n)
 }

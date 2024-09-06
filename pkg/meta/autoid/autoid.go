@@ -28,8 +28,8 @@ import (
 	"github.com/pingcap/kvproto/pkg/autoid"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/metrics"
-	"github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/dbterror"
@@ -654,7 +654,7 @@ func NewSequenceAllocator(store kv.Storage, dbID, tbID int64, info *model.Sequen
 func NewAllocatorsFromTblInfo(r Requirement, schemaID int64, tblInfo *model.TableInfo) Allocators {
 	var allocs []Allocator
 	dbID := tblInfo.GetAutoIDSchemaID(schemaID)
-	idCacheOpt := CustomAutoIncCacheOption(tblInfo.AutoIdCache)
+	idCacheOpt := CustomAutoIncCacheOption(tblInfo.AutoIDCache)
 	tblVer := AllocOptionTableInfoVersion(tblInfo.Version)
 
 	hasRowID := !tblInfo.PKIsHandle && !tblInfo.IsCommonHandle
@@ -933,11 +933,13 @@ func (alloc *allocator) alloc4Signed(ctx context.Context, n uint64, increment, o
 		}
 		alloc.base, alloc.end = newBase, newEnd
 	}
-	logutil.Logger(context.TODO()).Debug("alloc N signed ID",
-		zap.Uint64("from ID", uint64(alloc.base)),
-		zap.Uint64("to ID", uint64(alloc.base+n1)),
-		zap.Int64("table ID", alloc.tbID),
-		zap.Int64("database ID", alloc.dbID))
+	if logutil.BgLogger().Core().Enabled(zap.DebugLevel) {
+		logutil.BgLogger().Debug("alloc N signed ID",
+			zap.Uint64("from ID", uint64(alloc.base)),
+			zap.Uint64("to ID", uint64(alloc.base+n1)),
+			zap.Int64("table ID", alloc.tbID),
+			zap.Int64("database ID", alloc.dbID))
+	}
 	mini = alloc.base
 	alloc.base += n1
 	return mini, alloc.base, nil

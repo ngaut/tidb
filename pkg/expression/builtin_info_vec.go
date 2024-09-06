@@ -268,7 +268,7 @@ func (b *builtinBenchmarkSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, re
 	n := input.NumRows()
 	loopCount := b.constLoopCount
 	arg := b.args[1]
-	evalType := arg.GetType().EvalType()
+	evalType := arg.GetType(ctx).EvalType()
 	buf, err := b.bufAllocator.get()
 	if err != nil {
 		return err
@@ -320,7 +320,7 @@ func (b *builtinBenchmarkSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, re
 			}
 		}
 	default: // Should never go into here.
-		return errors.Errorf("EvalType %v not implemented for builtin BENCHMARK()", evalType)
+		return errors.Errorf("%s is not supported for BENCHMARK()", evalType)
 	}
 
 	// Return value of BENCHMARK() is always 0.

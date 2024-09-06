@@ -112,6 +112,8 @@ func (e *TopNExec) Open(ctx context.Context) error {
 		)
 		e.spillAction = &topNSpillAction{spillHelper: e.spillHelper}
 		e.Ctx().GetSessionVars().MemTracker.FallbackOldAndSetNewAction(e.spillAction)
+	} else {
+		e.spillHelper = newTopNSpillerHelper(e, nil, nil, nil, nil, nil, nil, 0)
 	}
 
 	return exec.Open(ctx, e.Children(0))
@@ -261,8 +263,16 @@ func (e *TopNExec) fetchChunks(ctx context.Context) error {
 }
 
 func (e *TopNExec) loadChunksUntilTotalLimit(ctx context.Context) error {
-	e.initCompareFuncs()
-	e.buildKeyColumns()
+	err := e.initCompareFuncs(e.Ctx().GetExprCtx().GetEvalCtx())
+	if err != nil {
+		return err
+	}
+
+	err = e.buildKeyColumns()
+	if err != nil {
+		return err
+	}
+
 	e.chkHeap.init(e, e.memTracker, e.Limit.Offset+e.Limit.Count, int(e.Limit.Offset), e.greaterRow, e.RetFieldTypes())
 	for uint64(e.chkHeap.rowChunks.Len()) < e.chkHeap.totalLimit {
 		srcChk := exec.TryNewCacheChunk(e.Children(0))
@@ -415,17 +425,18 @@ func (e *TopNExec) executeTopNWhenSpillTriggered(ctx context.Context) error {
 	// Wait for the finish of all workers
 	workersWaiter := util.WaitGroupWrapper{}
 
-	// Fetch chunks from child and put chunks into chunkChannel
-	fetcherWaiter.Run(func() {
-		e.fetchChunksFromChild(ctx)
-	})
-
 	for i := range e.spillHelper.workers {
 		worker := e.spillHelper.workers[i]
+		worker.initWorker()
 		workersWaiter.Run(func() {
 			worker.run()
 		})
 	}
+
+	// Fetch chunks from child and put chunks into chunkChannel
+	fetcherWaiter.Run(func() {
+		e.fetchChunksFromChild(ctx)
+	})
 
 	fetcherWaiter.Wait()
 	workersWaiter.Wait()

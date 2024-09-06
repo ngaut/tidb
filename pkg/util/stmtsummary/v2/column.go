@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/logutil"
@@ -120,7 +120,7 @@ const (
 	PlanInCacheStr                    = "PLAN_IN_CACHE"
 	PlanCacheHitsStr                  = "PLAN_CACHE_HITS"
 	PlanCacheUnqualifiedStr           = "PLAN_CACHE_UNQUALIFIED"
-	LastPlanCacheUnqualifiedStr       = "LAST_PLAN_CACHE_UNQUALIFIED_REASON"
+	PlanCacheUnqualifiedLastReasonStr = "PLAN_CACHE_UNQUALIFIED_LAST_REASON"
 	PlanInBindingStr                  = "PLAN_IN_BINDING"
 	QuerySampleTextStr                = "QUERY_SAMPLE_TEXT"
 	PrevSampleTextStr                 = "PREV_SAMPLE_TEXT"
@@ -487,8 +487,8 @@ var columnFactoryMap = map[string]columnFactory{
 	PlanCacheUnqualifiedStr: func(_ columnInfo, record *StmtRecord) any {
 		return record.PlanCacheUnqualifiedCount
 	},
-	LastPlanCacheUnqualifiedStr: func(_ columnInfo, record *StmtRecord) any {
-		return record.LastPlanCacheUnqualified
+	PlanCacheUnqualifiedLastReasonStr: func(_ columnInfo, record *StmtRecord) any {
+		return record.PlanCacheUnqualifiedLastReason
 	},
 }
 
