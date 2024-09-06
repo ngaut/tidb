@@ -16,8 +16,10 @@ package expression
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
+	"context"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/expression/contextopt"
@@ -30,6 +32,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/set"
 	"github.com/pingcap/tidb/pkg/util/stringutil"
 	"github.com/pingcap/tipb/go-tipb"
+	"github.com/sashabaranov/go-openai"
 )
 
 var (
@@ -46,6 +49,7 @@ var (
 	_ functionClass = &valuesFunctionClass{}
 	_ functionClass = &bitCountFunctionClass{}
 	_ functionClass = &getParamFunctionClass{}
+	_ functionClass = &aiProcessFunctionClass{}
 )
 
 var (
@@ -79,6 +83,7 @@ var (
 	_ builtinFunc = &builtinValuesJSONSig{}
 	_ builtinFunc = &builtinBitCountSig{}
 	_ builtinFunc = &builtinGetParamStringSig{}
+	_ builtinFunc = &builtinAIProcessSig{}
 )
 
 type inFunctionClass struct {
@@ -729,7 +734,7 @@ func (c *rowFunctionClass) getFunction(ctx BuildContext, args []Expression) (sig
 		return nil, err
 	}
 	argTps := make([]types.EvalType, len(args))
-	for i := range argTps {
+	for i := range args {
 		argTps[i] = args[i].GetType(ctx.GetEvalCtx()).EvalType()
 	}
 	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETString, argTps...)
@@ -1720,4 +1725,82 @@ func (b *builtinGetParamStringSig) evalString(ctx EvalContext, row chunk.Row) (s
 		return "", true, nil
 	}
 	return str, false, nil
+}
+
+
+type aiProcessFunctionClass struct {
+    baseFunctionClass
+}
+
+type builtinAIProcessSig struct {
+    baseBuiltinFunc
+}
+
+func (c *aiProcessFunctionClass) getFunction(ctx BuildContext, args []Expression) (builtinFunc, error) {
+    if err := c.verifyArgs(args); err != nil {
+        return nil, err
+    }
+    bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETString, types.ETString, types.ETString)
+    if err != nil {
+        return nil, err
+    }
+    sig := &builtinAIProcessSig{bf}
+    return sig, nil
+}
+
+func (b *builtinAIProcessSig) Clone() builtinFunc {
+    newSig := &builtinAIProcessSig{}
+    newSig.cloneFrom(&b.baseBuiltinFunc)
+    return newSig
+}
+
+
+func (b *builtinAIProcessSig) evalString(ctx EvalContext, row chunk.Row) (string, bool, error) {
+    data, isNull, err := b.args[0].EvalString(ctx, row)
+    if isNull || err != nil {
+        return "", true, err
+    }
+    taskDescription, isNull, err := b.args[1].EvalString(ctx, row)
+    if isNull || err != nil {
+        return "", true, err
+    }
+    
+    // Get the API key from env variable
+    apiKey := os.Getenv("OPENAI_API_KEY")
+    if apiKey == "" {
+        return "", true, errors.New("OPENAI_API_KEY is not set")
+    }
+
+    // Create a new context for the API calls
+    apiCtx := context.Background()
+
+    // Initialize OpenAI client
+    client := openai.NewClient(apiKey)
+
+    // Generate content
+    prompt := fmt.Sprintf("Process the following data: %s\nTask description: %s\n", data, taskDescription)
+    resp, err := client.CreateChatCompletion(
+        apiCtx,
+        openai.ChatCompletionRequest{
+            Model: openai.GPT4oMini,
+            Messages: []openai.ChatCompletionMessage{
+                {
+                    Role:    openai.ChatMessageRoleUser,
+                    Content: prompt,
+                },
+            },
+        },
+    )
+
+    if err != nil {
+        return "", true, fmt.Errorf("failed to generate content: %v", err)
+    }
+
+    // Extract the generated text from the response
+    if len(resp.Choices) == 0 {
+        return "", true, errors.New("no content generated")
+    }
+    generatedText := resp.Choices[0].Message.Content
+
+    return generatedText, false, nil
 }

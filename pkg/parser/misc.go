@@ -955,6 +955,7 @@ var btFuncTokenMap = map[string]int{
 	"VARIANCE":              builtinVarPop,
 	"VAR_POP":               builtinVarPop,
 	"VAR_SAMP":              builtinVarSamp,
+	"AI_PROCESS":            builtinAiProcess,
 }
 
 var windowFuncTokenMap = map[string]int{

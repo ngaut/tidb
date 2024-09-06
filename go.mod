@@ -98,6 +98,7 @@ require (
 	github.com/qri-io/jsonschema v0.2.1
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/sasha-s/go-deadlock v0.3.5
+	github.com/sashabaranov/go-openai v1.29.1
 	github.com/shirou/gopsutil/v3 v3.24.4
 	github.com/shurcooL/httpgzip v0.0.0-20190720172056-320755c1c1b0
 	github.com/soheilhy/cmux v0.1.5

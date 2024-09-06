@@ -814,6 +814,7 @@ import (
 
 	/* The following tokens belong to TiDBKeyword. Notice: make sure these tokens are contained in TiDBKeyword. */
 	admin                      "ADMIN"
+	builtinAiProcess		   "AI_PROCESS"
 	batch                      "BATCH"
 	buckets                    "BUCKETS"
 	builtinApproxCountDistinct
@@ -7061,7 +7062,8 @@ UnReservedKeyword:
 |	"ENCRYPTION_KEYFILE"
 
 TiDBKeyword:
-	"ADMIN"
+	"AI_PROCESS"
+|	"ADMIN"
 |	"BATCH"
 |	"BUCKETS"
 |	"BUILTINS"
@@ -8120,7 +8122,14 @@ FunctionCallKeyword:
 	}
 
 FunctionCallNonKeyword:
-	builtinCurTime '(' FuncDatetimePrecListOpt ')'
+	builtinAiProcess '(' Expression ',' Expression ')'
+    {
+        $$ = &ast.FuncCallExpr{
+            FnName: model.NewCIStr($1),
+            Args:   []ast.ExprNode{$3, $5},
+        }
+    }
+|	builtinCurTime '(' FuncDatetimePrecListOpt ')'
 	{
 		$$ = &ast.FuncCallExpr{FnName: model.NewCIStr($1), Args: $3.([]ast.ExprNode)}
 	}
