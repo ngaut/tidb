@@ -25,7 +25,7 @@ import (
 func TestTokenID(t *testing.T) {
 	for str, tok := range tokenMap {
 		l := NewScanner(str)
-		var v yySymType
+		var v YYSymType
 		tok1 := l.Lex(&v)
 		requires.Equal(t, tok1, tok)
 	}
@@ -35,7 +35,7 @@ func TestSingleChar(t *testing.T) {
 	table := []byte{'|', '&', '-', '+', '*', '/', '%', '^', '~', '(', ',', ')'}
 	for _, tok := range table {
 		l := NewScanner(string(tok))
-		var v yySymType
+		var v YYSymType
 		tok1 := l.Lex(&v)
 		requires.Equal(t, tok1, int(tok))
 	}
@@ -88,7 +88,7 @@ func TestAtLeadingIdentifier(t *testing.T) {
 }
 
 func TestUnderscoreCS(t *testing.T) {
-	var v yySymType
+	var v YYSymType
 	scanner := NewScanner(`_utf8"string"`)
 	tok := scanner.Lex(&v)
 	requires.Equal(t, underscoreCS, tok)
@@ -199,7 +199,7 @@ func TestLiteralValue(t *testing.T) {
 }
 
 func runTest(t *testing.T, table []testCaseItem) {
-	var val yySymType
+	var val YYSymType
 	for _, v := range table {
 		l := NewScanner(v.str)
 		tok := l.Lex(&val)
@@ -349,7 +349,7 @@ func TestIdentifier(t *testing.T) {
 	l := &Scanner{}
 	for _, item := range table {
 		l.reset(item[0])
-		var v yySymType
+		var v YYSymType
 		tok := l.Lex(&v)
 		requires.Equal(t, identifier, tok, item)
 		requires.Equal(t, item[1], v.ident, item)
@@ -401,7 +401,7 @@ func TestOptimizerHint(t *testing.T) {
 		{';', ";", 23},
 	}
 	for i := 0; ; i++ {
-		var sym yySymType
+		var sym YYSymType
 		tok := l.Lex(&sym)
 		if tok == 0 {
 			return
@@ -481,7 +481,7 @@ func TestOptimizerHintAfterCertainKeywordOnly(t *testing.T) {
 
 	for _, tc := range tests {
 		scanner := NewScanner(tc.input)
-		var sym yySymType
+		var sym YYSymType
 		for i := 0; ; i++ {
 			tok := scanner.Lex(&sym)
 			requires.Equalf(t, tc.tokens[i], tok, "input = [%s], i = %d", tc.input, i)
@@ -506,7 +506,7 @@ func TestInt(t *testing.T) {
 	}
 	scanner := NewScanner("")
 	for _, test := range tests {
-		var v yySymType
+		var v YYSymType
 		scanner.reset(test.input)
 		tok := scanner.Lex(&v)
 		requires.Equal(t, intLit, tok)
@@ -537,14 +537,14 @@ func TestSQLModeANSIQuotes(t *testing.T) {
 	scanner := NewScanner("")
 	scanner.SetSQLMode(mysql.ModeANSIQuotes)
 	for _, test := range tests {
-		var v yySymType
+		var v YYSymType
 		scanner.reset(test.input)
 		tok := scanner.Lex(&v)
 		requires.Equal(t, test.tok, tok)
 		requires.Equal(t, test.ident, v.ident)
 	}
 	scanner.reset(`'string' 'string'`)
-	var v yySymType
+	var v YYSymType
 	tok := scanner.Lex(&v)
 	requires.Equal(t, stringLit, tok)
 	requires.Equal(t, "string", v.ident)

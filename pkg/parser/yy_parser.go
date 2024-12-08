@@ -96,12 +96,12 @@ type Parser struct {
 	strictDoubleFieldType bool
 
 	// the following fields are used by yyParse to reduce allocation.
-	cache  []yySymType
-	yylval yySymType
-	yyVAL  *yySymType
+	cache  []YYSymType
+	yylval YYSymType
+	yyVAL  *YYSymType
 }
 
-func yySetOffset(yyVAL *yySymType, offset int) {
+func yySetOffset(yyVAL *YYSymType, offset int) {
 	if yyVAL.expr != nil {
 		yyVAL.expr.SetOriginTextPosition(offset)
 	}
@@ -124,7 +124,7 @@ func New() *Parser {
 	}
 
 	p := &Parser{
-		cache: make([]yySymType, 200),
+		cache: make([]YYSymType, 200),
 	}
 	p.EnableWindowFunc(true)
 	p.SetStrictDoubleTypeCheck(true)
@@ -230,11 +230,11 @@ func (parser *Parser) setLastSelectFieldText(st *ast.SelectStmt, lastEnd int) {
 	}
 }
 
-func (*Parser) startOffset(v *yySymType) int {
+func (*Parser) startOffset(v *YYSymType) int {
 	return v.offset
 }
 
-func (parser *Parser) endOffset(v *yySymType) int {
+func (parser *Parser) endOffset(v *YYSymType) int {
 	offset := v.offset
 	for offset > 0 && unicode.IsSpace(rune(parser.src[offset-1])) {
 		offset--
@@ -249,7 +249,7 @@ func (parser *Parser) parseHint(input string) ([]*ast.TableOptimizerHint, []erro
 	return parser.hintParser.parse(input, parser.lexer.GetSQLMode(), parser.lexer.lastHintPos)
 }
 
-func toInt(l yyLexer, lval *yySymType, str string) int {
+func toInt(l yyLexer, lval *YYSymType, str string) int {
 	n, err := strconv.ParseUint(str, 10, 64)
 	if err != nil {
 		e := err.(*strconv.NumError)
@@ -277,7 +277,7 @@ func toInt(l yyLexer, lval *yySymType, str string) int {
 	return intLit
 }
 
-func toDecimal(l yyLexer, lval *yySymType, str string) int {
+func toDecimal(l yyLexer, lval *YYSymType, str string) int {
 	dec, err := ast.NewDecimal(str)
 	if err != nil {
 		if terror.ErrorEqual(err, types.ErrDataOutOfRange) {
@@ -291,7 +291,7 @@ func toDecimal(l yyLexer, lval *yySymType, str string) int {
 	return decLit
 }
 
-func toFloat(l yyLexer, lval *yySymType, str string) int {
+func toFloat(l yyLexer, lval *YYSymType, str string) int {
 	n, err := strconv.ParseFloat(str, 64)
 	if err != nil {
 		e := err.(*strconv.NumError)
@@ -308,7 +308,7 @@ func toFloat(l yyLexer, lval *yySymType, str string) int {
 }
 
 // See https://dev.mysql.com/doc/refman/5.7/en/hexadecimal-literals.html
-func toHex(l yyLexer, lval *yySymType, str string) int {
+func toHex(l yyLexer, lval *YYSymType, str string) int {
 	h, err := ast.NewHexLiteral(str)
 	if err != nil {
 		l.AppendError(l.Errorf("hex literal: %v", err))
@@ -319,7 +319,7 @@ func toHex(l yyLexer, lval *yySymType, str string) int {
 }
 
 // See https://dev.mysql.com/doc/refman/5.7/en/bit-type.html
-func toBit(l yyLexer, lval *yySymType, str string) int {
+func toBit(l yyLexer, lval *YYSymType, str string) int {
 	b, err := ast.NewBitLiteral(str)
 	if err != nil {
 		l.AppendError(l.Errorf("bit literal: %v", err))

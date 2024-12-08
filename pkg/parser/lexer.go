@@ -186,7 +186,7 @@ func (s *Scanner) getNextToken() int {
 	r := s.r
 	tok, pos, lit := s.scan()
 	if tok == identifier {
-		tok = s.handleIdent(&yySymType{})
+		tok = s.handleIdent(&YYSymType{})
 	}
 	if tok == identifier {
 		if tok1 := s.isTokenIdentifier(lit, pos.Offset); tok1 != 0 {
@@ -201,7 +201,7 @@ func (s *Scanner) getNextTwoTokens() (tok1 int, tok2 int) {
 	r := s.r
 	tok1, pos, lit := s.scan()
 	if tok1 == identifier {
-		tok1 = s.handleIdent(&yySymType{})
+		tok1 = s.handleIdent(&YYSymType{})
 	}
 	if tok1 == identifier {
 		if tmpToken := s.isTokenIdentifier(lit, pos.Offset); tmpToken != 0 {
@@ -210,7 +210,7 @@ func (s *Scanner) getNextTwoTokens() (tok1 int, tok2 int) {
 	}
 	tok2, pos, lit = s.scan()
 	if tok2 == identifier {
-		tok2 = s.handleIdent(&yySymType{})
+		tok2 = s.handleIdent(&YYSymType{})
 	}
 	if tok2 == identifier {
 		if tmpToken := s.isTokenIdentifier(lit, pos.Offset); tmpToken != 0 {
@@ -226,7 +226,7 @@ func (s *Scanner) getNextTwoTokens() (tok1 int, tok2 int) {
 // 0 and invalid are special token id this function would return:
 // return 0 tells parser that scanner meets EOF,
 // return invalid tells parser that scanner meets illegal character.
-func (s *Scanner) Lex(v *yySymType) int {
+func (s *Scanner) Lex(v *YYSymType) int {
 	tok, pos, lit := s.scan()
 	s.lastScanOffset = pos.Offset
 	s.lastKeyword3 = s.lastKeyword2
@@ -331,7 +331,7 @@ func (s *Scanner) Lex(v *yySymType) int {
 
 // LexLiteral returns the value of the converted literal
 func (s *Scanner) LexLiteral() interface{} {
-	symType := &yySymType{}
+	symType := &YYSymType{}
 	s.Lex(symType)
 	if symType.item == nil {
 		return symType.ident
@@ -376,7 +376,7 @@ func NewScanner(s string) *Scanner {
 	return lexer
 }
 
-func (*Scanner) handleIdent(lval *yySymType) int {
+func (*Scanner) handleIdent(lval *YYSymType) int {
 	str := lval.ident
 	// A character string literal may have an optional character set introducer and COLLATE clause:
 	// [_charset_name]'string' [COLLATE collation_name]
