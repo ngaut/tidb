@@ -13,16 +13,43 @@
 
 package parser
 
+// Initialize lookup tables for character checks
+var (
+	isLetterTable    [256]bool
+	isDigitTable     [256]bool
+	isIdentCharTable [256]bool
+)
+
+func init() {
+	// Initialize letter lookup table
+	for i := 0; i < 256; i++ {
+		ch := byte(i)
+		isLetterTable[i] = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+	}
+
+	// Initialize digit lookup table
+	for i := 0; i < 256; i++ {
+		ch := byte(i)
+		isDigitTable[i] = ch >= '0' && ch <= '9'
+	}
+
+	// Initialize identifier character lookup table
+	for i := 0; i < 256; i++ {
+		ch := byte(i)
+		isIdentCharTable[i] = isLetterTable[i] || isDigitTable[i] || ch == '_' || ch == '$' || ch >= 0x80
+	}
+}
+
 func isLetter(ch byte) bool {
-	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+	return isLetterTable[ch]
 }
 
 func isDigit(ch byte) bool {
-	return ch >= '0' && ch <= '9'
+	return isDigitTable[ch]
 }
 
 func isIdentChar(ch byte) bool {
-	return isLetter(ch) || isDigit(ch) || ch == '_' || ch == '$' || isIdentExtend(ch)
+	return isIdentCharTable[ch]
 }
 
 func isIdentExtend(ch byte) bool {
