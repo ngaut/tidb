@@ -141,11 +141,16 @@ func (p *PacketIO) SetReadTimeout(timeout time.Duration) {
 func (p *PacketIO) readOnePacket() ([]byte, error) {
 	var header [4]byte
 	r := io.NopCloser(p.bufReadConn)
+	
+	// Cache deadline time if timeout is set
+	var deadline time.Time
 	if p.readTimeout > 0 {
-		if err := p.bufReadConn.SetReadDeadline(time.Now().Add(p.readTimeout)); err != nil {
+		deadline = time.Now().Add(p.readTimeout)
+		if err := p.bufReadConn.SetReadDeadline(deadline); err != nil {
 			return nil, err
 		}
 	}
+	
 	if p.compressionAlgorithm == mysql.CompressionNone {
 		if _, err := io.ReadFull(r, header[:]); err != nil {
 			return nil, errors.Trace(err)
@@ -165,13 +170,10 @@ func (p *PacketIO) readOnePacket() ([]byte, error) {
 		if p.compressionAlgorithm == mysql.CompressionNone {
 			return nil, err
 		}
-		// To be compatible with MariaDB Connector/J 2.x,
-		// ignore sequence check and print a log when compression protocol is active.
 		terror.Log(err)
 	}
 	p.sequence++
 
-	// Accumulated payload length exceeds the limit.
 	if p.accumulatedLength += uint64(length); p.accumulatedLength > p.maxAllowedPacket {
 		terror.Log(server_err.ErrNetPacketTooLarge)
 		return nil, server_err.ErrNetPacketTooLarge
@@ -179,10 +181,12 @@ func (p *PacketIO) readOnePacket() ([]byte, error) {
 
 	data := make([]byte, length)
 	if p.readTimeout > 0 {
-		if err := p.bufReadConn.SetReadDeadline(time.Now().Add(p.readTimeout)); err != nil {
+		// Reuse cached deadline
+		if err := p.bufReadConn.SetReadDeadline(deadline); err != nil {
 			return nil, err
 		}
 	}
+	
 	if p.compressionAlgorithm == mysql.CompressionNone {
 		if _, err := io.ReadFull(r, data); err != nil {
 			return nil, errors.Trace(err)
