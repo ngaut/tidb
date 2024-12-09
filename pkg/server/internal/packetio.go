@@ -297,6 +297,7 @@ func (p *PacketIO) WritePacket(data []byte) error {
 
 // Flush flushes buffered data to network.
 func (p *PacketIO) Flush() error {
+	server_metrics.TcpFlushCount.Inc()
 	var err error
 	if p.compressionAlgorithm != mysql.CompressionNone {
 		err = p.compressedWriter.Flush()

@@ -37,6 +37,7 @@ var (
 
 	InPacketBytes  prometheus.Counter
 	OutPacketBytes prometheus.Counter
+	TcpFlushCount  prometheus.Counter
 )
 
 func init() {
@@ -118,4 +119,5 @@ func InitMetricsVars() {
 
 	InPacketBytes = metrics.PacketIOCounter.WithLabelValues("In")
 	OutPacketBytes = metrics.PacketIOCounter.WithLabelValues("Out")
+	TcpFlushCount = metrics.PacketIOCounter.WithLabelValues("TcpFlushOut")
 }
