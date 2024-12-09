@@ -315,6 +315,8 @@ func main() {
 	printInfo()
 	setupMetrics()
 
+	runtime.GOMAXPROCS(3)
+
 	keyspaceName := keyspace.GetKeyspaceNameBySettings()
 	executor.Start()
 	resourcemanager.InstanceResourceManager.Start()

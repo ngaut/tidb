@@ -1328,14 +1328,14 @@ func (cc *clientConn) dispatch(ctx context.Context, data []byte) error {
 			pprof.SetGoroutineLabels(ctx)
 		}
 	}
-	token := cc.server.getToken()
+	//token := cc.server.getToken()
 	defer func() {
 		// if handleChangeUser failed, cc.ctx may be nil
 		if ctx := cc.getCtx(); ctx != nil {
 			ctx.SetProcessInfo("", t, mysql.ComSleep, 0)
 		}
 
-		cc.server.releaseToken(token)
+		//cc.server.releaseToken(token)
 		cc.lastActive = time.Now()
 	}()
 
