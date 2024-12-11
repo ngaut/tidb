@@ -85,7 +85,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/push"
 	"github.com/tikv/client-go/v2/tikv"
 	"github.com/tikv/client-go/v2/txnkv/transaction"
-	"go.uber.org/automaxprocs/maxprocs"
+	//"go.uber.org/automaxprocs/maxprocs"
+	"github.com/pingcap/tidb/pkg/util/cpu"
 	"go.uber.org/zap"
 )
 
@@ -309,13 +310,30 @@ func main() {
 		tikv.EnableFailpoints()
 	}
 	setGlobalVars()
-	setCPUAffinity()
+	//setCPUAffinity()
 	cgmon.StartCgroupMonitor()
 	setupTracing() // Should before createServer and after setup config.
 	printInfo()
 	setupMetrics()
 
-	runtime.GOMAXPROCS(3)
+	// Define the configuration for GOMAXPROCS manager
+	cfg := cpu.Config{
+		MonitorInterval:          1 * time.Second,    // Check every 2 seconds
+		AdjustmentCooldown:       5 * time.Second,   // At least 10 seconds between adjustments
+		HighLockWaitRateThreshold: 0.05,             // Threshold to decrease GOMAXPROCS
+		LowLockWaitRateThreshold: 0.02,              // Threshold to increase GOMAXPROCS
+		MinProcs:                 2,                  // Minimum GOMAXPROCS
+		MaxProcs:                 8,                 // Maximum GOMAXPROCS
+	}
+
+	// Create a new Manager instance
+	manager, err := cpu.NewManager(cfg)
+	if err != nil {
+		log.Fatal("Failed to create GOMAXPROCS manager:", zap.Error(err))
+	}
+
+	// Start the manager
+	manager.Start()
 
 	keyspaceName := keyspace.GetKeyspaceNameBySettings()
 	executor.Start()
@@ -336,6 +354,7 @@ func main() {
 	topsql.SetupTopSQL(svr)
 	terror.MustNil(svr.Run(dom))
 	<-exited
+	manager.Stop()
 	syncLog()
 }
 
@@ -701,12 +720,12 @@ func setGlobalVars() {
 	}
 
 	// Disable automaxprocs log
-	nopLog := func(string, ...any) {}
-	_, err := maxprocs.Set(maxprocs.Logger(nopLog))
-	terror.MustNil(err)
+	// nopLog := func(string, ...any) {}
+	// _, err := maxprocs.Set(maxprocs.Logger(nopLog))
+	// terror.MustNil(err)
 	// We should respect to user's settings in config file.
 	// The default value of MaxProcs is 0, runtime.GOMAXPROCS(0) is no-op.
-	runtime.GOMAXPROCS(int(cfg.Performance.MaxProcs))
+	// runtime.GOMAXPROCS(int(cfg.Performance.MaxProcs))
 
 	util.SetGOGC(cfg.Performance.GOGC)
 
