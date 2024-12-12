@@ -320,7 +320,7 @@ func main() {
 	cfg := cpu.Config{
 		MonitorInterval:          1 * time.Second,    // Check every 2 seconds
 		AdjustmentCooldown:       5 * time.Second,   // At least 10 seconds between adjustments
-		HighLockWaitRateThreshold: 0.05,             // Threshold to decrease GOMAXPROCS
+		HighLockWaitRateThreshold: 0.06,             // Threshold to decrease GOMAXPROCS
 		LowLockWaitRateThreshold: 0.02,              // Threshold to increase GOMAXPROCS
 		MinProcs:                 2,                  // Minimum GOMAXPROCS
 		MaxProcs:                 8,                 // Maximum GOMAXPROCS
