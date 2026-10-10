@@ -570,3 +570,88 @@ fn tls_owner_grant_require_shares_account_policy_at_every_scope() {
         "{}"
     );
 }
+
+/// Go `executeCreateUser` checks every account before its one INSERT and
+/// `executeDropUser` stops at the first missing account: `CREATE ROLE r1,
+/// r2, r3` with r2 taken creates nothing, and `DROP ROLE r1, r2, r3` names
+/// only r1.
+#[test]
+fn create_and_drop_role_lists_are_atomic() {
+    let mut session = session_with_privileges();
+    session.run("CREATE ROLE r2").unwrap();
+    assert!(matches!(
+        session.run("CREATE ROLE r1, r2, r3"),
+        Err(DriverError::CannotUserRole {
+            operation: "CREATE ROLE",
+            ..
+        })
+    ));
+    match session.run("DROP ROLE r1, r2, r3") {
+        Err(DriverError::CannotUserRole { operation, target }) => {
+            assert_eq!((operation, target.as_str()), ("DROP ROLE", "r1@%"));
+        }
+        other => panic!("expected CannotUserRole, got {other:?}"),
+    }
+    session.run("DROP ROLE r2").unwrap();
+    session.run("DROP USER IF EXISTS r2").unwrap();
+    assert_eq!(
+        row_text(session.run("SHOW WARNINGS")),
+        vec![vec!["Note", "3162", "User r2@% does not exist."]]
+    );
+}
+
+/// Go resolves a role's plugin from `default_authentication_plugin` like a
+/// user's, and GRANT creates a missing grantee with it once
+/// `NO_AUTO_CREATE_USER` is gone from sql_mode.
+#[test]
+fn roles_and_grant_created_users_take_the_default_plugin() {
+    let mut session = session_with_privileges();
+    session
+        .run("SET GLOBAL default_authentication_plugin = 'caching_sha2_password'")
+        .unwrap();
+    session.run("CREATE ROLE sha2_role").unwrap();
+    let create = row_text(session.run("SHOW CREATE USER sha2_role"));
+    assert!(
+        create[0][0].contains("IDENTIFIED WITH 'caching_sha2_password'"),
+        "{create:?}"
+    );
+    assert!(matches!(
+        session.run("GRANT SELECT ON test.* TO auto_user"),
+        Err(DriverError::GrantToUnknownUser)
+    ));
+    session.run("SET sql_mode = ''").unwrap();
+    session.run("GRANT SELECT ON test.* TO auto_user").unwrap();
+    let create = row_text(session.run("SHOW CREATE USER auto_user"));
+    assert!(
+        create[0][0].contains("IDENTIFIED WITH 'caching_sha2_password'"),
+        "{create:?}"
+    );
+}
+
+/// Go `RevokeExec.Next` (and GRANT, GRANT/REVOKE ROLE, FLUSH) commits the
+/// open transaction first, like DDL, so the ROLLBACK after it takes nothing
+/// back.
+#[test]
+fn revoke_commits_the_open_transaction() {
+    let mut session = session_with_privileges();
+    session.run("CREATE USER xxx").unwrap();
+    session.run("CREATE TABLE test.auto_new (id INT)").unwrap();
+    session.run("BEGIN").unwrap();
+    session.run("INSERT INTO test.auto_new VALUES (1)").unwrap();
+    session
+        .run("REVOKE ALL PRIVILEGES ON *.* FROM xxx")
+        .unwrap();
+    session.run("ROLLBACK").unwrap();
+    assert_eq!(
+        row_text(session.run("SELECT id FROM test.auto_new")),
+        vec![vec!["1"]]
+    );
+}
+
+/// Go `buildDo` evaluates the expressions and discards the row.
+#[test]
+fn do_evaluates_its_expressions() {
+    let mut session = session_with_privileges();
+    session.run("DO 1, @a := 1").unwrap();
+    assert_eq!(row_text(session.run("SELECT @a")), vec![vec!["1"]]);
+}

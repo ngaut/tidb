@@ -33,6 +33,48 @@ use crate::{
 };
 use crate::{CHECK_CONSTRAINT_IS_OFF_CODE, CHECK_CONSTRAINT_IS_OFF_MESSAGE};
 
+/// The `SELECT <exprs>` whose execution is Go `buildDo`'s Projection over a
+/// one-row TableDual.
+fn do_projection_query(exprs: &[tidb_ast::Expr]) -> Stmt {
+    let mut fields = tidb_ast::SelectFieldList::default();
+    for expr in exprs {
+        fields.push(tidb_ast::SelectField::Expr {
+            expr: expr.clone(),
+            alias: None,
+        });
+    }
+    Stmt::Query(tidb_ast::NodeBox::new(tidb_ast::QueryStmt::Select(
+        Box::new(tidb_ast::SelectStmt {
+            kind: Default::default(),
+            is_in_braces: false,
+            with: None,
+            hints: Vec::new(),
+            priority: Default::default(),
+            sql_small_result: false,
+            sql_big_result: false,
+            sql_buffer_result: false,
+            sql_no_cache: false,
+            straight_join: false,
+            calc_found_rows: false,
+            distinct: false,
+            all: false,
+            fields,
+            values: Vec::new(),
+            from: None,
+            where_clause: None,
+            group_by: Vec::new(),
+            rollup: false,
+            having: None,
+            windows: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            lock: None,
+            into_outfile: None,
+            into_vars: Vec::new(),
+        }),
+    )))
+}
+
 fn sem_table_option(option: &tidb_ast::TableOption) -> tidb_util::sem_v2::TableOptionType {
     match option {
         tidb_ast::TableOption::Ttl { .. } => tidb_util::sem_v2::TableOptionType::Ttl,
@@ -409,6 +451,19 @@ impl Session {
             // transaction, `with_catalog_mut` reaches the shared catalog, so
             // a TRUNCATE's counter reset lands on the table that survives
             // rather than on a copy about to be discarded.
+            self.commit()?;
+        }
+        // Go `GrantExec.Next` and `RevokeExec.Next`, and `SimpleExec`'s
+        // `autoNewTxn` for GRANT/REVOKE ROLE and FLUSH, commit the open
+        // transaction before touching the privilege tables, like DDL.
+        if matches!(stmt, Stmt::Admin(admin) if matches!(
+            &**admin,
+            tidb_ast::AdminStmt::Grant(_)
+                | tidb_ast::AdminStmt::Revoke(_)
+                | tidb_ast::AdminStmt::GrantRole(_)
+                | tidb_ast::AdminStmt::RevokeRole(_)
+                | tidb_ast::AdminStmt::Flush(_)
+        )) {
             self.commit()?;
         }
         if let Some(error) = self.local_temporary_ddl_refusal(stmt) {
@@ -2547,6 +2602,17 @@ impl Session {
                         !rows.is_empty(),
                     ))));
                 }
+            }
+        }
+        // Go `buildDo`: DO evaluates its expressions as a Projection over a
+        // one-row TableDual and discards the row, so `DO @a := 1` assigns and
+        // the expressions' errors and warnings surface, while the client
+        // sees an OK.
+        if let Stmt::Admin(admin) = &stmt {
+            if let tidb_ast::AdminStmt::Do(exprs) = &**admin {
+                let query = do_projection_query(exprs);
+                self.execute_parsed_statement(sql, query, prepared)?;
+                return Ok(PendingExecution::Complete(StmtOutput::Affected(0)));
             }
         }
         // Go hands every statement that is not continuing an open transaction

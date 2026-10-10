@@ -248,6 +248,30 @@ impl Session {
         self.run_user_table_write(&sql)
     }
 
+    /// Mirrors the account GRANT creates without `NO_AUTO_CREATE_USER` --
+    /// Go `GrantExec.Next`'s `INSERT INTO mysql.user (Host, User,
+    /// authentication_string, plugin)`, every other column at its default
+    /// and the host stored as written.
+    pub(crate) fn mirror_grant_created_user_row(
+        &mut self,
+        user: &str,
+        host: &str,
+        auth_string: &str,
+        plugin: &str,
+    ) -> Result<(), DriverError> {
+        if !self.user_table_present() {
+            return Ok(());
+        }
+        let sql = format!(
+            "INSERT INTO mysql.user (Host, User, authentication_string, plugin) VALUES ({}, {}, {}, {})",
+            sql_str(host),
+            sql_str(user),
+            sql_str(auth_string),
+            sql_str(plugin),
+        );
+        self.run_user_table_write(&sql)
+    }
+
     /// Mirrors `DROP USER`'s row removal -- Go `executeDropUser`'s
     /// `DELETE FROM mysql.user WHERE Host = %? and User = %?`.
     pub(crate) fn mirror_drop_user_row(

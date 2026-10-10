@@ -344,6 +344,12 @@ impl PrivilegeRegistry {
         )
     }
 
+    /// [`Self::create_role`] recording the account's plugin, which Go
+    /// resolves from `default_authentication_plugin` for a role too.
+    pub fn create_role_with_plugin(&self, role: &str, host: &str, plugin: &str) -> bool {
+        self.create_account(role, host, "", plugin, true, None)
+    }
+
     fn create_account(
         &self,
         user: &str,

@@ -1180,24 +1180,6 @@ fn determinate_objective_uses_analyzed_row_count_after_inserts() {
         "ANALYZE should make both objectives use 11 rows:\nmoderate={moderate_analyzed:?}\ndeterminate={determinate_analyzed:?}"
     );
 
-    session.run("BEGIN").unwrap();
-    session
-        .run("INSERT INTO ignore_realtime_stats VALUES (3,2),(3,3)")
-        .unwrap();
-    session.run("FLUSH STATS_DELTA *.*").unwrap();
-    let shared = session.shared_catalog();
-    {
-        let catalog = shared.lock().unwrap();
-        let table_id = match catalog.table_in("test", "ignore_realtime_stats").unwrap() {
-            tidb_executor::TableEntry::Kv(table) => table.table_id,
-            _ => panic!("ignore_realtime_stats is not a KV table"),
-        };
-        let statistics = catalog.table_statistics(table_id).unwrap();
-        assert_eq!(statistics.row_count, 11);
-        assert_eq!(statistics.modify_count, 0);
-    }
-    session.run("ROLLBACK").unwrap();
-
     session
         .run("INSERT INTO ignore_realtime_stats VALUES (3,2),(3,3),(3,4),(3,5)")
         .unwrap();

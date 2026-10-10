@@ -627,6 +627,10 @@ impl Session {
                 plugin: default_plugin,
             });
         }
+        // Go `executeCreateUser` validates every account -- existence,
+        // plugin, password strength -- while composing ONE INSERT, and runs
+        // it only after the loop: a failure on any account creates none.
+        let mut planned = Vec::with_capacity(users.len());
         for spec in users {
             // TiDB's grammar rejects RETAIN/DISCARD on CREATE USER with 1064
             // (the corpus asserts it), and this tier's parser does too, so
@@ -671,8 +675,9 @@ impl Session {
             }
             let (auth_string, plugin) =
                 Self::resolve_auth_string_and_plugin(spec.auth.as_ref(), &default_plugin)?;
-            // Go processes each account in source order and fails on the
-            // FIRST duplicate rather than batching, unlike DROP USER below.
+            planned.push((user, host, auth_string, plugin));
+        }
+        for (user, host, auth_string, plugin) in planned {
             if registry.create_user_with_plugin_and_tls_policy(
                 user,
                 host,
@@ -755,9 +760,26 @@ impl Session {
             .vars
             .get_global("default_authentication_plugin")
             .unwrap_or_else(|_| tidb_mysql::consts::AuthNativePassword.to_owned());
+        // Go `executeCreateUser` checks every role before its one INSERT, so
+        // `CREATE ROLE r1, r2, r3` with r2 taken creates none of them.
+        let mut planned = Vec::with_capacity(roles.len());
         for spec in roles {
             let (role, host) = role_identity(spec);
-            if registry.create_role(&role, &host) {
+            if !registry.user_exists(&role, &host) {
+                planned.push((role, host));
+            } else if !if_not_exists {
+                return Err(DriverError::CannotUserRole {
+                    operation: "CREATE ROLE",
+                    target: format!("'{role}'@'{host}'"),
+                });
+            } else {
+                // go demotes the duplicate to Note 3163 under IF NOT
+                // EXISTS, same as CREATE USER.
+                self.append_routed_note(3163, format!("User '{role}'@'{host}' already exists."));
+            }
+        }
+        for (role, host) in planned {
+            if registry.create_role_with_plugin(&role, &host, &default_plugin) {
                 registry.merge_user_attributes(&role, &host, serde_json::json!({}), false);
                 // The same INSERT as CREATE USER's, with `IsCreateRole`'s
                 // overrides: `Account_locked='Y'`, `Password_expired='Y'`,
@@ -778,10 +800,6 @@ impl Session {
                     operation: "CREATE ROLE",
                     target: format!("'{role}'@'{host}'"),
                 });
-            } else {
-                // go demotes the duplicate to Note 3163 under IF NOT
-                // EXISTS, same as CREATE USER.
-                self.append_routed_note(3163, format!("User '{role}'@'{host}' already exists."));
             }
         }
         Ok(StmtOutput::Affected(0))
@@ -1244,28 +1262,26 @@ impl Session {
                 "DROP USER requires a server front end with a privilege registry",
             ));
         };
-        if !if_exists {
-            let missing: Vec<String> = users
-                .iter()
-                .filter(|spec| !registry.user_exists(&spec.user, &spec.host))
-                .map(|spec| format!("{}@{}", spec.user, spec.host))
-                .collect();
-            if !missing.is_empty() {
-                let accounts = missing.join(",");
-                return Err(if is_role {
-                    DriverError::CannotUserRole {
-                        operation: "DROP ROLE",
-                        target: accounts,
-                    }
-                } else {
-                    DriverError::DropUserMissing { accounts }
-                });
-            }
-        }
-        // Go rolls the whole statement back when ONE target turns out to be
-        // a `SYSTEM_USER`, so the guard has to clear every target before the
-        // first delete rather than inside the delete loop.
+        // Go walks the accounts in order inside one transaction: the first
+        // missing account (without IF EXISTS) stops the walk and is the only
+        // one the error names, a missing one under IF EXISTS is Note 3162,
+        // and a `SYSTEM_USER` target rolls everything back. Checking all of
+        // it before the first delete reproduces that rollback.
         for spec in users {
+            if !registry.user_exists(&spec.user, &spec.host) {
+                let account = format!("{}@{}", spec.user, spec.host);
+                if !if_exists {
+                    return Err(if is_role {
+                        DriverError::CannotUserRole {
+                            operation: "DROP ROLE",
+                            target: account,
+                        }
+                    } else {
+                        DriverError::DropUserMissing { accounts: account }
+                    });
+                }
+                self.append_routed_note(3162, format!("User {account} does not exist."));
+            }
             self.require_system_user_privilege_over(&spec.user, &spec.host)?;
         }
         for spec in users {
@@ -1332,14 +1348,26 @@ impl Session {
         // grantee AFTER its privilege gate (Go's plan-time check precedes
         // the executor's user lookup) and BEFORE its first registry write,
         // which reproduces the rollback without one.
-        let all_grantees_exist = |users: &[tidb_ast::CreateUserSpec]| -> Result<(), DriverError> {
-            for spec in users {
-                if !registry.user_exists(&spec.user.user, &spec.user.host) {
-                    return Err(DriverError::GrantToUnknownUser);
+        //
+        // Go `GrantExec.Next` creates a missing grantee inside that same
+        // transaction when `NO_AUTO_CREATE_USER` is unset (5.7 compatibility):
+        // `INSERT INTO mysql.user (Host, User, authentication_string, plugin)`
+        // with `default_authentication_plugin`. The accounts to create are
+        // collected here and written only after every check has passed.
+        let no_auto_create_user = self.vars.sql_mode().has_no_auto_create_user_mode();
+        let all_grantees_exist =
+            |users: &[tidb_ast::CreateUserSpec]| -> Result<Vec<usize>, DriverError> {
+                let mut missing = Vec::new();
+                for (position, spec) in users.iter().enumerate() {
+                    if !registry.user_exists(&spec.user.user, &spec.user.host) {
+                        if no_auto_create_user {
+                            return Err(DriverError::GrantToUnknownUser);
+                        }
+                        missing.push(position);
+                    }
                 }
-            }
-            Ok(())
-        };
+                Ok(missing)
+            };
         match &grant.level {
             tidb_ast::GrantLevel::Global => {
                 let (static_mask, dynamic) = self.split_global_privs(&grant.privileges, true)?;
@@ -1354,8 +1382,9 @@ impl Session {
                 let names_static = grant.privileges.iter().any(|privilege| !privilege.dynamic);
                 let mask = static_mask | if names_static { with_grant } else { 0 };
                 self.require_grant_privileges("", "", static_mask, &dynamic, true)?;
-                all_grantees_exist(&grant.users)?;
+                let missing = all_grantees_exist(&grant.users)?;
                 tls_policy = load_tls_policy()?;
+                self.create_grantees(&registry, &grant.users, &missing)?;
                 for spec in &grant.users {
                     let user = spec.user.user.as_str();
                     let host = spec.user.host.as_str();
@@ -1382,8 +1411,9 @@ impl Session {
                 let privs = self.resolve_scoped_privs(&grant.privileges, ScopeKind::Database)?;
                 let mask = privs.iter().fold(0u64, |mask, priv_| mask | priv_.bit()) | with_grant;
                 self.require_grant_privileges(&database, "", mask, &[], true)?;
-                all_grantees_exist(&grant.users)?;
+                let missing = all_grantees_exist(&grant.users)?;
                 tls_policy = load_tls_policy()?;
+                self.create_grantees(&registry, &grant.users, &missing)?;
                 for spec in &grant.users {
                     let user = spec.user.user.as_str();
                     let host = spec.user.host.as_str();
@@ -1405,7 +1435,7 @@ impl Session {
                 // like any other privilege in the same statement.
                 let column_mask = columns.iter().fold(mask, |mask, (_, bits)| mask | bits);
                 self.require_grant_privileges(&database, table, column_mask, &[], true)?;
-                all_grantees_exist(&grant.users)?;
+                let missing = all_grantees_exist(&grant.users)?;
                 // Go allows granting on a table that does not exist only
                 // when the privilege list includes `CREATE` (captured:
                 // issues #28533/#29268); otherwise it reports
@@ -1424,6 +1454,7 @@ impl Session {
                 // (A)` prints back as `SELECT(a)`.
                 let columns = self.resolve_grant_columns(&database, table, &columns)?;
                 tls_policy = load_tls_policy()?;
+                self.create_grantees(&registry, &grant.users, &missing)?;
                 for spec in &grant.users {
                     let user = spec.user.user.as_str();
                     let host = spec.user.host.as_str();
@@ -1447,6 +1478,36 @@ impl Session {
             }
         }
         Ok(StmtOutput::Affected(0))
+    }
+
+    /// Go `GrantExec.Next`'s implicit account creation: each missing grantee
+    /// gets a `mysql.user` row carrying only its host, name, encoded password
+    /// and plugin (`IDENTIFIED BY` in the GRANT, else
+    /// `default_authentication_plugin`).
+    fn create_grantees(
+        &mut self,
+        registry: &privilege::PrivilegeRegistry,
+        users: &[tidb_ast::CreateUserSpec],
+        missing: &[usize],
+    ) -> Result<(), DriverError> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let default_plugin = self
+            .vars
+            .get_global("default_authentication_plugin")
+            .map_err(crate::variables::var_error)?;
+        for &position in missing {
+            let spec = &users[position];
+            let (auth_string, plugin) =
+                Self::resolve_auth_string_and_plugin(spec.auth.as_ref(), &default_plugin)?;
+            let (user, host) = (spec.user.user.as_str(), spec.user.host.as_str());
+            if registry.create_user_with_plugin(user, host, &auth_string, &plugin) {
+                let (user, host) = (user.to_owned(), host.to_owned());
+                self.mirror_grant_created_user_row(&user, &host, &auth_string, &plugin)?;
+            }
+        }
+        Ok(())
     }
 
     /// `REVOKE <static privs> ON <level> FROM <user>...`. Go's `revoke.go`
