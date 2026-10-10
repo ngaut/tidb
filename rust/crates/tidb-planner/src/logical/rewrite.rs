@@ -645,6 +645,16 @@ impl OwnedRewrite for PredicatePushDown<'_, '_> {
             }
             // Go `LogicalProjection.PredicatePushDown` (`logical_projection.go:82`).
             LogicalPlan::Projection(op) => {
+                if op
+                    .exprs
+                    .iter()
+                    .any(tidb_expr::expr_util::predicates::has_assign_set_var_func)
+                {
+                    // `BaseLogicalPlan.PredicatePushDown(nil)`: nothing goes
+                    // down and every predicate stays above.
+                    self.stash.push(PendingPredicates::AddSelection(predicates));
+                    return Descend::Children(vec![Vec::new()]);
+                }
                 let opts = SubstituteOptions::new(self.ctx.builder);
                 let (can_push, cannot_push) =
                     op.break_down_predicates(&predicates, &own_schema, &opts);

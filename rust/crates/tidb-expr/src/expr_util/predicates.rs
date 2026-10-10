@@ -499,6 +499,25 @@ pub fn expr_has_set_var_or_sleep(expr: &Expression) -> bool {
     function.get_args().iter().any(expr_has_set_var_or_sleep)
 }
 
+/// Go `HasAssignSetVarFunc` (`chunk_executor.go:83`): whether `expr` holds a
+/// `SET @var := <function>`, whose value depends on the rows the projection
+/// sees, so no predicate may move below it.
+#[must_use]
+pub fn has_assign_set_var_func(expr: &Expression) -> bool {
+    let Expression::ScalarFunction(function) = expr else {
+        return false;
+    };
+    if function.func_name.lowercase() == "setvar"
+        && function
+            .get_args()
+            .iter()
+            .any(|arg| matches!(arg, Expression::ScalarFunction(_)))
+    {
+        return true;
+    }
+    function.get_args().iter().any(has_assign_set_var_func)
+}
+
 /// Go `ExprsHasSideEffects` (`util.go:2100`).
 #[must_use]
 pub fn exprs_has_side_effects(exprs: &[Expression]) -> bool {

@@ -2804,3 +2804,67 @@ fn an_empty_index_merge_partial_reads_nothing() {
         ]
     );
 }
+
+/// Go `colNames2ResultFields`' inputs: a table column names its schema, its
+/// visible and original table and its original column; a computed column
+/// names only itself (buildProjectionField). A prepared point get names its
+/// columns as buildSchemaFromFields does: the alias when there is one.
+#[test]
+fn result_output_names_carry_each_column_origin() {
+    fn spelled(names: &[tidb_datatype::FieldNameMetadata]) -> Vec<[String; 5]> {
+        names
+            .iter()
+            .map(|name| {
+                [
+                    name.database.original.clone(),
+                    name.table.original.clone(),
+                    name.original_table.original.clone(),
+                    name.column.original.clone(),
+                    name.original_column.original.clone(),
+                ]
+            })
+            .collect()
+    }
+    let row = |cells: [&str; 5]| cells.map(str::to_owned);
+    let mut session = Session::new();
+    session
+        .run("CREATE TABLE origin_t (id INT PRIMARY KEY, d DOUBLE(7,4))")
+        .unwrap();
+    session
+        .run("INSERT INTO origin_t VALUES (1, 123.45)")
+        .unwrap();
+    session
+        .run("SELECT d, IFNULL(d, 0) AS e FROM origin_t AS x")
+        .unwrap();
+    let (names, current_db) = session.last_result_output_names();
+    assert_eq!(current_db, "test");
+    assert_eq!(
+        spelled(names),
+        [
+            row(["test", "x", "origin_t", "d", "d"]),
+            row(["", "", "", "e", ""])
+        ]
+    );
+    session.run("CREATE TABLE other (a INT)").unwrap();
+    assert!(
+        session.last_result_output_names().0.is_empty(),
+        "a statement without a query result leaves no names"
+    );
+
+    let sql = "SELECT d FROM origin_t AS x WHERE id = ?";
+    let prepared = session.prepare_ast(sql).unwrap();
+    let plan = prepared.point_get_plan().expect("a primary-key point get");
+    let execution = session
+        .bind_cached_prepared_point_get(&plan, &[Datum::Int(1)])
+        .unwrap();
+    let opened = session
+        .open_prepared_point_get(execution, prepared.statement(), sql)
+        .unwrap()
+        .unwrap();
+    let crate::StatementExecution::Rows(record_set) = opened.attach(&mut session) else {
+        panic!("a point get opens a record set")
+    };
+    let (names, current_db) = record_set.output_names();
+    assert_eq!(current_db, "test");
+    assert_eq!(spelled(names), [row(["test", "x", "origin_t", "d", "d"])]);
+}

@@ -6018,8 +6018,18 @@ pub(super) fn open_query(
         }
         tidb_ast::QueryStmt::SetOpr(_) => physical_result_columns(physical, root.schema()),
     };
+    // Go `recordSet.Fields()` reads the names captured before optimization.
+    let output_names = physical
+        .base()
+        .base
+        .output_names()
+        .iter()
+        .map(|name| name.names.clone())
+        .collect();
+    let current_db = ctx.current_database_name().unwrap_or_default();
     ctx.notify_before_executor_first_run();
     super::QueryRecordSet::open(root, columns, ctx.statement_memory())
+        .map(|record_set| record_set.with_output_names(output_names, current_db))
 }
 
 /// Builds and drains the target of `EXPLAIN ANALYZE` through the same

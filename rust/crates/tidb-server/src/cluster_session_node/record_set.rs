@@ -293,8 +293,9 @@ impl ResultSetSource for ClusterRecordSet<'_> {
             .collect())
     }
     fn columns(&mut self) -> Result<Vec<tidb_protocol::ColumnInfo>, tidb_executor::MysqlError> {
-        Ok(crate::pipeline_session::select_columns(
+        Ok(crate::pipeline_session::result_set_columns(
             self.state.columns(),
+            self.state.output_names(),
         ))
     }
     fn finish(&mut self) -> Result<(), tidb_executor::MysqlError> {

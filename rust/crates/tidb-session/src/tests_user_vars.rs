@@ -379,3 +379,30 @@ fn user_variable_batch_reads_integer_carrier_and_running_totals() {
         ]
     );
 }
+
+/// Go TestPpdWithSetVar: a predicate over a projection that assigns
+/// `@c3 := @c3 + 1` stays above it (`LogicalProjection.PredicatePushDown`'s
+/// HasAssignSetVarFunc guard), so the numbering counts every row rather than
+/// the rows the predicate kept.
+#[test]
+fn predicate_stays_above_projection_assigning_function_value() {
+    let mut session = Session::new();
+    session
+        .run("CREATE TABLE t (c1 INT, c2 VARCHAR(255))")
+        .unwrap();
+    session
+        .run("INSERT INTO t VALUES (1,'a'),(2,'d'),(3,'c')")
+        .unwrap();
+    let query = |c3: i32| {
+        format!(
+            "SELECT t01.c1, t01.c2, t01.c3 FROM (SELECT t1.*, @c3 := @c3 + 1 AS c3 \
+             FROM (SELECT t.*, @c3 := 0 FROM t ORDER BY t.c1) t1) t01 \
+             WHERE t01.c3 = {c3} AND t01.c2 = 'd'"
+        )
+    };
+    assert!(row_text(session.run(&query(1))).is_empty());
+    assert_eq!(
+        row_text(session.run(&query(2))),
+        [vec!["2".to_owned(), "d".to_owned(), "2".to_owned()]]
+    );
+}

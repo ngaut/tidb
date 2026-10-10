@@ -792,6 +792,13 @@ pub struct Session {
     /// Go `StmtCtx.useChunkAlloc` for the running statement: its result was
     /// produced through a valid reusable chunk allocator.
     pub(crate) use_chunk_alloc: bool,
+    /// Go `ExecStmt.OutputNames` of the statement's materialized query
+    /// result, one per column; empty for any other result. With
+    /// `last_result_current_db` they give Go `recordSet.Fields()`, which the
+    /// wire's column definitions and text rows read.
+    pub(crate) last_result_output_names: Vec<tidb_datatype::FieldNameMetadata>,
+    /// Go `SessionVars.CurrentDB` when that result's statement opened.
+    pub(crate) last_result_current_db: String,
     /// Go `SessionVars.preUseChunkAlloc`, promoted from the previous
     /// statement by `ExchangeChunkStatus`; `@@last_sql_use_alloc` reads it.
     pub(crate) pre_use_chunk_alloc: bool,
@@ -1038,6 +1045,8 @@ impl Session {
             found_in_plan_cache: false,
             prev_found_in_plan_cache: false,
             use_chunk_alloc: false,
+            last_result_output_names: Vec::new(),
+            last_result_current_db: String::new(),
             pre_use_chunk_alloc: tidb_vardef::defaults::DEF_TIDB_USE_ALLOC,
             user_vars: tidb_expr::user_vars::UserVars::new(),
             sequence_last_values: Arc::default(),
@@ -2381,6 +2390,15 @@ impl Session {
         }
     }
 
+    /// Go `ExecStmt.OutputNames` of the last statement's materialized query
+    /// result, one per column, and the `CurrentDB` it opened under: the
+    /// inputs of `colNames2ResultFields`. The names are empty when the
+    /// statement produced no query result or its plan had none.
+    #[must_use]
+    pub fn last_result_output_names(&self) -> (&[tidb_datatype::FieldNameMetadata], &str) {
+        (&self.last_result_output_names, &self.last_result_current_db)
+    }
+
     /// Parses and executes one SQL statement, reducing the output to rows
     /// or an affected count.
     pub fn run(&mut self, sql: &str) -> Result<StmtResult, DriverError> {
@@ -2464,6 +2482,7 @@ impl Session {
     // for queries and to execution itself for statements without results.
     fn begin_statement_execution(&mut self, sql: &str) -> Result<(), DriverError> {
         self.mpp_attempt_completed = false;
+        self.last_result_output_names.clear();
         if !self.external_executor_breakpoint_scope {
             self.executor_first_run_breakpoint
                 .store(false, std::sync::atomic::Ordering::Release);

@@ -40,7 +40,9 @@ use std::sync::Arc;
 
 use tidb_chunk::chunk::Chunk;
 use tidb_datatype::{Datum, FieldType, FieldTypeCode, UNSPECIFIED_LENGTH};
-use tidb_exec::{convert_result_field, ResultFieldMetadata, ResultFieldTypeMetadata};
+use tidb_exec::{
+    col_names_to_result_fields, convert_result_field, ResultFieldMetadata, ResultFieldTypeMetadata,
+};
 use tidb_protocol::ColumnInfo;
 use tidb_session::privilege::PrivilegeRegistry;
 use tidb_session::process::ProcessRegistry;
@@ -307,7 +309,7 @@ impl PipelineServerSession {
             StmtOutput::Rows { columns, rows } => {
                 let field_types = columns.iter().map(|(_, field)| field.clone()).collect();
                 let result = QueryResult::new(Box::new(MaterializedResultSetSource::new(
-                    select_columns(&columns),
+                    result_set_columns(&columns, self.session.last_result_output_names()),
                     rows,
                 )))
                 .with_cursor_materialization(
@@ -510,7 +512,9 @@ impl QuerySession for PipelineServerSession {
         let result_columns = match self.session.statement_kind_parsed(prepared.statement()) {
             StmtKind::Query => {
                 match self.session.probe_prepared(&prepared) {
-                    Ok(StmtOutput::Rows { columns, .. }) => select_columns(&columns),
+                    Ok(StmtOutput::Rows { columns, .. }) => {
+                        result_set_columns(&columns, self.session.last_result_output_names())
+                    }
                     Err(error @ tidb_executor::DriverError::Var(_)) => {
                         return Err(map_error(error));
                     }
@@ -592,9 +596,10 @@ impl QuerySession for PipelineServerSession {
     fn execute<'a>(&'a mut self, sql: &str) -> Result<QueryResult<'a>, SqlQueryError> {
         let process_statement = self.session.retain_process_statement(sql);
         let source = match self.session.run_with_columns(sql).map_err(map_error)? {
-            StmtOutput::Rows { columns, rows } => {
-                MaterializedResultSetSource::new(select_columns(&columns), rows)
-            }
+            StmtOutput::Rows { columns, rows } => MaterializedResultSetSource::new(
+                result_set_columns(&columns, self.session.last_result_output_names()),
+                rows,
+            ),
             // Writes normally answer through `execute_write` (a real OK
             // packet). These arms remain for a caller that invokes `execute`
             // directly, which the trait permits: report the count as a
@@ -684,13 +689,9 @@ fn map_error(error: tidb_executor::DriverError) -> SqlQueryError {
     SqlQueryError::new(mapped.code, mapped.state, mapped.message)
 }
 
-/// Converts the pipeline's `(name, FieldType)` output schema to protocol
-/// column metadata through the source-shaped `ConvertColumnInfo` port.
-///
-/// Simplification (documented): the seed driver does not yet resolve original
-/// schema/table/column names for the wire, so those identifier fields are
-/// empty and `org_name` mirrors the display name, as Go does for expression
-/// result fields.
+/// Converts a `(name, FieldType)` output schema with no plan names to
+/// protocol column metadata: no schema or table, and `org_name` mirroring the
+/// display name.
 pub(crate) fn select_columns(columns: &[(String, FieldType)]) -> Vec<ColumnInfo> {
     columns
         .iter()
@@ -705,6 +706,35 @@ pub(crate) fn select_columns(columns: &[(String, FieldType)]) -> Vec<ColumnInfo>
                 default_value: None,
                 field_type: result_field_type(field_type),
             })
+        })
+        .collect()
+}
+
+/// Go `tidbResultSet.Columns()`: `ConvertColumnInfo` over
+/// `recordSet.Fields()`, which `colNames2ResultFields` derives from the
+/// statement's output names and current database. A computed column has no
+/// table and an empty `OrgName`. Without one name per column the result has
+/// no fields to convert and takes [`select_columns`]' shape.
+pub(crate) fn result_set_columns(
+    columns: &[(String, FieldType)],
+    (output_names, current_db): (&[tidb_datatype::FieldNameMetadata], &str),
+) -> Vec<ColumnInfo> {
+    if output_names.len() != columns.len() {
+        return select_columns(columns);
+    }
+    let schema = columns
+        .iter()
+        .map(|(_, field_type)| result_field_type(field_type))
+        .collect::<Vec<_>>();
+    col_names_to_result_fields(&schema, output_names, current_db)
+        .iter()
+        .zip(columns)
+        .map(|(field, (name, _))| {
+            // The display name is the one the executor resolved for the
+            // result, which the integration results pin.
+            let mut field = field.as_result_field();
+            name.clone_into(&mut field.name);
+            convert_result_field(&field)
         })
         .collect()
 }
@@ -785,7 +815,10 @@ impl ResultSetSource for PreparedRecordSet<'_> {
     }
 
     fn columns(&mut self) -> Result<Vec<ColumnInfo>, tidb_executor::MysqlError> {
-        Ok(select_columns(self.state.columns()))
+        Ok(result_set_columns(
+            self.state.columns(),
+            self.state.output_names(),
+        ))
     }
 
     fn finish(&mut self) -> Result<(), tidb_executor::MysqlError> {

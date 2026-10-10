@@ -286,16 +286,17 @@ fn cell(value: &Datum) -> String {
 /// column's declared width says which. A harness that cannot tell those apart
 /// reports a divergence for a correct answer -- or, worse, a match for a
 /// wrong one.
-fn cell_bytes(field_type: &tidb_datatype::FieldType, value: &Datum) -> Vec<u8> {
+fn cell_bytes(
+    field_type: &tidb_datatype::FieldType,
+    table_is_empty: bool,
+    value: &Datum,
+) -> Vec<u8> {
     if value.is_null() {
         return b"NULL".to_vec();
     }
-    // `table_is_empty` is Go's `ColumnInfo.Table == ""`. This tier does not
-    // carry the source table on a result column, and the flag only decides
-    // whether a FIXED decimal precision is honoured, so the conservative
-    // reading -- treat every column as computed, format at full precision --
-    // is the one that cannot silently truncate a cell.
-    let column = tidb_protocol::TextColumn::from_field_type(field_type, true);
+    // `table_is_empty` is Go's `ColumnInfo.Table == ""`, which decides
+    // whether a DOUBLE/FLOAT's FIXED decimal precision is honoured.
+    let column = tidb_protocol::TextColumn::from_field_type(field_type, table_is_empty);
     match tidb_protocol::format_datum_text(column, value) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => b"NULL".to_vec(),
@@ -312,6 +313,7 @@ fn cell_bytes(field_type: &tidb_datatype::FieldType, value: &Datum) -> Vec<u8> {
 /// names, then one tab-separated line per row.
 fn render_rows(
     columns: &[(String, tidb_datatype::FieldType)],
+    output_names: &[tidb_datatype::FieldNameMetadata],
     rows: &[Vec<Datum>],
 ) -> Vec<Vec<u8>> {
     let mut out = vec![columns
@@ -327,7 +329,15 @@ fn render_rows(
                 line.push(b'\t');
             }
             match columns.get(index) {
-                Some((_, field_type)) => line.extend(cell_bytes(field_type, value)),
+                Some((_, field_type)) => {
+                    // Go `ResultField.TableAsName` is the output name's
+                    // `TblName` (colNames2ResultFields); a result without
+                    // names formats every column as computed.
+                    let table_is_empty = output_names
+                        .get(index)
+                        .is_none_or(|name| name.table.original.is_empty());
+                    line.extend(cell_bytes(field_type, table_is_empty, value));
+                }
                 None => line.extend(
                     value
                         .to_bytes()
@@ -514,7 +524,7 @@ fn warning_difference(session: &mut Session, want: Option<&[Vec<u8>]>) -> Option
                         line.push(b'\t');
                     }
                     match columns.get(index) {
-                        Some((_, field_type)) => line.extend(cell_bytes(field_type, value)),
+                        Some((_, field_type)) => line.extend(cell_bytes(field_type, true, value)),
                         None => line.extend(
                             value
                                 .to_bytes()
@@ -694,6 +704,7 @@ fn compare_output(
     }
     let started = std::time::Instant::now();
     let outcome = run_command(session, sql);
+    let output_names = session.last_result_output_names().0.to_vec();
     if traced {
         eprintln!("SQL< {}ms", started.elapsed().as_millis());
     }
@@ -718,7 +729,7 @@ fn compare_output(
             Err(None)
         }
         (Ok(StmtOutput::Rows { columns, rows }), false) => {
-            let mut ours = render_rows(&columns, &rows);
+            let mut ours = render_rows(&columns, &output_names, &rows);
             let mut theirs: Vec<Vec<u8>> = recorded.to_vec();
             if plan.is_some() {
                 // Drop the header on both sides: a plan's columns are fixed,

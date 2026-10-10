@@ -130,6 +130,10 @@ impl PendingQuery {
             transaction_end,
             execute_opened_at: _,
         } = self;
+        session.last_result_output_names = record_set.output_names().to_vec();
+        record_set
+            .current_db()
+            .clone_into(&mut session.last_result_current_db);
         let result = record_set.collect();
         context.drain_fold_warnings();
         session.drain_eval_warnings(&context);
@@ -172,6 +176,13 @@ impl StatementRecordSet {
     /// Metadata remains available after Finish or Close, as in Go.
     pub fn columns(&self) -> &[(String, FieldType)] {
         self.query.record_set.columns()
+    }
+
+    /// Go `ExecStmt.OutputNames`, one per column, and the `CurrentDB` the
+    /// statement opened under: the inputs of `colNames2ResultFields`.
+    pub fn output_names(&self) -> (&[tidb_datatype::FieldNameMetadata], &str) {
+        let record_set = &self.query.record_set;
+        (record_set.output_names(), record_set.current_db())
     }
 
     /// Allocates the result's configured chunk shape.
@@ -311,6 +322,10 @@ impl SessionRecordSet<'_> {
     /// Result metadata, including after Finish.
     pub fn columns(&self) -> &[(String, FieldType)] {
         self.state.columns()
+    }
+    /// See [`StatementRecordSet::output_names`].
+    pub fn output_names(&self) -> (&[tidb_datatype::FieldNameMetadata], &str) {
+        self.state.output_names()
     }
     /// Allocates a chunk with this statement's schema and sizing.
     pub fn new_chunk(&self) -> Chunk {

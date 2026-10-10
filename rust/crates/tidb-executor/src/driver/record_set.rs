@@ -23,6 +23,11 @@ use crate::{Executor, StatementMemory};
 pub struct QueryRecordSet {
     executor: Option<Box<dyn Executor>>,
     columns: Vec<(String, FieldType)>,
+    /// Go `ExecStmt.OutputNames`, one per column; empty when the plan has
+    /// none.
+    output_names: Vec<tidb_datatype::FieldNameMetadata>,
+    /// Go `SessionVars.CurrentDB` when the statement opened.
+    current_db: String,
     memory: StatementMemory,
     init_cap: usize,
     max_chunk_size: usize,
@@ -45,13 +50,41 @@ impl QueryRecordSet {
             max_chunk_size: executor.max_chunk_size(),
             executor: Some(executor),
             columns,
+            output_names: Vec::new(),
+            current_db: String::new(),
             memory,
         })
+    }
+
+    /// Attaches the plan's output names and the current database, from
+    /// which `colNames2ResultFields` derives Go `recordSet.Fields()`.
+    #[must_use]
+    pub(super) fn with_output_names(
+        mut self,
+        output_names: Vec<tidb_datatype::FieldNameMetadata>,
+        current_db: &str,
+    ) -> Self {
+        if output_names.len() == self.columns.len() {
+            self.output_names = output_names;
+            current_db.clone_into(&mut self.current_db);
+        }
+        self
     }
 
     /// Result field names and types, including after `finish`.
     pub fn columns(&self) -> &[(String, FieldType)] {
         &self.columns
+    }
+
+    /// Go `ExecStmt.OutputNames`, one per column; empty when the plan has
+    /// none.
+    pub fn output_names(&self) -> &[tidb_datatype::FieldNameMetadata] {
+        &self.output_names
+    }
+
+    /// Go `SessionVars.CurrentDB` as the statement saw it.
+    pub fn current_db(&self) -> &str {
+        &self.current_db
     }
 
     /// Go `recordSet.NewChunk`, retaining schema after the executor closes.

@@ -2723,3 +2723,85 @@ fn session_migration_moves_text_and_binary_prepared_handles_over_mysql() {
     target.shutdown(std::net::Shutdown::Both).unwrap();
     worker.join().unwrap();
 }
+
+/// Source: `tidbResultSet.Columns()` (`ConvertColumnInfo` over
+/// `recordSet.Fields()`) and `dumpTextRow`.
+///
+/// A table column's definition names its schema, visible and original table
+/// and original column, so a DOUBLE(7,4) column of a table prints at full
+/// precision; a computed column (IFNULL keeps DOUBLE(7,4)) has no table and an
+/// empty `org_name`, and prints at its fixed decimals.
+#[test]
+fn query_column_definitions_carry_result_field_names() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let tracker = Arc::new(ConnectionTracker::default());
+    let worker_tracker = Arc::clone(&tracker);
+    let worker = std::thread::spawn(move || {
+        let (stream, peer_addr) = listener.accept().unwrap();
+        let store = users();
+        serve_mysql_connection(
+            stream,
+            peer_addr,
+            ConnectionCancellation::default(),
+            &PipelineSessionFactory::with_configured_store(&store),
+            &store,
+            &worker_tracker,
+            DEFAULT_MAX_ALLOWED_PACKET,
+        )
+        .unwrap()
+    });
+
+    let mut client = TcpStream::connect(address).unwrap();
+    let read_side = client.try_clone().unwrap();
+    let mut reader = PacketReader::new(read_side);
+    authenticate(&mut client, &mut reader);
+    run_write(
+        &mut client,
+        &mut reader,
+        "CREATE TABLE fields_t (id INT PRIMARY KEY, d DOUBLE(7,4))",
+    );
+    run_write(
+        &mut client,
+        &mut reader,
+        "INSERT INTO fields_t VALUES (1, 123.45)",
+    );
+
+    let mut command = vec![COM_QUERY];
+    command.extend_from_slice(b"SELECT d, IFNULL(d, 0) AS e FROM fields_t AS x");
+    write_packet(&mut client, 0, &command);
+    reader.set_sequence(1);
+    assert_eq!(reader.read_packet().unwrap(), [2]);
+    let definitions = (0..2)
+        .map(|_| {
+            let packet = reader.read_packet().unwrap();
+            let mut remaining = packet.as_slice();
+            // catalog, schema, table, org_table, name, org_name.
+            (0..6)
+                .map(|_| String::from_utf8(read_length_encoded_string(&mut remaining)).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        definitions,
+        [
+            ["def", "test", "x", "fields_t", "d", "d"],
+            ["def", "", "", "", "e", ""],
+        ]
+    );
+    let packet = reader.read_packet().unwrap();
+    let mut remaining = packet.as_slice();
+    assert_eq!(
+        [
+            read_text_value(&mut remaining),
+            read_text_value(&mut remaining)
+        ],
+        ["123.45", "123.4500"]
+    );
+    let terminal = reader.read_packet().unwrap();
+    assert_eq!(terminal[0], 0xfe);
+
+    write_packet(&mut client, 0, &[0x01]);
+    drop(client);
+    assert_eq!(worker.join().unwrap().exit, ConnectionExit::Quit);
+}

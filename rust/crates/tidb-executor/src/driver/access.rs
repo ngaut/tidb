@@ -40,6 +40,9 @@ use tidb_chunk::chunk::Chunk;
 struct FastPointOutput {
     offsets: Vec<usize>,
     columns: Vec<(String, FieldType)>,
+    /// The table's visible name (its alias when it has one): every output
+    /// column's `TableAsName`.
+    table_alias: String,
 }
 
 /// One residual `column = ?`/`column = const` conjunct of a cached point
@@ -1829,6 +1832,25 @@ pub fn open_prepared_point_get(
     let schema = fast_point_schema(kv, &plan.output);
     let statistics = catalog.table_statistics(kv.stats_physical_id());
     let columns = plan.output.columns.clone();
+    // The point plan's output names: each column is a column of the one
+    // table (Go buildSchemaFromFields).
+    let output_names = plan
+        .output
+        .offsets
+        .iter()
+        .zip(&columns)
+        .map(|(&offset, (name, _))| tidb_datatype::FieldNameMetadata {
+            original_table: tidb_datatype::IdentifierMetadata::new(plan.table.clone()),
+            original_column: tidb_datatype::IdentifierMetadata::new(
+                kv.columns()
+                    .get(offset)
+                    .map_or_else(String::new, |column| column.name.clone()),
+            ),
+            database: tidb_datatype::IdentifierMetadata::new(plan.database.clone()),
+            table: tidb_datatype::IdentifierMetadata::new(plan.output.table_alias.clone()),
+            column: tidb_datatype::IdentifierMetadata::new(name.clone()),
+        })
+        .collect();
     // Go buildPointGet sets both capacities to one (point_get.go:94).
     let executor = PreparedPointGetExecutor {
         meta: crate::ExecutorMeta::new(schema, 0, 1, 1),
@@ -1839,7 +1861,9 @@ pub fn open_prepared_point_get(
         statistics,
         done: false,
     };
-    super::QueryRecordSet::open(Box::new(executor), columns, stmt_ctx.statement_memory()).map(Some)
+    let current_db = stmt_ctx.current_database_name().unwrap_or_default();
+    super::QueryRecordSet::open(Box::new(executor), columns, stmt_ctx.statement_memory())
+        .map(|record_set| Some(record_set.with_output_names(output_names, current_db)))
 }
 
 struct PreparedPointGetExecutor {
@@ -2398,7 +2422,11 @@ fn fast_dml_point_output(table: &KvTable) -> FastPointOutput {
                 .with_flags(tidb_datatype::FieldTypeFlags::NOT_NULL),
         ));
     }
-    FastPointOutput { offsets, columns }
+    FastPointOutput {
+        offsets,
+        columns,
+        table_alias: table.name.clone(),
+    }
 }
 
 fn fast_point_output(select: &tidb_ast::SelectStmt, scope: &FromScope) -> Option<FastPointOutput> {
@@ -2446,7 +2474,11 @@ fn fast_point_output(select: &tidb_ast::SelectStmt, scope: &FromScope) -> Option
             }
         }
     }
-    Some(FastPointOutput { offsets, columns })
+    Some(FastPointOutput {
+        offsets,
+        columns,
+        table_alias: scope.tables.first()?.name.clone(),
+    })
 }
 
 fn point_get_consumes_where(
