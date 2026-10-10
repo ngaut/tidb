@@ -2092,9 +2092,10 @@ fn try_fast_point_physical_plan_with_allocator_mode(
     plan_ids: &tidb_planner::plan_base::PlanIdAllocator,
     dml_source: bool,
 ) -> Result<Option<tidb_planner::physical::PhysicalPlan>, DriverError> {
-    if ctx
-        .optimizer_fix_control()
-        .get_bool_with_default(tidb_planner::fix_control::FIX_52592, false)
+    if ctx.stable_result_mode()
+        || ctx
+            .optimizer_fix_control()
+            .get_bool_with_default(tidb_planner::fix_control::FIX_52592, false)
         || select.into_outfile.is_some()
         || select.lock.is_some()
     {
@@ -2179,28 +2180,58 @@ fn try_fast_point_physical_plan_with_allocator_mode(
             if batch.constants.is_some() {
                 return Ok(None);
             }
-            // Go newBatchPointGetPlan requires a bare partition column.
-            // Secondary and common keys need their own index-value routing.
+            // Go newBatchPointGetPlan requires a bare partition column
+            // (`PartitionExpr().Expr` is a `*expression.Column`), which the
+            // COLUMNS and KEY forms do not carry.
             if !matches!(
                 partition.kind,
                 crate::partition_routing::PartitionKind::Hash
+                    | crate::partition_routing::PartitionKind::Range { .. }
+                    | crate::partition_routing::PartitionKind::List { .. }
             ) || !matches!(partition.expr, Expression::Column(_))
-                || batch.index.is_some()
-                || batch.common_handle
-                || table.pk_handle_offset().is_none()
             {
                 return Ok(None);
             }
-            let handles = batch
-                .key_values
-                .iter()
-                .map(|values| match values.as_slice() {
-                    [Datum::Int(value)] => Ok(TableHandle::Int(*value)),
-                    [Datum::UInt(value)] => Ok(TableHandle::Int(*value as i64)),
-                    _ => Err(DriverError::unsupported("invalid partition batch handle")),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let routes = table.handle_partition_routes(&handles, &scope.zone, ctx);
+            // Go `PrunePartitionsAndValues`: an integer handle routes as the
+            // handle column's value, a common handle or unique index by its
+            // `IndexValues` placed at their columns (`getPartitionIdxs`).
+            let routes = if batch.index.is_none() && !batch.common_handle {
+                if table.pk_handle_offset().is_none() {
+                    return Ok(None);
+                }
+                let handles = batch
+                    .key_values
+                    .iter()
+                    .map(|values| match values.as_slice() {
+                        [Datum::Int(value)] => Ok(TableHandle::Int(*value)),
+                        [Datum::UInt(value)] => Ok(TableHandle::Int(*value as i64)),
+                        _ => Err(DriverError::unsupported("invalid partition batch handle")),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                table.handle_partition_routes(&handles, &scope.zone, ctx)
+            } else {
+                let offsets = match &batch.index {
+                    Some((index_id, _)) => {
+                        let Some(index) = table.plan_indexes().find(|index| index.id == *index_id)
+                        else {
+                            return Ok(None);
+                        };
+                        index.column_offsets.clone()
+                    }
+                    None => table.common_handle_offsets().to_vec(),
+                };
+                batch
+                    .key_values
+                    .iter()
+                    .map(|values| {
+                        let mut row = vec![Datum::Null; table.columns.len()];
+                        for (offset, value) in offsets.iter().zip(values) {
+                            *row.get_mut(*offset)? = value.clone();
+                        }
+                        table.row_partition_route(&row, ctx)
+                    })
+                    .collect()
+            };
             let mut ids = Vec::with_capacity(routes.len());
             let mut keys = Vec::with_capacity(routes.len());
             for (key, route) in batch.key_values.into_iter().zip(routes) {

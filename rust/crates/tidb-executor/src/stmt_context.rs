@@ -1050,6 +1050,10 @@ pub struct StmtContextData {
     /// `INSERT ... SELECT` must say `InInsertStmt`, and only the statement
     /// knows that.
     statement_class: StatementClass,
+    /// Go `SessionVars.EnableStableResultMode`
+    /// (`tidb_enable_ordered_result_mode`); see
+    /// [`StmtContext::stable_result_mode`].
+    enable_stable_result_mode: bool,
     /// Whether executor construction installed a physical table reader for
     /// this statement. Go records the corresponding table IDs while building
     /// those readers; `SLEEP` needs only the empty/non-empty distinction when
@@ -1668,6 +1672,13 @@ context_configuration! {
         self
     }
 
+    /// Records `tidb_enable_ordered_result_mode`.
+    #[must_use]
+    pub fn with_enable_stable_result_mode(mut self, enabled: bool) -> Self {
+        self.enable_stable_result_mode = enabled;
+        self
+    }
+
     /// Installs the existing statement phase notification.
     pub fn with_statement_phase_observer(
         mut self,
@@ -2277,6 +2288,7 @@ impl StmtContext {
             apply_cache_capacity: tidb_vardef::defaults::DEF_TIDB_MEM_QUOTA_APPLY_CACHE,
             enable_parallel_apply: false,
             statement_class: StatementClass::Other,
+            enable_stable_result_mode: false,
             has_physical_table_reader: Arc::default(),
             chunk_alloc_valid: Arc::default(),
             txn_read_snapshot: None,
@@ -2317,6 +2329,22 @@ impl StmtContext {
     #[must_use]
     pub fn statement_class(&self) -> StatementClass {
         self.statement_class
+    }
+
+    /// Go `checkStableResultMode`: the variable is on and the statement is
+    /// no INSERT, UPDATE, DELETE or LOAD DATA. The optimizer then runs
+    /// `ResultReorder`, and `TryFastPlan` declines because that rule has not
+    /// shaped a fast plan.
+    #[must_use]
+    pub fn stable_result_mode(&self) -> bool {
+        self.enable_stable_result_mode
+            && !matches!(
+                self.statement_class,
+                StatementClass::Insert
+                    | StatementClass::Update
+                    | StatementClass::Delete
+                    | StatementClass::LoadData
+            )
     }
 
     /// Keeps evaluation inputs and statement effects shared while collecting

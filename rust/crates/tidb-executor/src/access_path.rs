@@ -1277,6 +1277,7 @@ impl UniqueIndexPointSourceExec {
                 .table
                 .plan_indexes()
                 .any(|index| index.id == self.index_id && index.clustered_primary);
+        let mut routed_partitions: Option<Vec<i64>> = None;
         let mut handles: Vec<TableHandle> = if common_primary {
             self.index_values
                 .iter()
@@ -1307,11 +1308,13 @@ impl UniqueIndexPointSourceExec {
                 .map(|(handle, _)| handle)
                 .collect()
         } else {
-            self.table
-                .lookup_unique_batched_with_partition(
+            let found = self
+                .table
+                .lookup_unique_batched_routed(
                     self.index_id,
                     &self.index_values,
                     self.decode_context.zone(),
+                    Some(self.decode_context.expression()),
                 )
                 .map_err(|error| {
                     ExecError::unsupported(format!("unique index batch lookup failed: {error:?}"))
@@ -1319,8 +1322,15 @@ impl UniqueIndexPointSourceExec {
                 .into_iter()
                 .flatten()
                 .filter(|(_, partition)| self.partition_allowed(*partition))
-                .map(|(handle, _)| handle)
-                .collect()
+                .collect::<Vec<_>>();
+            // Each row reads from the partition its key routed to (or its
+            // global entry recorded), as Go's second BatchGet does.
+            if self.table.partition().is_some()
+                && found.iter().all(|(_, partition)| partition.is_some())
+            {
+                routed_partitions = Some(found.iter().filter_map(|(_, id)| *id).collect());
+            }
+            found.into_iter().map(|(handle, _)| handle).collect()
         };
         let Some(first) = handles.first().cloned() else {
             return Ok(());
@@ -1347,6 +1357,7 @@ impl UniqueIndexPointSourceExec {
                 self.output_columns.clone(),
                 self.decode_context.clone(),
             )
+            .with_partition_ids(routed_partitions)
         };
         source.open()?;
         self.source = Some(source);

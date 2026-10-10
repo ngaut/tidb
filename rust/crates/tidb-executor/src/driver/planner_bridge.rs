@@ -2844,6 +2844,7 @@ impl DriverCteOptimizer<'_> {
         if let Some(error) = initializer.error {
             return Err(error);
         }
+        let opt_flag = adjust_optimization_flags(opt_flag, ctx);
         let optimized = logical_optimize(rule_context, opt_flag, plan)
             .map_err(|(_, error)| error)?
             .plan;
@@ -3394,6 +3395,7 @@ fn optimize_built_logical(
         flags & !flags::PARTITION_PROCESSOR
     };
     let flags = tidb_planner::logical::rule::add_second_column_prune(flags);
+    let flags = adjust_optimization_flags(flags, ctx);
     let function_builder = RealFunctionBuilder::new(ctx);
     let statistics_load = PlannerStatisticsLoad {
         catalog,
@@ -3678,6 +3680,16 @@ pub(super) fn deferred_rebuild_context(
     values: &[tidb_datatype::Datum],
 ) -> Option<crate::StmtContext> {
     ctx.map(|ctx| ctx.clone().with_prepared_params(std::sync::Arc::from(values)))
+}
+
+/// Go `adjustOptimizationFlags` (`VolcanoOptimize`, run for the statement
+/// and for each CTE part): stable result mode adds `ResultReorder`.
+fn adjust_optimization_flags(flags: u64, ctx: &crate::StmtContext) -> u64 {
+    if ctx.stable_result_mode() {
+        flags | tidb_planner::logical::rule::flags::STABILIZE_RESULTS
+    } else {
+        flags
+    }
 }
 
 /// Builds the same logical and physical plan as ordinary execution, with

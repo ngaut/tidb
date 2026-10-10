@@ -388,3 +388,95 @@ fn a_static_mode_batch_point_get_names_every_partition_it_reads() {
         ]
     );
 }
+
+/// `planner/core/point_get_plan.test`: Go's `newBatchPointGetPlan` plans a
+/// partitioned table whose partition expression is a bare column, in either
+/// prune mode, and `PrunePartitionsAndValues` routes each key to its
+/// partition: one Batch_Point_Get over the partitions the keys touch, rows
+/// in key order.
+#[test]
+fn a_partitioned_common_handle_batch_routes_each_key() {
+    let mut session = Session::new();
+    session
+        .run("set @@tidb_partition_prune_mode = 'static'")
+        .unwrap();
+    session
+        .run("set tidb_enable_clustered_index = 'ON'")
+        .unwrap();
+    session
+        .run("create table t(a int, b int, c int, primary key (a, b)) PARTITION BY HASH(a) PARTITIONS 4")
+        .unwrap();
+    session
+        .run("insert into t values (1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4)")
+        .unwrap();
+    let sql = "select * from t where (a, b) in ((1, 1), (2, 2), (3, 3), (4, 4))";
+    let plan = row_text(session.run(&format!("explain format='brief' {sql}")));
+    assert_eq!(plan.len(), 1, "{plan:?}");
+    assert_eq!(plan[0][0], "Batch_Point_Get");
+    assert_eq!(
+        plan[0][3],
+        "table:t, partition:p0,p1,p2,p3, clustered index:PRIMARY(a, b)"
+    );
+    assert_eq!(
+        row_text(session.run(sql)),
+        [
+            ["1", "1", "1"],
+            ["2", "2", "2"],
+            ["3", "3", "3"],
+            ["4", "4", "4"]
+        ]
+    );
+    // A key no partition holds drops out; none left is a TableDual.
+    session
+        .run("create table r(a int primary key) partition by range (a) (partition p0 values less than (10))")
+        .unwrap();
+    let plan = row_text(session.run("explain format='brief' select * from r where a in (20, 30)"));
+    assert_eq!(plan[0][0], "TableDual");
+}
+
+/// `planner/core/casetest/rule/rule_result_reorder.test`: with
+/// `tidb_enable_ordered_result_mode` Go's `TryFastPlan` declines
+/// (`checkStableResultMode`) and the optimizer runs `ResultReorder`, so the
+/// partitioned `IN` is an ordered range read rather than a fast batch.
+#[test]
+fn ordered_result_mode_skips_the_fast_plan_and_orders_the_read() {
+    let mut session = Session::new();
+    session
+        .run("set tidb_enable_ordered_result_mode = 1")
+        .unwrap();
+    session
+        .run("create table thash (a int primary key, b int) partition by hash(a) partitions 4")
+        .unwrap();
+    let plan =
+        row_text(session.run("explain format='brief' select * from thash where a in (1, 200)"));
+    assert_eq!(plan[0][0], "TableReader");
+    assert_eq!(
+        plan[1][4],
+        "range:[1,1], [200,200], keep order:true, stats:pseudo"
+    );
+}
+
+/// `executor/write.test`: a routed Batch_Point_Get over a LOCAL unique index
+/// reads each key's entry in the partition it routes to (Go
+/// `getPartitionIdxs`), for a read and for the UPDATE built on it.
+#[test]
+fn a_partitioned_unique_index_batch_reads_each_keys_partition() {
+    let mut session = Session::new();
+    session
+        .run(
+            "create table t (id int, name varchar(10), unique index idx (id)) partition by list (id) \
+             (partition p0 values in (3,5,6,9,17), partition p1 values in (1,2,10,11,19,20), \
+             partition p2 values in (4,12,13,14,18), partition p3 values in (7,8,15,16,null))",
+        )
+        .unwrap();
+    session
+        .run("insert into t values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
+        .unwrap();
+    session
+        .run("update t set name = 'x' where id in (1, 3, 4, 99)")
+        .unwrap();
+    assert_eq!(
+        row_text(session.run("select * from t where id in (1, 2, 3, 4)")),
+        [["1", "x"], ["2", "b"], ["3", "x"], ["4", "x"]]
+    );
+}

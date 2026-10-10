@@ -106,3 +106,22 @@ fn keys_examined_accumulates_until_flush_status() {
     assert_eq!(keys_examined(&mut session), "20");
     assert!(row_text(session.run("show global status like 'tidb_keys_examined'")).is_empty());
 }
+
+/// Go's `FinishExecuteStmt` adds a write statement's coprocessor reads to
+/// `KeysExamined` too (oracle: 5 after a full-table UPDATE of five rows, 10
+/// after a DELETE scanning them again); only the limit exempts DML.
+#[test]
+fn a_write_statements_reads_join_keys_examined() {
+    let mut session = Session::new();
+    session
+        .run("create table t (id int primary key auto_increment, val int)")
+        .unwrap();
+    session
+        .run("insert into t (val) values (1),(2),(3),(4),(5)")
+        .unwrap();
+    session.run("flush status").unwrap();
+    session.run("update t set val = val + 1").unwrap();
+    assert_eq!(keys_examined(&mut session), "5");
+    session.run("delete from t where val > 4").unwrap();
+    assert_eq!(keys_examined(&mut session), "10");
+}

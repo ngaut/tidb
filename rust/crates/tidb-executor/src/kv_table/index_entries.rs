@@ -1008,6 +1008,21 @@ impl KvTable {
         values: &[Vec<Datum>],
         zone: &SessionTimeZone,
     ) -> Result<Vec<Option<(TableHandle, Option<i64>)>>, KvTableError> {
+        self.lookup_unique_batched_routed(index_id, values, zone, None::<&crate::StmtContext>)
+    }
+
+    /// [`Self::lookup_unique_batched_with_partition`] over a partitioned
+    /// table's LOCAL unique index: Go `BatchPointGetPlan.getPartitionIdxs`
+    /// routes each key by its `IndexValues` and reads its entry under that
+    /// partition's physical id, which each found row reports back. A key no
+    /// retained partition holds finds nothing.
+    pub(crate) fn lookup_unique_batched_routed(
+        &mut self,
+        index_id: i64,
+        values: &[Vec<Datum>],
+        zone: &SessionTimeZone,
+        route_ctx: Option<&impl tidb_expr::Columns>,
+    ) -> Result<Vec<Option<(TableHandle, Option<i64>)>>, KvTableError> {
         let Some(index) = self
             .indexes
             .iter()
@@ -1026,25 +1041,51 @@ impl KvTable {
         } else {
             self.record_physical_ids()
         };
-        let [physical_id] = physical_ids.as_slice() else {
-            return Err(KvTableError::Decode(
-                "batch unique lookup requires one retained physical table".to_owned(),
-            ));
+        let routed = match (physical_ids.as_slice(), route_ctx) {
+            ([_], _) => None,
+            (_, Some(ctx)) if self.partition.is_some() => Some(ctx),
+            _ => {
+                return Err(KvTableError::Decode(
+                    "batch unique lookup requires one retained physical table".to_owned(),
+                ))
+            }
         };
         let mut keys = Vec::with_capacity(values.len());
+        let mut routes = Vec::with_capacity(values.len());
         for values in values {
             if values.len() != index.column_offsets.len() || values.contains(&Datum::Null) {
                 keys.push(None);
+                routes.push(None);
                 continue;
             }
+            let physical_id = match routed {
+                None => physical_ids[0],
+                Some(ctx) => {
+                    let mut row = vec![Datum::Null; self.columns.len()];
+                    for (offset, value) in index.column_offsets.iter().zip(values) {
+                        if let Some(slot) = row.get_mut(*offset) {
+                            *slot = value.clone();
+                        }
+                    }
+                    match self.row_partition_route(&row, ctx) {
+                        Some((_, id)) if physical_ids.contains(&id) => id,
+                        _ => {
+                            keys.push(None);
+                            routes.push(None);
+                            continue;
+                        }
+                    }
+                }
+            };
             let encoded = Encoder::new(self.use_new_collation)
                 .encode_key_in_timezone(zone, values)
                 .map_err(|error| KvTableError::Encode(format!("{error:?}")))?;
             keys.push(Some(Key::from_bytes(encode_index_seek_key(
-                *physical_id,
+                physical_id,
                 index.id,
                 &encoded,
             ))));
+            routes.push(routed.map(|_| physical_id));
         }
         let request = keys.iter().flatten().cloned().collect::<Vec<_>>();
         let entries = if request.is_empty() {
@@ -1053,7 +1094,8 @@ impl KvTable {
             self.store.batch_get(&request).map_err(KvTableError::from)?
         };
         keys.into_iter()
-            .map(|key| {
+            .zip(routes)
+            .map(|(key, route)| {
                 let Some(key) = key else {
                     return Ok(None);
                 };
@@ -1065,7 +1107,10 @@ impl KvTable {
                             .ok_or_else(|| {
                                 KvTableError::Decode("index value contains no handle".to_owned())
                             })?;
-                        Ok((convert_handle(&handle), global_partition_id(&handle)))
+                        Ok((
+                            convert_handle(&handle),
+                            route.or_else(|| global_partition_id(&handle)),
+                        ))
                     })
                     .transpose()
             })
