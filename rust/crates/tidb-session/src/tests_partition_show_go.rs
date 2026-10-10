@@ -203,4 +203,55 @@ fn show_statements_follow_go() {
         row_text(session.run("show variables like 'AUTHENTICATION_LDAP_SASL_BIND_ROOT_PWD'")),
         vec![vec!["authentication_ldap_sasl_bind_root_pwd", "******"]]
     );
+    // Go `fetchShowPrivileges`' static table goes from Proxy straight to
+    // References; it lists no OPERATE VIEW row.
+    let privileges: Vec<String> = row_text(session.run("show privileges"))
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    let proxy = privileges.iter().position(|name| name == "Proxy").unwrap();
+    assert_eq!(privileges[proxy + 1], "References");
+    assert!(!privileges
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("Operate view")));
+}
+
+/// Go TestPartitionInNonUTF8Charset: a partition bound is evaluated under the
+/// session context, so under `character_set_connection = gbk` the literal
+/// '你好' is a GBK string and a VARBINARY partition column stores its GBK
+/// bytes -- the same bytes INSERT writes, so the row routes to the partition
+/// that lists it.
+#[test]
+fn partition_bound_literal_takes_the_connection_charset() {
+    let mut session = Session::new();
+    session.run("set character_set_connection = gbk").unwrap();
+    session
+        .run(
+            "create table t (col1 varbinary(16) unique key) partition by list columns(col1) \
+             (partition p0 values in ('你好', '我好'), partition p1 values in ('大家好'), \
+             partition p2 default)",
+        )
+        .unwrap();
+    assert!(create_text(&mut session, "t").contains(
+        "(PARTITION `p0` VALUES IN (_binary 0xc4e3bac3,_binary 0xced2bac3),\n \
+         PARTITION `p1` VALUES IN (_binary 0xb4f3bcd2bac3),"
+    ));
+    session.run("insert into t values ('你好')").unwrap();
+    assert_eq!(
+        row_text(session.run("select hex(col1) from t partition(p0)")),
+        vec![vec!["C4E3BAC3"]]
+    );
+    session.run("drop table t").unwrap();
+    session
+        .run(
+            "create table t (col1 varbinary(16) unique key) partition by range columns(col1) \
+             (partition p0 values less than ('你好'), partition p1 values less than ('我好'), \
+             partition p2 values less than maxvalue)",
+        )
+        .unwrap();
+    session.run("insert into t values ('你好')").unwrap();
+    assert_eq!(
+        row_text(session.run("select hex(col1) from t partition(p1)")),
+        vec![vec!["C4E3BAC3"]]
+    );
 }

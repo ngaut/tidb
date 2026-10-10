@@ -622,42 +622,54 @@ pub(crate) fn timestamp_diff(vals: &[Datum]) -> Result<Datum, EvalError> {
 
 /// `TO_DAYS(date)`, implemented through the same zero-date day number used by
 /// `types.TimestampDiff("DAY", types.ZeroDate, date)`.  This preserves the
-/// source's year-zero `0000-01-01 -> 1` behavior while rejecting invalid
-/// zero-date components and malformed time suffixes.
-pub(crate) fn to_days(vals: &[Datum]) -> Result<Datum, EvalError> {
-    if vals.len() != 1 {
+/// source's year-zero `0000-01-01 -> 1` behavior; an invalid zero date, or a
+/// date with no day number, warns and is NULL (`builtinToDaysSig`).
+pub(crate) fn to_days(vals: &[Datum], cols: &dyn Columns) -> Result<Datum, EvalError> {
+    let [value] = vals else {
         return Err(EvalError::Unsupported("bad function arity"));
+    };
+    let Some(time) = super::checked_date_arg(value, cols, tidb_datatype::Time::invalid_zero)?
+    else {
+        return Ok(Datum::Null);
+    };
+    let core = time.core_time();
+    let days = time_diff_daynr(
+        i64::from(core.year()),
+        u32::from(core.month()),
+        u32::from(core.day()),
+    );
+    if days == 0 {
+        cols.handle_truncate(&format!("Incorrect datetime value: '{time}'"))?;
+        return Ok(Datum::Null);
     }
-    let Some(value) = coerce_str(&vals[0])? else {
-        return Ok(Datum::Null);
-    };
-    let Some(value) = parse_timestamp_diff_datetime(&value) else {
-        return Ok(Datum::Null);
-    };
-    Ok(Datum::Int(time_diff_daynr(
-        value.year,
-        value.month,
-        value.day,
-    )))
+    Ok(Datum::Int(days))
 }
 
 /// `TO_SECONDS(date)`, implemented through the same zero-date timestamp
-/// arithmetic as the Go builtin.  Fractional seconds are deliberately
-/// ignored because the source's `SECOND` unit returns whole seconds.
-pub(crate) fn to_seconds(vals: &[Datum]) -> Result<Datum, EvalError> {
-    if vals.len() != 1 {
+/// arithmetic as the Go builtin (`builtinToSecondsSig`).  Fractional seconds
+/// are deliberately ignored because the source's `SECOND` unit returns whole
+/// seconds; an invalid zero date, or a zero result, warns and is NULL.
+pub(crate) fn to_seconds(vals: &[Datum], cols: &dyn Columns) -> Result<Datum, EvalError> {
+    let [value] = vals else {
         return Err(EvalError::Unsupported("bad function arity"));
+    };
+    let Some(time) = super::checked_date_arg(value, cols, tidb_datatype::Time::invalid_zero)?
+    else {
+        return Ok(Datum::Null);
+    };
+    let core = time.core_time();
+    let seconds = time_diff_daynr(
+        i64::from(core.year()),
+        u32::from(core.month()),
+        u32::from(core.day()),
+    ) * 86_400
+        + i64::from(core.hour()) * 3_600
+        + i64::from(core.minute()) * 60
+        + i64::from(core.second());
+    if seconds == 0 {
+        cols.handle_truncate(&format!("Incorrect datetime value: '{time}'"))?;
+        return Ok(Datum::Null);
     }
-    let Some(value) = coerce_str(&vals[0])? else {
-        return Ok(Datum::Null);
-    };
-    let Some(value) = parse_timestamp_diff_datetime(&value) else {
-        return Ok(Datum::Null);
-    };
-    let seconds = time_diff_daynr(value.year, value.month, value.day) * 86_400
-        + i64::from(value.hour) * 3_600
-        + i64::from(value.minute) * 60
-        + i64::from(value.second);
     Ok(Datum::Int(seconds))
 }
 

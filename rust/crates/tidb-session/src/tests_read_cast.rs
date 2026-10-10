@@ -350,3 +350,38 @@ fn the_relaxed_parse_does_not_reach_date_arithmetic_or_comparisons() {
         );
     }
 }
+
+/// Go `builtinCastStringAsTimeSig.vecEvalTime`: a date part that is not an
+/// integer fails `ParseTime` inside strconv (`scanTimeArgs`), which the cast
+/// reports as 8034 with the raw text; the other failures stay 1292. Captured
+/// from Go TiDB, for a constant and for a column alike.
+#[test]
+fn a_non_integer_date_part_warns_8034() {
+    let mut session = Session::new();
+    session.run("CREATE TABLE s (v VARCHAR(64))").unwrap();
+    for (value, code, quoted) in [
+        ("4#,8?Q", 8034, "4#,8?Q"),
+        ("2020-01-01x", 8034, "2020-01-01x"),
+        ("2020-01-01 10:10:1x", 8034, "2020-01-01 10:10:1x"),
+        ("2020-01-x", 8034, "2020-01-x"),
+        ("2020-01-01 xx:10:10", 1292, "2020-01-01 xx:10:10"),
+        ("99999999999-01-01", 1292, "99999999999-01-01"),
+        ("2020-01-32", 1292, "2020-01-32"),
+        ("2020-13-01", 1292, "2020-13-1"),
+        ("abc", 1292, "abc"),
+    ] {
+        let expected = [(code, format!("Incorrect datetime value: '{quoted}'"))];
+        for target in ["DATE", "DATETIME"] {
+            let sql = format!("SELECT CAST('{value}' AS {target})");
+            assert_eq!(rows(&mut session, &sql), [["NULL"]], "{sql}");
+            assert_eq!(warnings(&session), expected, "{sql}");
+        }
+        session.run("DELETE FROM s").unwrap();
+        session
+            .run(&format!("INSERT INTO s VALUES ('{value}')"))
+            .unwrap();
+        let sql = "SELECT CAST(v AS DATE) FROM s";
+        assert_eq!(rows(&mut session, sql), [["NULL"]], "{value}");
+        assert_eq!(warnings(&session), expected, "column {value}");
+    }
+}

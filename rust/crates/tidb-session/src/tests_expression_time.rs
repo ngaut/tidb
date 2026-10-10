@@ -223,3 +223,78 @@ fn now_advances_per_statement_unless_timestamp_is_set() {
     assert_eq!(cell(&mut session, "select unix_timestamp(now(6))"), pinned);
     assert_eq!(pinned, "1700000000.654320");
 }
+
+/// The date-part builtins read their ETDatetime argument as a typed time and
+/// refuse a zero (or zero-in) date with a 1292 warning naming the time as Go's
+/// `Time.String()` prints it, fraction and all (`builtinDayOfWeekSig` and its
+/// siblings). MONTHNAME warns only for a zero date under NO_ZERO_DATE, and
+/// LAST_DAY accepts a zero day without it. Captured from Go TiDB under the
+/// default sql_mode and under `''`.
+#[test]
+fn date_part_builtins_warn_on_zero_dates_as_go() {
+    let mut session = Session::new();
+    session
+        .run("create table t(v1 datetime, v2 datetime(3))")
+        .unwrap();
+    session.run("insert ignore into t values(0,0)").unwrap();
+    let args = [
+        ("v2", "0000-00-00 00:00:00.000"),
+        ("'2024-02-00'", "2024-02-00 00:00:00.000000"),
+        ("'2024-00-10'", "2024-00-10 00:00:00.000000"),
+        ("0", "0000-00-00 00:00:00"),
+    ];
+    for strict in [true, false] {
+        session
+            .run(if strict {
+                "set sql_mode = default"
+            } else {
+                "set sql_mode = ''"
+            })
+            .unwrap();
+        for function in [
+            "DAYNAME",
+            "MONTHNAME",
+            "WEEKDAY",
+            "WEEK",
+            "YEARWEEK",
+            "WEEKOFYEAR",
+            "TO_DAYS",
+            "TO_SECONDS",
+            "LAST_DAY",
+            "DAYOFWEEK",
+            "DAYOFYEAR",
+        ] {
+            for (arg, rendered) in args {
+                let sql = format!("select {function}({arg}) from t");
+                let (value, warns) = match (function, arg, strict) {
+                    ("MONTHNAME", "'2024-02-00'", _) => ("February", false),
+                    ("MONTHNAME", "'2024-00-10'", _) | ("MONTHNAME", _, false) => ("NULL", false),
+                    ("LAST_DAY", "'2024-02-00'", false) => ("2024-02-29", false),
+                    _ => ("NULL", true),
+                };
+                assert_eq!(cell(&mut session, &sql), value, "{sql} strict={strict}");
+                let expected = if warns {
+                    vec![(1292, format!("Incorrect datetime value: '{rendered}'"))]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(warnings_of(&session), expected, "{sql} strict={strict}");
+            }
+        }
+        for (sql, rendered) in [
+            ("select WEEK(v2, 1) from t", "0000-00-00 00:00:00.000"),
+            ("select YEARWEEK(v2, 1) from t", "0000-00-00 00:00:00.000"),
+            (
+                "select YEARWEEK('2024-00-10', 1) from t",
+                "2024-00-10 00:00:00.000000",
+            ),
+        ] {
+            assert_eq!(cell(&mut session, sql), "NULL", "{sql}");
+            assert_eq!(
+                warnings_of(&session),
+                [(1292, format!("Incorrect datetime value: '{rendered}'"))],
+                "{sql}"
+            );
+        }
+    }
+}

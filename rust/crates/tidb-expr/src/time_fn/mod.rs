@@ -60,20 +60,20 @@ pub(crate) fn dispatch(
         "TIME" => time(vals, cols),
         "MONTH" => month(vals),
         "DAY" | "DAYOFMONTH" => day_of_month(vals),
-        "DAYOFWEEK" => day_of_week(vals),
-        "DAYOFYEAR" => day_of_year(vals),
-        "WEEKDAY" => weekday(vals),
+        "DAYOFWEEK" => day_of_week(vals, cols),
+        "DAYOFYEAR" => day_of_year(vals, cols),
+        "WEEKDAY" => weekday(vals, cols),
         "QUARTER" => quarter(vals),
-        "WEEK" => week(vals, cols.default_week_format()),
-        "WEEKOFYEAR" => week_of_year_builtin(vals),
+        "WEEK" => week(vals, cols.default_week_format(), cols),
+        "WEEKOFYEAR" => week_of_year_builtin(vals, cols),
         "TIDB_PARSE_TSO_LOGICAL" => tidb_parse_tso_logical(vals),
         "TIDB_BOUNDED_STALENESS" => tidb_bounded_staleness(vals, cols),
         "TIDB_CURRENT_TSO" => current_tso(vals, cols),
         "GET_FORMAT" => get_format_value(vals),
-        "YEARWEEK" => yearweek(vals),
-        "MONTHNAME" => monthname(vals),
-        "DAYNAME" => dayname(vals),
-        "LAST_DAY" => last_day(vals),
+        "YEARWEEK" => yearweek(vals, cols),
+        "MONTHNAME" => monthname(vals, cols),
+        "DAYNAME" => dayname(vals, cols),
+        "LAST_DAY" => last_day(vals, cols),
         "TIME_TO_SEC" => time_to_sec(vals),
         "SEC_TO_TIME" => sec_to_time(vals, cols),
         "MAKEDATE" => makedate(vals),
@@ -99,8 +99,8 @@ pub(crate) fn dispatch(
         "TIMESTAMP" => add_sub::timestamp(vals, cols),
         "TIMESTAMPADD" => add_sub::timestamp_add(vals, cols),
         "SYSDATE" => add_sub::sysdate(vals, cols),
-        "TO_DAYS" => calendar::to_days(vals),
-        "TO_SECONDS" => calendar::to_seconds(vals),
+        "TO_DAYS" => calendar::to_days(vals, cols),
+        "TO_SECONDS" => calendar::to_seconds(vals, cols),
         // `EXTRACT(<composite unit> FROM value)`, e.g. `HOUR_MINUTE`,
         // `DAY_SECOND`, `YEAR_MONTH` — see `calendar::extract_composite`'s
         // own doc.
@@ -432,38 +432,42 @@ fn format_time_only(secs: i64, nanos: u32, fsp: u32, round: bool) -> String {
     format!("{}{}", format_hms(secs), frac_suffix(nanos, fsp))
 }
 
-fn single_date(vals: &[Datum]) -> Result<Option<(i64, u32, u32)>, EvalError> {
-    if vals.len() != 1 {
-        return Err(EvalError::Unsupported("bad function arity"));
+/// Go `EvalTime` and a date-part signature's zero check: the typed argument,
+/// or `None` for NULL and for an argument `rejects` refuses, after
+/// `handleInvalidTimeError(ErrWrongValue(DateTimeStr, arg.String()))` has
+/// warned (or failed a strict statement).
+pub(crate) fn checked_date_arg(
+    value: &Datum,
+    cols: &dyn Columns,
+    rejects: impl FnOnce(tidb_datatype::Time) -> bool,
+) -> Result<Option<tidb_datatype::Time>, EvalError> {
+    match value {
+        Datum::Null => Ok(None),
+        Datum::Time(time) if rejects(*time) => {
+            cols.handle_truncate(&format!("Incorrect datetime value: '{time}'"))?;
+            Ok(None)
+        }
+        Datum::Time(time) => Ok(Some(*time)),
+        // Both evaluators apply the ETDatetime argument cast first.
+        _ => Err(EvalError::Unsupported(
+            "a date-part argument reached the signature without its ETDatetime cast",
+        )),
     }
-    Ok(coerce_str(&vals[0])?.and_then(|s| parse_date_ymd(&s)))
 }
 
-/// Parses a date/datetime argument at the same value boundary as Go's
-/// `EvalTime`.  [`parse_date_ymd`] intentionally ignores a trailing time
-/// suffix because date-part functions only need the calendar fields; the
-/// `LAST_DAY` signature still rejects a malformed suffix (for example
-/// `23:59:61`) before it computes the month end.
-fn single_datetime(vals: &[Datum]) -> Result<Option<(i64, u32, u32)>, EvalError> {
-    if vals.len() != 1 {
-        return Err(EvalError::Unsupported("bad function arity"));
-    }
-    let Some(value) = coerce_str(&vals[0])? else {
-        return Ok(None);
-    };
-    let value = value.trim();
-    let (date, time) = value
-        .split_once(char::is_whitespace)
-        .map_or((value, None), |(date, time)| (date, Some(time.trim())));
-    let Some(ymd) = parse_date_ymd(date) else {
-        return Ok(None);
-    };
-    if let Some(time) = time {
-        if calendar::parse_time_with_fraction(time).is_none() {
-            return Ok(None);
-        }
-    }
-    Ok(Some(ymd))
+/// The calendar fields of a typed temporal value.
+fn date_fields(time: tidb_datatype::Time) -> (i64, u32, u32) {
+    let core = time.core_time();
+    (
+        i64::from(core.year()),
+        u32::from(core.month()),
+        u32::from(core.day()),
+    )
+}
+
+/// `IsZero() || InvalidZero()`, the check most date-part signatures make.
+fn zero_or_invalid_zero(time: tidb_datatype::Time) -> bool {
+    time.is_zero() || time.invalid_zero()
 }
 
 /// `builtinMonthSig.evalInt` in `pkg/expression/builtin_time.go`.
@@ -488,31 +492,49 @@ fn day_of_month(vals: &[Datum]) -> Result<Datum, EvalError> {
         .map_or(Datum::Null, |(_, _, day)| Datum::Int(i64::from(day))))
 }
 
-/// `builtinDayOfWeekSig.evalInt`: Sunday is 1 through Saturday 7. Invalid
-/// zero dates are NULL in Go even when EvalTime is configured to parse them.
-fn day_of_week(vals: &[Datum]) -> Result<Datum, EvalError> {
+/// `builtinDayOfWeekSig.evalInt`: Sunday is 1 through Saturday 7; an
+/// invalid zero date warns and is NULL.
+fn day_of_week(vals: &[Datum], cols: &dyn Columns) -> Result<Datum, EvalError> {
+    let [value] = vals else {
+        return Err(EvalError::Unsupported("bad function arity"));
+    };
     Ok(
-        single_date(vals)?.map_or(Datum::Null, |(year, month, day)| {
-            Datum::Int((days_from_civil(year, month, day) + 4).rem_euclid(7) + 1)
-        }),
+        checked_date_arg(value, cols, tidb_datatype::Time::invalid_zero)?.map_or(
+            Datum::Null,
+            |time| {
+                let (year, month, day) = date_fields(time);
+                Datum::Int((days_from_civil(year, month, day) + 4).rem_euclid(7) + 1)
+            },
+        ),
     )
 }
 
-/// `builtinDayOfYearSig.evalInt`: one-based day within the calendar year.
-/// Invalid zero dates are NULL before this calculation in the Go evaluator.
-fn day_of_year(vals: &[Datum]) -> Result<Datum, EvalError> {
+/// `builtinDayOfYearSig.evalInt`: one-based day within the calendar year;
+/// an invalid zero date warns and is NULL.
+fn day_of_year(vals: &[Datum], cols: &dyn Columns) -> Result<Datum, EvalError> {
+    let [value] = vals else {
+        return Err(EvalError::Unsupported("bad function arity"));
+    };
     Ok(
-        single_date(vals)?.map_or(Datum::Null, |(year, month, day)| {
-            Datum::Int(days_from_civil(year, month, day) - days_from_civil(year, 1, 1) + 1)
-        }),
+        checked_date_arg(value, cols, tidb_datatype::Time::invalid_zero)?.map_or(
+            Datum::Null,
+            |time| {
+                let (year, month, day) = date_fields(time);
+                Datum::Int(days_from_civil(year, month, day) - days_from_civil(year, 1, 1) + 1)
+            },
+        ),
     )
 }
 
-/// `builtinWeekDaySig.evalInt`: Monday is 0 through Sunday 6. Like
-/// DAYOFWEEK, zero and invalid-zero dates are NULL in the source.
-fn weekday(vals: &[Datum]) -> Result<Datum, EvalError> {
+/// `builtinWeekDaySig.evalInt`: Monday is 0 through Sunday 6; a zero or
+/// invalid zero date warns and is NULL.
+fn weekday(vals: &[Datum], cols: &dyn Columns) -> Result<Datum, EvalError> {
+    let [value] = vals else {
+        return Err(EvalError::Unsupported("bad function arity"));
+    };
     Ok(
-        single_date(vals)?.map_or(Datum::Null, |(year, month, day)| {
+        checked_date_arg(value, cols, zero_or_invalid_zero)?.map_or(Datum::Null, |time| {
+            let (year, month, day) = date_fields(time);
             Datum::Int((days_from_civil(year, month, day) + 3).rem_euclid(7))
         }),
     )
@@ -544,12 +566,12 @@ fn quarter(vals: &[Datum]) -> Result<Datum, EvalError> {
 /// TiDB's default zero.
 /// `WEEKOFYEAR(date)`. Port of `builtinWeekOfYearSig.evalInt`, which is
 /// `date.Week(3)` — the ISO-like mode-3 week number. Zero and invalid dates are
-/// NULL, matching `week`.
-fn week_of_year_builtin(vals: &[Datum]) -> Result<Datum, EvalError> {
-    if vals.len() != 1 {
+/// NULL after a warning, matching `week`.
+fn week_of_year_builtin(vals: &[Datum], cols: &dyn Columns) -> Result<Datum, EvalError> {
+    let [value] = vals else {
         return Err(EvalError::Unsupported("bad function arity"));
-    }
-    let Some(date) = coerce_str(&vals[0])?.and_then(|s| parse_date_ymd(&s)) else {
+    };
+    let Some(date) = checked_date_arg(value, cols, zero_or_invalid_zero)?.map(date_fields) else {
         return Ok(Datum::Null);
     };
     Ok(Datum::Int(week_of_year(date.0, date.1, date.2, 3, false).1))
@@ -644,11 +666,16 @@ fn get_format_bytes(format_type: &[u8], location: &[u8]) -> &'static str {
     }
 }
 
-pub(crate) fn week(vals: &[Datum], default_week_format: i64) -> Result<Datum, EvalError> {
+pub(crate) fn week(
+    vals: &[Datum],
+    default_week_format: i64,
+    cols: &dyn Columns,
+) -> Result<Datum, EvalError> {
     if !(1..=2).contains(&vals.len()) {
         return Err(EvalError::Unsupported("bad function arity"));
     }
-    let Some(date) = coerce_str(&vals[0])?.and_then(|s| parse_date_ymd(&s)) else {
+    let Some(date) = checked_date_arg(&vals[0], cols, zero_or_invalid_zero)?.map(date_fields)
+    else {
         return Ok(Datum::Null);
     };
     let mode = if vals.len() == 2 {
@@ -663,11 +690,18 @@ pub(crate) fn week(vals: &[Datum], default_week_format: i64) -> Result<Datum, Ev
 
 /// `builtinYearWeekWithModeSig` / `builtinYearWeekWithoutModeSig` in
 /// `pkg/expression/builtin_time.go`.
-fn yearweek(vals: &[Datum]) -> Result<Datum, EvalError> {
+fn yearweek(vals: &[Datum], cols: &dyn Columns) -> Result<Datum, EvalError> {
     if !(1..=2).contains(&vals.len()) {
         return Err(EvalError::Unsupported("bad function arity"));
     }
-    let Some(date) = coerce_str(&vals[0])?.and_then(|s| parse_date_ymd(&s)) else {
+    // The one-argument signature checks only InvalidZero, which a zero date
+    // also is.
+    let rejects = if vals.len() == 2 {
+        zero_or_invalid_zero
+    } else {
+        tidb_datatype::Time::invalid_zero
+    };
+    let Some(date) = checked_date_arg(&vals[0], cols, rejects)?.map(date_fields) else {
         return Ok(Datum::Null);
     };
     let mode = if vals.len() == 2 {
@@ -684,8 +718,9 @@ fn yearweek(vals: &[Datum]) -> Result<Datum, EvalError> {
     }))
 }
 
-/// `builtinMonthNameSig` in `pkg/expression/builtin_time.go`.
-fn monthname(vals: &[Datum]) -> Result<Datum, EvalError> {
+/// `builtinMonthNameSig` in `pkg/expression/builtin_time.go`: a zero date
+/// warns under NO_ZERO_DATE and is otherwise NULL, as a zero month is.
+fn monthname(vals: &[Datum], cols: &dyn Columns) -> Result<Datum, EvalError> {
     const MONTHS: [&str; 12] = [
         "January",
         "February",
@@ -700,13 +735,22 @@ fn monthname(vals: &[Datum]) -> Result<Datum, EvalError> {
         "November",
         "December",
     ];
-    Ok(single_date(vals)?.map_or(Datum::Null, |(_, month, _)| {
-        Datum::new_string(MONTHS[(month - 1) as usize].to_string())
-    }))
+    let [value] = vals else {
+        return Err(EvalError::Unsupported("bad function arity"));
+    };
+    let no_zero_date = cols.date_modes().no_zero_date;
+    let time = checked_date_arg(value, cols, |time| time.is_zero() && no_zero_date)?;
+    Ok(time
+        .map(date_fields)
+        .filter(|&(_, month, _)| month != 0)
+        .map_or(Datum::Null, |(_, month, _)| {
+            Datum::new_string(MONTHS[(month - 1) as usize].to_string())
+        }))
 }
 
-/// `builtinDayNameSig` in `pkg/expression/builtin_time.go`.
-fn dayname(vals: &[Datum]) -> Result<Datum, EvalError> {
+/// `builtinDayNameSig` in `pkg/expression/builtin_time.go`: an invalid zero
+/// date warns and is NULL.
+fn dayname(vals: &[Datum], cols: &dyn Columns) -> Result<Datum, EvalError> {
     const DAYS: [&str; 7] = [
         "Sunday",
         "Monday",
@@ -716,14 +760,27 @@ fn dayname(vals: &[Datum]) -> Result<Datum, EvalError> {
         "Friday",
         "Saturday",
     ];
-    Ok(single_date(vals)?.map_or(Datum::Null, |(y, m, d)| {
+    let [value] = vals else {
+        return Err(EvalError::Unsupported("bad function arity"));
+    };
+    let time = checked_date_arg(value, cols, tidb_datatype::Time::invalid_zero)?;
+    Ok(time.map(date_fields).map_or(Datum::Null, |(y, m, d)| {
         Datum::new_string(DAYS[(days_from_civil(y, m, d) + 4).rem_euclid(7) as usize].to_string())
     }))
 }
 
-/// `builtinLastDaySig` in `pkg/expression/builtin_time.go`.
-fn last_day(vals: &[Datum]) -> Result<Datum, EvalError> {
-    Ok(single_datetime(vals)?.map_or(Datum::Null, |(y, m, _)| {
+/// `builtinLastDaySig` in `pkg/expression/builtin_time.go`: a zero month,
+/// or a zero day under NO_ZERO_DATE, warns and is NULL.
+fn last_day(vals: &[Datum], cols: &dyn Columns) -> Result<Datum, EvalError> {
+    let [value] = vals else {
+        return Err(EvalError::Unsupported("bad function arity"));
+    };
+    let no_zero_date = cols.date_modes().no_zero_date;
+    let time = checked_date_arg(value, cols, |time| {
+        let core = time.core_time();
+        core.month() == 0 || (core.day() == 0 && no_zero_date)
+    })?;
+    Ok(time.map(date_fields).map_or(Datum::Null, |(y, m, _)| {
         let next_month = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
         let (last_y, last_m, last_d) =
             civil_from_days(days_from_civil(next_month.0, next_month.1, 1) - 1);

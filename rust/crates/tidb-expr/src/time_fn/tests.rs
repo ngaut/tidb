@@ -66,22 +66,25 @@ fn get_format_table() {
 #[test]
 fn week_of_year_source_vectors() {
     assert_eq!(
-        week_of_year_builtin(&[string_datum("2024-03-15")]).unwrap(),
+        week_of_year_builtin(&datetime_str_arg("2024-03-15"), &crate::NoColumns).unwrap(),
         Datum::Int(11)
     );
     assert_eq!(
-        week_of_year_builtin(&[string_datum("2024-01-01")]).unwrap(),
+        week_of_year_builtin(&datetime_str_arg("2024-01-01"), &crate::NoColumns).unwrap(),
         Datum::Int(1)
     );
     assert_eq!(
-        week_of_year_builtin(&[string_datum("2020-12-31")]).unwrap(),
+        week_of_year_builtin(&datetime_str_arg("2020-12-31"), &crate::NoColumns).unwrap(),
         Datum::Int(53)
     );
     assert_eq!(
-        week_of_year_builtin(&[string_datum("0000-00-00")]).unwrap(),
+        week_of_year_builtin(&datetime_str_arg("0000-00-00"), &crate::NoColumns).unwrap(),
         Datum::Null
     );
-    assert_eq!(week_of_year_builtin(&[Datum::Null]).unwrap(), Datum::Null);
+    assert_eq!(
+        week_of_year_builtin(&datetime_arg(Datum::Null), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
 }
 
 /// `builtinTidbParseTsoLogicalSig` = low 18 bits; non-positive/NULL -> NULL.
@@ -125,7 +128,7 @@ fn calendar_part_source_vectors() {
     ];
     for (input, want) in day_of_week_cases {
         assert_eq!(
-            day_of_week(&[string_datum(input)]).unwrap(),
+            day_of_week(&datetime_str_arg(input), &crate::NoColumns).unwrap(),
             want,
             "{input}"
         );
@@ -143,7 +146,7 @@ fn calendar_part_source_vectors() {
     ];
     for (input, want) in day_of_year_cases {
         assert_eq!(
-            day_of_year(&[string_datum(input)]).unwrap(),
+            day_of_year(&datetime_str_arg(input), &crate::NoColumns).unwrap(),
             want,
             "{input}"
         );
@@ -194,35 +197,51 @@ fn calendar_part_source_vectors() {
         ("0000-00-00", Datum::Null),
     ];
     for (input, want) in weekday_cases {
-        assert_eq!(weekday(&[string_datum(input)]).unwrap(), want, "{input}");
+        assert_eq!(
+            weekday(&datetime_str_arg(input), &crate::NoColumns).unwrap(),
+            want,
+            "{input}"
+        );
     }
 
     assert_eq!(
         day_of_month(&datetime_arg(Datum::Null)).unwrap(),
         Datum::Null
     );
-    assert_eq!(day_of_week(&[Datum::Null]).unwrap(), Datum::Null);
-    assert_eq!(day_of_year(&[Datum::Null]).unwrap(), Datum::Null);
-    assert_eq!(weekday(&[Datum::Null]).unwrap(), Datum::Null);
+    assert_eq!(
+        day_of_week(&datetime_arg(Datum::Null), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
+    assert_eq!(
+        day_of_year(&datetime_arg(Datum::Null), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
+    assert_eq!(
+        weekday(&datetime_arg(Datum::Null), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
     assert_eq!(quarter(&datetime_arg(Datum::Null)).unwrap(), Datum::Null);
     assert_eq!(
         day_of_month(&datetime_arg(Datum::Int(20_240_315))).unwrap(),
         Datum::Int(15)
     );
     assert_eq!(
-        day_of_week(&[Datum::Int(20_240_315)]).unwrap(),
+        day_of_week(&datetime_arg(Datum::Int(20_240_315)), &crate::NoColumns).unwrap(),
         Datum::Int(6)
     );
     assert_eq!(
-        day_of_year(&[Datum::Int(20_240_315)]).unwrap(),
+        day_of_year(&datetime_arg(Datum::Int(20_240_315)), &crate::NoColumns).unwrap(),
         Datum::Int(75)
     );
-    assert_eq!(weekday(&[Datum::Int(20_240_315)]).unwrap(), Datum::Int(4));
+    assert_eq!(
+        weekday(&datetime_arg(Datum::Int(20_240_315)), &crate::NoColumns).unwrap(),
+        Datum::Int(4)
+    );
     assert_eq!(
         quarter(&datetime_arg(Datum::Int(20_240_315))).unwrap(),
         Datum::Int(1)
     );
-    assert!(day_of_week(&[]).is_err());
+    assert!(day_of_week(&[], &crate::NoColumns).is_err());
     assert!(quarter(&[string_datum("2008-01-01"), Datum::Int(1)]).is_err());
 }
 
@@ -286,16 +305,25 @@ fn zero_datetime_column_matches_recorded_tidb() {
     // The day-of-week family rejects a zero date as NULL (Go:
     // `InvalidZero()` -> NULL + warning 1292), even when typed.
     assert_eq!(
-        day_of_week(std::slice::from_ref(&zero)).unwrap(),
+        day_of_week(std::slice::from_ref(&zero), &crate::NoColumns).unwrap(),
         Datum::Null
     );
     assert_eq!(
-        day_of_year(std::slice::from_ref(&zero)).unwrap(),
+        day_of_year(std::slice::from_ref(&zero), &crate::NoColumns).unwrap(),
         Datum::Null
     );
-    assert_eq!(weekday(std::slice::from_ref(&zero)).unwrap(), Datum::Null);
-    assert_eq!(dayname(std::slice::from_ref(&zero)).unwrap(), Datum::Null);
-    assert_eq!(monthname(std::slice::from_ref(&zero)).unwrap(), Datum::Null);
+    assert_eq!(
+        weekday(std::slice::from_ref(&zero), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
+    assert_eq!(
+        dayname(std::slice::from_ref(&zero), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
+    assert_eq!(
+        monthname(std::slice::from_ref(&zero), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
 
     // The string form is NULL, NOT 0 — and the split is now decided by ONE
     // rule instead of by each signature: the ETDatetime argument cast
@@ -365,21 +393,32 @@ fn month_and_monthname_source_vectors() {
         ("2008-13-01", Datum::Null),
     ];
     for (input, want) in monthname_cases {
-        assert_eq!(monthname(&[string_datum(input)]).unwrap(), want, "{input}");
+        assert_eq!(
+            monthname(&datetime_str_arg(input), &crate::NoColumns).unwrap(),
+            want,
+            "{input}"
+        );
     }
 
     assert_eq!(month(&datetime_arg(Datum::Null)).unwrap(), Datum::Null);
-    assert_eq!(monthname(&[Datum::Null]).unwrap(), Datum::Null);
+    assert_eq!(
+        monthname(&datetime_arg(Datum::Null), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
     assert_eq!(
         month(&datetime_arg(Datum::Int(20_240_315))).unwrap(),
         Datum::Int(3)
     );
     assert_eq!(
-        monthname(&[Datum::Int(20_240_315)]).unwrap(),
+        monthname(&datetime_arg(Datum::Int(20_240_315)), &crate::NoColumns).unwrap(),
         Datum::new_string("March".to_string())
     );
     assert!(month(&[]).is_err());
-    assert!(monthname(&[string_datum("2008-01-01"), Datum::Int(1)]).is_err());
+    assert!(monthname(
+        &[string_datum("2008-01-01"), Datum::Int(1)],
+        &crate::NoColumns
+    )
+    .is_err());
 }
 
 struct FractionalClock;
@@ -565,7 +604,11 @@ fn go_week_vectors_cover_year_boundaries() {
     assert_eq!(week_of_year(2008, 2, 20, 1, false), (2008, 8));
     assert_eq!(week_of_year(2020, 1, 1, 3, true), (2020, 1));
     assert_eq!(
-        yearweek(&[Datum::new_string("2000-01-01".to_string()), Datum::Int(0)]).unwrap(),
+        yearweek(
+            &[datetime_str_arg("2000-01-01").remove(0), Datum::Int(0)],
+            &crate::NoColumns
+        )
+        .unwrap(),
         Datum::Int(199_952)
     );
     assert_eq!(
@@ -595,14 +638,21 @@ fn dayname_source_vectors() {
         ("0000-00-00 00:00:11.000000", Datum::Null),
     ];
     for (input, want) in cases {
-        assert_eq!(dayname(&[string_datum(input)]).unwrap(), want, "{input}");
+        assert_eq!(
+            dayname(&datetime_str_arg(input), &crate::NoColumns).unwrap(),
+            want,
+            "{input}"
+        );
     }
-    assert_eq!(dayname(&[Datum::Null]).unwrap(), Datum::Null);
     assert_eq!(
-        dayname(&[Datum::Int(20_171_201)]).unwrap(),
+        dayname(&datetime_arg(Datum::Null), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
+    assert_eq!(
+        dayname(&datetime_arg(Datum::Int(20_171_201)), &crate::NoColumns).unwrap(),
         Datum::new_string("Friday".to_string())
     );
-    assert!(dayname(&[]).is_err());
+    assert!(dayname(&[], &crate::NoColumns).is_err());
 }
 
 /// Full finite source table from `TestDateFormat` at line 604.  This is
@@ -1110,7 +1160,10 @@ fn to_seconds_source_vectors() {
         (string_datum("09-11-29 13:43:32"), 63_426_721_412),
         (string_datum("99-11-29 13:43:32"), 63_111_102_212),
     ] {
-        assert_eq!(calendar::to_seconds(&[input]).unwrap(), Datum::Int(want),);
+        assert_eq!(
+            calendar::to_seconds(&datetime_arg(input), &crate::NoColumns).unwrap(),
+            Datum::Int(want),
+        );
     }
     for input in [
         "0000-00-00",
@@ -1121,12 +1174,15 @@ fn to_seconds_source_vectors() {
         "123456789",
     ] {
         assert_eq!(
-            calendar::to_seconds(&[string_datum(input)]).unwrap(),
+            calendar::to_seconds(&datetime_str_arg(input), &crate::NoColumns).unwrap(),
             Datum::Null,
             "TO_SECONDS({input:?})"
         );
     }
-    assert_eq!(calendar::to_seconds(&[Datum::Null]).unwrap(), Datum::Null);
+    assert_eq!(
+        calendar::to_seconds(&datetime_arg(Datum::Null), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
 }
 
 /// Exact scalar rows from `TestToDays` at
@@ -1143,7 +1199,10 @@ fn to_days_source_vectors() {
         (string_datum("0000-01-01"), 1),
         (string_datum("2007-10-07 00:00:59"), 733_321),
     ] {
-        assert_eq!(calendar::to_days(&[input]).unwrap(), Datum::Int(want));
+        assert_eq!(
+            calendar::to_days(&datetime_arg(input), &crate::NoColumns).unwrap(),
+            Datum::Int(want)
+        );
     }
     for input in [
         "0000-00-00",
@@ -1153,12 +1212,15 @@ fn to_days_source_vectors() {
         "123456789",
     ] {
         assert_eq!(
-            calendar::to_days(&[string_datum(input)]).unwrap(),
+            calendar::to_days(&datetime_str_arg(input), &crate::NoColumns).unwrap(),
             Datum::Null,
             "TO_DAYS({input:?})"
         );
     }
-    assert_eq!(calendar::to_days(&[Datum::Null]).unwrap(), Datum::Null);
+    assert_eq!(
+        calendar::to_days(&datetime_arg(Datum::Null), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
 }
 
 /// Rows from `TestTimeDiff` at `pkg/expression/builtin_time_test.go:1985`:
@@ -1226,13 +1288,23 @@ fn week_source_vectors() {
         (("2008-12-31", 1), 53),
     ] {
         assert_eq!(
-            week(&[string_datum(date), Datum::Int(mode)], 0).unwrap(),
+            week(
+                &[datetime_str_arg(date).remove(0), Datum::Int(mode)],
+                0,
+                &crate::NoColumns
+            )
+            .unwrap(),
             Datum::Int(want),
             "WEEK({date}, {mode})"
         );
     }
     assert_eq!(
-        week(&[string_datum("2023-01-01"), Datum::Null], 0,).unwrap(),
+        week(
+            &[datetime_str_arg("2023-01-01").remove(0), Datum::Null],
+            0,
+            &crate::NoColumns
+        )
+        .unwrap(),
         Datum::Int(1)
     );
 }
@@ -1263,7 +1335,7 @@ fn test_week_without_mode_sig() {
         ("2008-02-20", 0, 7),
     ] {
         assert_eq!(
-            dispatch("WEEK", &[string_datum(date)], &Mode(mode))
+            dispatch("WEEK", &datetime_str_arg(date), &Mode(mode))
                 .expect("WEEK must dispatch")
                 .expect("source row must evaluate"),
             Datum::Int(expected),
@@ -1284,13 +1356,13 @@ fn last_day_source_vectors() {
         ("2004-01-01 01:01:01", "2004-01-31"),
     ] {
         assert_eq!(
-            last_day(&[string_datum(input)]).unwrap(),
+            last_day(&datetime_str_arg(input), &crate::NoColumns).unwrap(),
             Datum::new_string(want.to_string()),
             "LAST_DAY({input})"
         );
     }
     assert_eq!(
-        last_day(&[Datum::Int(950501)]).unwrap(),
+        last_day(&datetime_arg(Datum::Int(950501)), &crate::NoColumns).unwrap(),
         Datum::new_string("1995-05-31".to_string())
     );
     for input in [
@@ -1303,12 +1375,15 @@ fn last_day_source_vectors() {
         "123456789",
     ] {
         assert_eq!(
-            last_day(&[string_datum(input)]).unwrap(),
+            last_day(&datetime_str_arg(input), &crate::NoColumns).unwrap(),
             Datum::Null,
             "LAST_DAY({input})"
         );
     }
-    assert_eq!(last_day(&[Datum::Null]).unwrap(), Datum::Null);
+    assert_eq!(
+        last_day(&datetime_arg(Datum::Null), &crate::NoColumns).unwrap(),
+        Datum::Null
+    );
 }
 
 #[test]

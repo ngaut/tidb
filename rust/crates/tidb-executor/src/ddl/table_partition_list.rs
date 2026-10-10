@@ -183,18 +183,27 @@ pub(super) fn fold_range_column_value(
     convert_column_value(value, field_type, ctx)
 }
 
+/// The session context Go's partition DDL evaluates a bound under
+/// (`EvalSimpleAst`, `ParseSimpleExpr`): its zone, `LIKE` escape and
+/// connection charset, so a string literal takes `collation_connection`.
+pub(super) fn partition_value_resolver(
+    ctx: &crate::StmtContext,
+) -> tidb_expr::rewriter::ZonedNoResolver {
+    let (charset, collation) = ctx.connection_charset_info();
+    tidb_expr::rewriter::ZonedNoResolver::with_like_default_escape(
+        ctx.session_zone(),
+        ctx.like_default_escape(),
+    )
+    .with_connection_charset(charset, collation)
+}
+
 pub(super) fn eval_column_value(
     expr: &Expr,
     ctx: &crate::StmtContext,
 ) -> Result<Datum, DriverError> {
-    let rewritten = tidb_expr::rewriter::rewrite_expr_resolved(
-        expr,
-        &tidb_expr::rewriter::ZonedNoResolver::with_like_default_escape(
-            ctx.session_zone(),
-            ctx.like_default_escape(),
-        ),
-    )
-    .map_err(|_| DriverError::PartitionColumnValueWrongType)?;
+    let rewritten =
+        tidb_expr::rewriter::rewrite_expr_resolved(expr, &partition_value_resolver(ctx))
+            .map_err(|_| DriverError::PartitionColumnValueWrongType)?;
     let mut dual = tidb_chunk::chunk::Chunk::new_empty(&[]);
     dual.set_num_virtual_rows(1);
     rewritten
@@ -375,14 +384,9 @@ fn fold_list_value(
     unsigned: bool,
     ctx: &crate::StmtContext,
 ) -> Result<Option<i64>, DriverError> {
-    let rewritten = tidb_expr::rewriter::rewrite_expr_resolved(
-        expr,
-        &tidb_expr::rewriter::ZonedNoResolver::with_like_default_escape(
-            ctx.session_zone(),
-            ctx.like_default_escape(),
-        ),
-    )
-    .map_err(|_| DriverError::PartitionValuesNotInt(partition.to_owned()))?;
+    let rewritten =
+        tidb_expr::rewriter::rewrite_expr_resolved(expr, &partition_value_resolver(ctx))
+            .map_err(|_| DriverError::PartitionValuesNotInt(partition.to_owned()))?;
     let mut dual = tidb_chunk::chunk::Chunk::new_empty(&[]);
     dual.set_num_virtual_rows(1);
     match rewritten

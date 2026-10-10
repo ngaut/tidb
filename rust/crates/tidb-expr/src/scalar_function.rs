@@ -157,6 +157,12 @@ fn same_eval_family(value: &Datum, ret_type: &tidb_datatype::FieldType) -> bool 
     if ret_type.is_hybrid() {
         return true;
     }
+    // Go's `EvalString` reads an ENUM/SET by its name, so under a plain
+    // string result the hybrid datum becomes that string: `IF(c, e, e)`
+    // over an ENUM column is VARCHAR and orders by name, not by ordinal.
+    if matches!(value, Datum::Enum(..) | Datum::Set(..)) {
+        return false;
+    }
     // The REAL family is the one place where sharing an eval type is not
     // enough. Go's `ScalarFunction.Eval` returns `EvalReal`'s float64 for both
     // `FLOAT` and `DOUBLE` (`cast(1.1 as float) = 1.1` is true), so a

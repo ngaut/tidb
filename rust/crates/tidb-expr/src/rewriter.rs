@@ -347,6 +347,8 @@ impl<T: ColumnResolver + ?Sized> ColumnResolver for &T {
 pub struct ZonedNoResolver {
     zone: tidb_datatype::SessionTimeZone,
     like_default_escape: u8,
+    /// The session's `GetCharsetInfo`, when the caller evaluates under one.
+    connection_charset: Option<(String, String)>,
 }
 
 impl ZonedNoResolver {
@@ -357,6 +359,7 @@ impl ZonedNoResolver {
         Self {
             zone,
             like_default_escape: b'\\',
+            connection_charset: None,
         }
     }
 
@@ -367,7 +370,18 @@ impl ZonedNoResolver {
         Self {
             zone,
             like_default_escape: escape,
+            connection_charset: None,
         }
+    }
+
+    /// Stamps string literals with the session's connection charset and
+    /// collation (Go `BuildContext.GetCharsetInfo`), as an expression Go
+    /// evaluates under the session context (`EvalSimpleAst`,
+    /// `ParseSimpleExpr`) does.
+    #[must_use]
+    pub fn with_connection_charset(mut self, charset: &str, collation: &str) -> Self {
+        self.connection_charset = Some((charset.to_owned(), collation.to_owned()));
+        self
     }
 }
 
@@ -382,6 +396,13 @@ impl ColumnResolver for ZonedNoResolver {
 
     fn like_default_escape(&self) -> u8 {
         self.like_default_escape
+    }
+
+    fn connection_charset_info(&self) -> (&str, &str) {
+        match &self.connection_charset {
+            Some((charset, collation)) => (charset, collation),
+            None => crate::collation_derive::connection_charset_info(),
+        }
     }
 }
 
@@ -2318,11 +2339,20 @@ fn rewrite_leaf_compound(
             let value = rewrite_expr_resolved(expr, resolver)?;
             let low = rewrite_expr_resolved(low, resolver)?;
             let high = rewrite_expr_resolved(high, resolver)?;
-            let [value, low, high] = wrap_between_arguments(
+            let was_cast = [&value, &low, &high].map(is_newly_built_cast);
+            let [mut value, mut low, mut high] = wrap_between_arguments(
                 [&value, &low, &high],
                 resolve_type4_between([&value, &low, &high]),
                 resolver.connection_charset_info(),
             )?;
+            // Go `BuildCastFunction` folds the cast it just built, so a
+            // constant operand is converted (and warns) once, not once per
+            // bound comparison that shares it.
+            for (operand, was_cast) in [&mut value, &mut low, &mut high].into_iter().zip(was_cast) {
+                if is_newly_built_cast(operand) && !was_cast {
+                    resolver.fold_constant(operand, ConstantFoldMode::Normal);
+                }
+            }
             // Go `betweenToExpression`: one collation over all three
             // operands, each cast to it, so `a BETWEEN binary_col AND
             // ci_col` compares both bounds as binary instead of picking a

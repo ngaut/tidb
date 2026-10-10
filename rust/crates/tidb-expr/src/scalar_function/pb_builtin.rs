@@ -267,7 +267,7 @@ impl PbBuiltin {
             MicroSecond => Kernel::Values(|values, _| crate::time_fn::microsecond(values)),
             Month => Kernel::Values(|values, _| crate::time_fn::month(values)),
             WeekWithoutMode => Kernel::Values(|values, ctx| {
-                crate::time_fn::week(values, ctx.default_week_format())
+                crate::time_fn::week(values, ctx.default_week_format(), ctx)
             }),
             TimestampDiff => {
                 Kernel::Values(|values, _| crate::time_fn::calendar::timestamp_diff(values))

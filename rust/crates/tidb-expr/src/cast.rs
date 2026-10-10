@@ -1749,34 +1749,45 @@ fn cast_to_time_value(
     // (`expression/cast`). The parser choice mirrors `Datum::convert_to_time`,
     // the faithful write-path port.
     let parsed = parse_time_by_source(v, &s, kind, fsp, ctx.type_flags(), &ctx.time_zone());
-    let Ok((time, truncated, dst_adjusted)) = parsed else {
-        // go routes each source TYPE to its own parser and its own warning:
-        // the STRING sources warn `Incorrect datetime value: '<text>'`; the
-        // numeric sources parse the INT64/FLOAT reinterpretations and warn
-        // `Incorrect time value: '<int64>'` (a u64 overflow reads -1).
-        if matches!(v, Datum::String(_) | Datum::Bytes(_)) {
-            invalid_time_warning(ctx, &s, fsp.unwrap_or(0));
-        } else if matches!(v, Datum::Decimal(_) | Datum::Real(_) | Datum::Float32(_)) {
-            // The DECIMAL/REAL sources read the value through
-            // `ParseTimeFromFloatString` -- the same wall-clock TEXT parser
-            // the string sources use -- so a failure names the value with
-            // the DATETIME word and the full decimal text (`cast(2.5 as
-            // datetime)` warns `Incorrect datetime value: '2.5'`, not a
-            // truncated integer).
-            invalid_time_warning(ctx, &s, fsp.unwrap_or(0));
-        } else {
-            // go ParseTimeFromNum consumes the number's INT64 WRAP: a u64
-            // overflow wraps to -1 (not the saturating i64::MAX).
-            let signed = match v {
-                Datum::UInt(n) => format!("{}", *n as i64),
-                _ => v
-                    .to_i64()
-                    .map(|converted| format!("{}", converted.value))
-                    .unwrap_or_else(|_| s.clone()),
-            };
-            ctx.append_warning(1292, &format!("Incorrect time value: '{signed}'"));
+    let (time, truncated, dst_adjusted) = match parsed {
+        Ok(parsed) => parsed,
+        // Go `builtinCastStringAsTimeSig.vecEvalTime`: a `ParseTime` failure
+        // inside strconv is `ErrIncorrectDatetimeValue` with the raw text.
+        Err(Some(tidb_datatype::TimeError::Syntax))
+            if matches!(v, Datum::String(_) | Datum::Bytes(_)) =>
+        {
+            ctx.append_warning(8034, &format!("Incorrect datetime value: '{s}'"));
+            return Ok(None);
         }
-        return Ok(None);
+        Err(_) => {
+            // go routes each source TYPE to its own parser and its own warning:
+            // the STRING sources warn `Incorrect datetime value: '<text>'`; the
+            // numeric sources parse the INT64/FLOAT reinterpretations and warn
+            // `Incorrect time value: '<int64>'` (a u64 overflow reads -1).
+            if matches!(v, Datum::String(_) | Datum::Bytes(_)) {
+                invalid_time_warning(ctx, &s, fsp.unwrap_or(0));
+            } else if matches!(v, Datum::Decimal(_) | Datum::Real(_) | Datum::Float32(_)) {
+                // The DECIMAL/REAL sources read the value through
+                // `ParseTimeFromFloatString` -- the same wall-clock TEXT parser
+                // the string sources use -- so a failure names the value with
+                // the DATETIME word and the full decimal text (`cast(2.5 as
+                // datetime)` warns `Incorrect datetime value: '2.5'`, not a
+                // truncated integer).
+                invalid_time_warning(ctx, &s, fsp.unwrap_or(0));
+            } else {
+                // go ParseTimeFromNum consumes the number's INT64 WRAP: a u64
+                // overflow wraps to -1 (not the saturating i64::MAX).
+                let signed = match v {
+                    Datum::UInt(n) => format!("{}", *n as i64),
+                    _ => v
+                        .to_i64()
+                        .map(|converted| format!("{}", converted.value))
+                        .unwrap_or_else(|_| s.clone()),
+                };
+                ctx.append_warning(1292, &format!("Incorrect time value: '{signed}'"));
+            }
+            return Ok(None);
+        }
     };
     if truncated {
         ctx.append_warning(
@@ -2103,8 +2114,9 @@ fn year_source_value(v: &Datum, source: Option<&tidb_datatype::FieldType>) -> Op
 /// [`cast_to_time`]'s doc for why the text is not enough). The read-path flags
 /// are the string signature's own: `allow_zero_in_date` is UNCONDITIONALLY
 /// `true` (a SELECT reads a zero-in-date back intact), and `allow_invalid_date`
-/// follows `ALLOW_INVALID_DATES`. `Err(())` is Go's parse failure, which the
-/// caller turns into a 1292 warning plus NULL.
+/// follows `ALLOW_INVALID_DATES`. `Err` is Go's parse failure, carrying the
+/// parser's error when there is one, which the caller turns into a warning
+/// plus NULL.
 ///
 /// The parser routing mirrors `Datum::convert_to_time`, the faithful write-path
 /// port: INT/UINT -> `parse_time_from_num`, DECIMAL -> `parse_time_from_decimal`,
@@ -2119,7 +2131,7 @@ fn parse_time_by_source(
     fsp: Option<i64>,
     flags: ConversionFlags,
     zone: &tidb_datatype::SessionTimeZone,
-) -> Result<(tidb_datatype::Time, bool, bool), ()> {
+) -> Result<(tidb_datatype::Time, bool, bool), Option<tidb_datatype::TimeError>> {
     match v {
         Datum::Int(value) => tidb_datatype::parse_time_from_num(
             *value,
@@ -2131,9 +2143,9 @@ fn parse_time_by_source(
             zone,
         )
         .map(|parsed| (parsed.time, false, parsed.dst_adjusted))
-        .map_err(|_| ()),
+        .map_err(Some),
         Datum::UInt(value) => {
-            let signed = i64::try_from(*value).map_err(|_| ())?;
+            let signed = i64::try_from(*value).map_err(|_| None)?;
             tidb_datatype::parse_time_from_num(
                 signed,
                 kind,
@@ -2144,7 +2156,7 @@ fn parse_time_by_source(
                 zone,
             )
             .map(|parsed| (parsed.time, false, parsed.dst_adjusted))
-            .map_err(|_| ())
+            .map_err(Some)
         }
         Datum::Decimal(value) => {
             let mut time = tidb_datatype::parse_time_from_decimal(
@@ -2153,20 +2165,22 @@ fn parse_time_by_source(
                 flags.ignore_invalid_date_err(),
                 zone,
             )
-            .map_err(|_| ())?;
+            .map_err(Some)?;
             time.set_kind(kind);
             match fsp {
                 Some(fsp) => time
                     .round_frac(fsp, zone)
                     .map(|time| (time, false, false))
-                    .map_err(|_| ()),
+                    .map_err(Some),
                 None => Ok((time, false, false)),
             }
         }
         Datum::Real(value) => real_to_time(*value, kind, fsp.unwrap_or(0), flags, zone)
-            .map(|time| (time, false, false)),
+            .map(|time| (time, false, false))
+            .map_err(|()| None),
         Datum::Float32(value) => real_to_time(*value, kind, fsp.unwrap_or(0), flags, zone)
-            .map(|time| (time, false, false)),
+            .map(|time| (time, false, false))
+            .map_err(|()| None),
         // STRING/BYTES and every other coercible source keep Go's
         // `builtinCastStringAsTimeSig` path: parse the wall-clock TEXT.
         //
@@ -2191,7 +2205,7 @@ fn parse_time_by_source(
             zone,
         )
         .map(|parsed| (parsed.time, parsed.truncated, parsed.dst_adjusted))
-        .map_err(|_| ()),
+        .map_err(Some),
     }
 }
 
@@ -2224,9 +2238,9 @@ fn invalid_time_warning(ctx: &dyn crate::Columns, input: &str, fsp: i64) {
     // go splits the failure classes by SHAPE (oracle-captured):
     //  * the ZERO date renders through the parsed value with its fsp
     //    (`'0000-00-00 00:00:00.000000'` for fsp 6 -- g-fsp);
-    //  * a VALID calendar date prefix followed by trailing characters raises
-    //    the VALUE class 8034 with the raw text (`CAST('2020-01-01x' AS
-    //    DATE)` -- m17);
+    //  * a part that is not an integer never reaches here: the parser's
+    //    `TimeError::Syntax` is the caller's 8034 (`CAST('2020-01-01x' AS
+    //    DATE)`);
     //  * a calendar-INVALID date shape renders through its parsed parts
     //    without zero padding under the truncation class 1292
     //    (`'2020-2-30'` -- m4);
@@ -2282,12 +2296,7 @@ fn invalid_time_warning(ctx: &dyn crate::Columns, input: &str, fsp: i64) {
                     }
                 }
             };
-            if day <= days_in_month {
-                // A valid calendar date prefix plus trailing characters.
-                ctx.append_warning(8034, &format!("Incorrect datetime value: '{input}'"));
-                return;
-            }
-            if head[2].bytes().all(|byte| byte.is_ascii_digit()) {
+            if day > days_in_month && head[2].bytes().all(|byte| byte.is_ascii_digit()) {
                 let rendered = format!("{year}-{month}-{day}");
                 ctx.append_warning(1292, &format!("Incorrect datetime value: '{rendered}'"));
                 return;

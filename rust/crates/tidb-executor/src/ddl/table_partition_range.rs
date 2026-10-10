@@ -336,10 +336,7 @@ pub(super) fn fold_range_bound(
     // outright until the context reached here.
     let rewritten = tidb_expr::rewriter::rewrite_expr_resolved(
         expr,
-        &tidb_expr::rewriter::ZonedNoResolver::with_like_default_escape(
-            ctx.session_zone(),
-            ctx.like_default_escape(),
-        ),
+        &super::table_partition_list::partition_value_resolver(ctx),
     )
     .map_err(|_| DriverError::PartitionValuesNotInt(partition.to_owned()))?;
     let mut dual = tidb_chunk::chunk::Chunk::new_empty(&[]);

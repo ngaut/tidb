@@ -359,3 +359,65 @@ fn nullif_result_is_nullable() {
         2
     );
 }
+
+/// Go `wrapExpWithCast` casts each BETWEEN operand once, and
+/// `BuildCastFunction` folds a constant cast as it builds it: the operand
+/// shared by both bound comparisons is converted, and warns, once. Captured
+/// from Go TiDB.
+#[test]
+fn between_converts_a_shared_constant_operand_once() {
+    let mut session = Session::new();
+    let truncated = |value: &str| (1292, format!("Truncated incorrect DOUBLE value: '{value}'"));
+    for (sql, answer, warned) in [
+        (
+            "SELECT 'lvuleck' BETWEEN '2008-09-16 22:23:50' AND 0",
+            "0",
+            ["lvuleck", "2008-09-16 22:23:50"],
+        ),
+        ("SELECT 'aa' BETWEEN 'bb' AND 0", "1", ["aa", "bb"]),
+        ("SELECT 'aa' BETWEEN 0 AND 'bb'", "1", ["aa", "bb"]),
+        ("SELECT '1x' BETWEEN '2x' AND 0", "0", ["1x", "2x"]),
+    ] {
+        assert_eq!(cell(&mut session, sql), answer, "{sql}");
+        assert_eq!(warnings_of(&session), warned.map(truncated), "{sql}");
+    }
+}
+
+/// Go TestEnumPushDown: `IF(enum, enum)` is VARCHAR (InferType4ControlFuncs),
+/// and `ScalarFunction.Eval` reads the chosen ENUM through `EvalString`, so
+/// the result is the member's name and orders by it -- not by the ordinal a
+/// bare ENUM column orders by.
+#[test]
+fn control_function_over_enum_yields_the_member_name() {
+    let mut session = Session::new();
+    session
+        .run("create table t (c_enum enum('c', 'b', 'a'))")
+        .unwrap();
+    session
+        .run("insert into t values ('a'), ('b'), ('c'), ('a'), ('b'), ('a')")
+        .unwrap();
+    let column = |session: &mut Session, sql: &str| -> Vec<String> {
+        row_text(session.run(sql))
+            .into_iter()
+            .map(|mut row| row.remove(0))
+            .collect()
+    };
+    assert_eq!(
+        column(&mut session, "select c_enum from t order by c_enum"),
+        ["c", "b", "b", "a", "a", "a"]
+    );
+    assert_eq!(
+        column(
+            &mut session,
+            "select c_enum from t order by if(c_enum>1, c_enum, c_enum)"
+        ),
+        ["a", "a", "a", "b", "b", "c"]
+    );
+    assert_eq!(
+        column(
+            &mut session,
+            "select if(c_enum>1, c_enum, 'z') x from t order by x"
+        ),
+        ["a", "a", "a", "b", "b", "z"]
+    );
+}

@@ -717,14 +717,14 @@ fn parse_datetime_core<TZ: TimeZone>(
         2 => return Err(TimeError::InvalidDate),
         3..=6 => {
             for (field, part) in fields.iter_mut().zip(&parts) {
-                *field = part.parse().map_err(|_| TimeError::InvalidDate)?;
+                *field = scan_time_arg(part)?;
             }
             hhmmss = parts.len() == 6;
         }
         _ => {
             truncated = true;
             for (field, part) in fields.iter_mut().zip(parts.iter().take(6)) {
-                *field = part.parse().map_err(|_| TimeError::InvalidDate)?;
+                *field = scan_time_arg(part)?;
             }
             hhmmss = true;
         }
@@ -788,6 +788,14 @@ fn parse_datetime_core<TZ: TimeZone>(
         core = core_time_from_datetime(source.with_timezone(timezone));
     }
     Ok((core, truncated))
+}
+
+/// One part of Go `scanTimeArgs`' `strconv.Atoi`: a part that is not an
+/// integer fails with the strconv error itself ([`TimeError::Syntax`]); an
+/// integer too wide for a field fails the later `FromDateChecked` range check.
+fn scan_time_arg(part: &str) -> Result<i32, TimeError> {
+    let value = part.parse::<i64>().map_err(|_| TimeError::Syntax)?;
+    i32::try_from(value).map_err(|_| TimeError::InvalidDate)
 }
 
 fn split_datetime(input: &str) -> (Vec<String>, String, Option<crate::TimezoneSuffix>, bool) {

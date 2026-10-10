@@ -90,11 +90,15 @@ fn utc_date_answers_the_utc_statement_date() {
 /// two dev.mysql.com rows answer `198652` / `199952`.
 #[test]
 fn yearweek_source_rows_pin_zero_month_null_and_boundary_years() {
-    let string_arg = |text: &str| Datum::new_string(text);
+    // The date reaches the signature through its ETDatetime argument cast.
+    let args = |values: Vec<Datum>| {
+        crate::arg_eval_type::wrap_datetime_args("YEARWEEK", values, &[], &NoColumns)
+            .expect("the ETDatetime argument cast")
+    };
     assert_eq!(
         dispatched(
             "YEARWEEK",
-            &[string_arg("1987-01-01"), Datum::Int(0)],
+            &args(vec![Datum::new_string("1987-01-01"), Datum::Int(0)]),
             &NoColumns,
         ),
         Datum::Int(198_652)
@@ -102,13 +106,17 @@ fn yearweek_source_rows_pin_zero_month_null_and_boundary_years() {
     assert_eq!(
         dispatched(
             "YEARWEEK",
-            &[string_arg("2000-01-01"), Datum::Int(0)],
+            &args(vec![Datum::new_string("2000-01-01"), Datum::Int(0)]),
             &NoColumns
         ),
         Datum::Int(199_952),
     );
     assert_eq!(
-        dispatched("YEARWEEK", &[string_arg("2016-00-05")], &NoColumns),
+        dispatched(
+            "YEARWEEK",
+            &args(vec![Datum::new_string("2016-00-05")]),
+            &NoColumns
+        ),
         Datum::Null
     );
 }
