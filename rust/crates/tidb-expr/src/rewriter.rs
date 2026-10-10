@@ -3252,6 +3252,16 @@ fn rewrite_leaf_call(expr: &Expr, resolver: &impl ColumnResolver) -> Result<Expr
                 }
                 vec![arg]
             } else {
+                let mut arg = arg;
+                // Go `castAsRealFunctionClass`: a DECIMAL argument's result
+                // scale widens through `PropagateType(ETReal)`.
+                if ret_type.eval_type() == tidb_datatype::EvalType::Real
+                    && arg
+                        .static_type()
+                        .is_some_and(|field| field.eval_type() == tidb_datatype::EvalType::Decimal)
+                {
+                    crate::expression::propagate_type(&mut arg, tidb_datatype::EvalType::Real);
+                }
                 vec![arg]
             };
             let charset_name = ret_type.charset_name().to_owned();

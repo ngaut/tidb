@@ -1545,3 +1545,31 @@ fn index_merge_hints_apply_go_path_rules() {
     );
     assert!(plan.contains("IndexMerge"), "{plan}");
 }
+
+/// Go `Limit | Selection(c != 500) | LocalIndexLookUp`: a table-side filter
+/// keeps the pushed LIMIT above the storage-side lookup, which gathers its
+/// handle batch (unistore `fetchTableScans`), sorts it by handle, filters,
+/// and only then limits -- the index stream is not cut at the LIMIT first.
+/// Captured from Go TiDB (executor/index_lookup_pushdown).
+#[test]
+fn pushed_lookup_limits_after_its_table_side_filter() {
+    let mut session = Session::new();
+    session
+        .run("create table t1(id int primary key, a varchar(32), b int, c int, index i(a, b))")
+        .unwrap();
+    session
+        .run(
+            "insert into t1 values (1, '9a', 10, 100), (2, '8b', 20, 200), (3, '7c', 30, 300), \
+             (4, '6d', 40, 400), (5, '5e', 50, 500), (6, '4f', 60, 600), (7, '3g', 70, 700), \
+             (8, '2h', 80, 800), (9, '1i', 90, 900), (10, '0j', 100, 1000)",
+        )
+        .unwrap();
+    let ids: Vec<String> = row_text(session.run(
+        "select /*+ index_lookup_pushdown(t1, i) */ id, a, b + 1, c + 2 from t1 \
+         where a < '8' and b < 90 and c != 500 limit 4",
+    ))
+    .into_iter()
+    .map(|row| row[0].clone())
+    .collect();
+    assert_eq!(ids, ["3", "4", "6", "7"]);
+}

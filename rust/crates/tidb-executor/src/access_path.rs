@@ -2396,9 +2396,23 @@ impl IndexRangeSourceExec {
         // push down which does not support keep order"), so the pushdown
         // truncation rules below never apply to a keep-order read.
         let pushdown = self.lookup_pushdown && self.can_reorder_handles;
-        let mut want = self.batch_size;
+        // The storage side of a pushed-down lookup gathers its own handle
+        // batches (Go unistore `indexLookUpExec.fetchTableScans`, up to
+        // `DefaultBatchSize` index rows) and sorts each by handle; TiDB's
+        // growing lookup batches do not apply to it.
+        let mut want = if pushdown {
+            LOCAL_INDEX_LOOKUP_BATCH_SIZE
+        } else {
+            self.batch_size
+        };
         if let Some(limit) = self.limit {
-            if pushdown {
+            // A table-side Selection between the pushed Limit and the
+            // `LocalIndexLookUp` (`Limit | Selection(c != 500) |
+            // LocalIndexLookUp`) limits the rows that survive it, so the
+            // storage side sorts the whole handle batch, filters, and only
+            // then limits: the index stream is not cut at `offset + count`.
+            let table_side_residual = self.filter.is_some() && !self.index_filter;
+            if pushdown && !table_side_residual {
                 // The pushed limit rides INSIDE each per-partition cop
                 // request (Go plants `Limit offset:o, count:c | cop[tikv]`
                 // under `LocalIndexLookUp`), so it cuts THIS partition's
@@ -2417,6 +2431,8 @@ impl IndexRangeSourceExec {
                 want = want.min(
                     usize::try_from(self.lookup_offset.saturating_add(limit)).unwrap_or(usize::MAX),
                 );
+            } else if pushdown {
+                // Read the ordinary handle batch (see above).
             } else if self.filter.is_none() {
                 // Go `extractTaskHandles`: `leftCnt := w.PushedLimit.Offset
                 // + w.PushedLimit.Count - w.scannedKeys` cuts the
@@ -9148,3 +9164,7 @@ mod tests {
         table
     }
 }
+
+/// Go unistore `cophandler.DefaultBatchSize`: the index rows a
+/// `LocalIndexLookUp` gathers, then sorts by handle, per table lookup.
+const LOCAL_INDEX_LOOKUP_BATCH_SIZE: usize = 32;

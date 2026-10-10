@@ -421,3 +421,33 @@ fn control_function_over_enum_yields_the_member_name() {
         ["a", "a", "a", "b", "b", "z"]
     );
 }
+
+/// Go `castAsRealFunctionClass` builds `builtinCastDecimalAsRealSig` with
+/// `PropagateType(ETReal)`, widening the DECIMAL argument's result scale to
+/// 30, and `builtinArithmeticDivideDecimalSig` rounds a quotient up to its
+/// result scale, so a quotient reaches the double with every digit
+/// `DecimalDiv` stored rather than its 12-digit display. Captured from Go
+/// TiDB (executor/issues).
+#[test]
+fn decimal_quotient_reaches_double_with_its_stored_digits() {
+    let mut session = Session::new();
+    session
+        .run("CREATE TABLE t (a varchar(8), b varchar(8), c decimal(20,2), d decimal(15,8))")
+        .unwrap();
+    session
+        .run("insert into t values(20210606, 20210606, 50000.00, 5.04600000)")
+        .unwrap();
+    for (sql, want) in [
+        ("select a * c *(d/36000) from t", "141642663.71666598"),
+        (
+            "select cast(d/36000 as double) from t",
+            "0.000140166666666666",
+        ),
+        ("select d/36000 from t", "0.000140166667"),
+        ("select c*(d/36000) from t", "7.00833333333330"),
+        ("select cast(1/3 as double)", "0.333333333"),
+        ("select 1/3 + 0e0", "0.333333333"),
+    ] {
+        assert_eq!(cell(&mut session, sql), want, "{sql}");
+    }
+}

@@ -623,6 +623,16 @@ pub fn build_cast_function(
     );
     let unsigned = target.flags() & FieldTypeFlags::UNSIGNED != 0;
     let source_eval_type = expr.static_type().map(FieldType::eval_type);
+    // Go `castAsRealFunctionClass.getFunction` builds
+    // `builtinCastDecimalAsRealSig` with `PropagateType(ETReal, args...)`:
+    // the DECIMAL argument's own result scale widens (to 30), so a quotient
+    // keeps its stored digits for the double instead of its display scale
+    // (`cast(1/3 as double)` is 0.333333333).
+    if target.eval_type() == tidb_datatype::EvalType::Real
+        && source_eval_type == Some(tidb_datatype::EvalType::Decimal)
+    {
+        crate::expression::propagate_type(&mut expr, tidb_datatype::EvalType::Real);
+    }
     // Go `castAsJSONFunctionClass.getFunction`: a string source picks
     // `builtinCastStringAsJSONSig` and marks its result ParseToJSON, so the
     // text is parsed as a JSON document (`'[1, 2]'` is an array, not a JSON

@@ -154,12 +154,8 @@ pub fn wrap_with_cast_as_int(
 }
 
 /// Go `WrapWithCastAsReal` (`builtin_cast.go:2703`).
-pub fn wrap_with_cast_as_real(mut expr: Expression) -> Result<Expression, EvalError> {
+pub fn wrap_with_cast_as_real(expr: Expression) -> Result<Expression, EvalError> {
     let source = type_of(&expr);
-    let source_is_decimal = source.eval_type() == EvalType::Decimal;
-    if source_is_decimal {
-        crate::expression::propagate_type(&mut expr, EvalType::Real);
-    }
     if source.eval_type() == EvalType::Real {
         return Ok(expr);
     }

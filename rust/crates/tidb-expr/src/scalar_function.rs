@@ -1489,6 +1489,20 @@ impl ScalarFunction {
         let Some(domain) = self.numeric_operand_domain() else {
             return;
         };
+        if domain == EvalType::Real {
+            // Each DECIMAL argument's implicit cast is Go's
+            // `builtinCastDecimalAsRealSig`, built with
+            // `PropagateType(ETReal)`: the argument's own result scale widens,
+            // so a quotient reaches the double with its stored digits.
+            for argument in &mut self.args {
+                if argument
+                    .static_type()
+                    .is_some_and(|field| field.eval_type() == EvalType::Decimal)
+                {
+                    crate::expression::propagate_type(argument, EvalType::Real);
+                }
+            }
+        }
         let mut probed_types = [None, None];
         for (index, argument) in self.args.iter_mut().enumerate() {
             if argument.const_level() != ConstLevel::STRICT {
@@ -1680,7 +1694,7 @@ impl ScalarFunction {
             } else {
                 None
             };
-        crate::ops::eval_binary_full(
+        let result = crate::ops::eval_binary_full(
             op,
             lhs,
             rhs,
@@ -1697,7 +1711,33 @@ impl ScalarFunction {
             EvalError::FloatOverflow => real_arithmetic_overflow_error(self, op, ctx),
             EvalError::DecimalOverflow => decimal_arithmetic_overflow_error(self, op, ctx),
             other => other,
-        })
+        })?;
+        Ok(self.round_quotient_to_result_scale(op, result))
+    }
+
+    /// Go `builtinArithmeticDivideDecimalSig`: a quotient storing fewer
+    /// fraction digits than the result type declares is rounded up to it,
+    /// which is how a scale `PropagateType` widened (a DECIMAL division under
+    /// a cast to DOUBLE) keeps every stored digit.
+    fn round_quotient_to_result_scale(&self, op: BinaryOp, result: Datum) -> Datum {
+        if op != BinaryOp::Div {
+            return result;
+        }
+        let Datum::Decimal(quotient) = &result else {
+            return result;
+        };
+        let Some(target) = self
+            .get_static_type()
+            .map(FieldType::decimal)
+            .filter(|&decimal| decimal != tidb_datatype::UNSPECIFIED_LENGTH)
+        else {
+            return result;
+        };
+        let (_, fraction) = quotient.precision_and_frac();
+        if i64::from(fraction) < target {
+            return Datum::Decimal(quotient.round_to_scale(target as i32));
+        }
+        result
     }
 
     /// The typed fast path for an integer arithmetic/comparison operator.
