@@ -314,7 +314,30 @@ pub fn build_field_type(
         field_type.set_flen(flen);
     }
     field_type.set_decimal(decimal);
+    decode_enum_set_binary_literal_to_utf8(&mut field_type);
     Ok(field_type)
+}
+
+/// Go `decodeEnumSetBinaryLiteralToUTF8`: an ENUM/SET member written as a
+/// hex or bit literal is text in the column's charset, decoded to UTF-8 with
+/// each invalid sequence replaced by `?` (`enum('a', 0x91) charset gbk`
+/// stores `?`); the literal markers are then cleared.
+fn decode_enum_set_binary_literal_to_utf8(field_type: &mut FieldType) {
+    if !matches!(field_type.code(), FieldTypeCode::Enum | FieldTypeCode::Set) {
+        return;
+    }
+    let encoding = tidb_datatype::find_encoding(field_type.charset_name());
+    for index in 0..field_type.elems().len() {
+        if !field_type.elem_is_binary_literal(index) {
+            continue;
+        }
+        let decoded = encoding.transform(
+            field_type.elem(index).as_bytes(),
+            tidb_datatype::TransformOp::DECODE_REPLACE,
+        );
+        field_type.set_elem(index, decoded.bytes().to_vec());
+    }
+    field_type.clean_elem_binary_literals();
 }
 
 /// Go `processColumnFlags` (`pkg/ddl/add_column.go:1297`), the four flag rules
@@ -505,8 +528,10 @@ mod tests {
             .expect("the probe declaration is buildable")
     }
 
+    /// Go `decodeEnumSetBinaryLiteralToUTF8`: the binary charset's decode
+    /// keeps the bytes, and the literal markers are cleared once decoded.
     #[test]
-    fn binary_enum_members_keep_bytes_and_literal_markers() {
+    fn binary_enum_members_keep_bytes_and_clear_literal_markers() {
         let declared = ColumnType {
             name: "ENUM".to_owned(),
             args: vec![
@@ -523,8 +548,8 @@ mod tests {
 
         assert_eq!(field_type.elem(0).as_bytes(), [0xff]);
         assert_eq!(field_type.elem(1).as_bytes(), [0x15]);
-        assert!(field_type.elem_is_binary_literal(0));
-        assert!(field_type.elem_is_binary_literal(1));
+        assert!(!field_type.elem_is_binary_literal(0));
+        assert!(!field_type.elem_is_binary_literal(1));
         assert_eq!(field_type.flen(), 1);
         assert_eq!(field_type.restore_bytes(), b"ENUM('\xff','\x15')");
     }

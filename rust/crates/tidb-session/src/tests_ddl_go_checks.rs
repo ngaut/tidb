@@ -465,3 +465,69 @@ fn multi_schema_position_and_rebase_follow_go() {
         ]]
     );
 }
+
+/// Go `GetTimeValue` -> `ParseTime`: a temporal DEFAULT with a seventh part is
+/// truncated to six with the warning `parseDatetime` appends directly, and
+/// kept (DATE stores `2020-03-27`), not refused as an invalid default.
+#[test]
+fn truncated_temporal_default_warns_and_is_kept() {
+    let mut session = Session::new();
+    session.run("create table t (a int)").unwrap();
+    session
+        .run("alter table t add column da1 date default '2020-03-27 20:20:20 123456'")
+        .unwrap();
+    assert_eq!(
+        warnings(&mut session),
+        vec![vec![
+            "Warning".to_owned(),
+            "1292".to_owned(),
+            "Truncated incorrect datetime value: '2020-03-27 20:20:20 123456'".to_owned(),
+        ]]
+    );
+    assert!(create_text(&mut session, "t").contains("`da1` date DEFAULT '2020-03-27'"));
+    assert_eq!(
+        code(
+            &mut session,
+            "alter table t add column da2 date default '2020-02-30'"
+        )
+        .0,
+        1067
+    );
+}
+
+/// Go `decodeEnumSetBinaryLiteralToUTF8`: an ENUM/SET member written as a
+/// hex literal is text in the column charset, decoded with `?` for each
+/// invalid sequence, before the duplicate check runs. Captured from Go TiDB.
+#[test]
+fn enum_set_binary_literal_members_decode_in_the_column_charset() {
+    let mut session = Session::new();
+    session
+        .run("create table e1 (a enum('a', 0x91) charset gbk)")
+        .unwrap();
+    assert!(create_text(&mut session, "e1")
+        .contains("`a` enum('a','?') CHARACTER SET gbk COLLATE gbk_chinese_ci DEFAULT NULL"));
+    session.run("create table e4 (a enum('a', 0xff))").unwrap();
+    assert!(create_text(&mut session, "e4").contains("`a` enum('a','?') DEFAULT NULL"));
+    session
+        .run("create table e5 (a set('x', 0x61) charset gbk)")
+        .unwrap();
+    assert!(create_text(&mut session, "e5").contains("`a` set('x','a') CHARACTER SET gbk"));
+    session
+        .run("create table e3 (a enum('a', 0xE4BDA0E5A5BD) charset gbk)")
+        .unwrap();
+    session.run("insert into e3 values (1), (2)").unwrap();
+    assert_eq!(
+        row_text(session.run("select a from e3")),
+        vec![vec!["a".to_owned()], vec!["浣犲ソ".to_owned()]]
+    );
+    assert_eq!(
+        code(
+            &mut session,
+            "create table e2 (a set('a', 0x91, '?') charset gbk)"
+        ),
+        (
+            1291,
+            "Column 'a' has duplicated value '?' in SET".to_owned()
+        )
+    );
+}

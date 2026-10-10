@@ -2620,7 +2620,7 @@ pub fn settle_column_default(
     zone: &tidb_datatype::SessionTimeZone,
 ) -> Result<SettledColumnDefault, DriverError> {
     let flags = ctx.ddl_default_conversion_flags();
-    let stored = column_default_storage_value(value, field_type, column, flags, zone)?;
+    let stored = column_default_storage_value(value, field_type, column, flags, zone, Some(ctx))?;
     let (has_default, stored) = check_column_default_value(stored, field_type, column, ctx, zone)?;
     let stored = timestamp_default_to_utc(stored, field_type, column, flags, zone)?;
     Ok(SettledColumnDefault {
@@ -2725,7 +2725,7 @@ fn prepare_computed_origin(
     zone: &tidb_datatype::SessionTimeZone,
 ) -> Result<Datum, DriverError> {
     let flags = ctx.ddl_default_conversion_flags();
-    let stored = column_default_storage_value(value, field_type, column, flags, zone)?;
+    let stored = column_default_storage_value(value, field_type, column, flags, zone, Some(ctx))?;
     let stored = timestamp_default_to_utc(stored, field_type, column, flags, zone)?;
     let stored = pad_fixed_width_binary_default(stored, field_type);
     validate_column_default(
@@ -2790,8 +2790,14 @@ pub fn normalize_column_default(
     column: &str,
     zone: &tidb_datatype::SessionTimeZone,
 ) -> Result<Datum, DriverError> {
-    let stored =
-        column_default_storage_value(value, field_type, column, tidb_datatype::STRICT_FLAGS, zone)?;
+    let stored = column_default_storage_value(
+        value,
+        field_type,
+        column,
+        tidb_datatype::STRICT_FLAGS,
+        zone,
+        None,
+    )?;
     let stored = pad_fixed_width_binary_default(stored, field_type);
     validate_column_default(
         &stored,
@@ -2812,6 +2818,7 @@ fn column_default_storage_value(
     column: &str,
     flags: tidb_datatype::ConversionFlags,
     zone: &tidb_datatype::SessionTimeZone,
+    ctx: Option<&crate::StmtContext>,
 ) -> Result<Datum, DriverError> {
     if value.is_null() {
         return Ok(Datum::Null);
@@ -2890,15 +2897,34 @@ fn column_default_storage_value(
         | tidb_datatype::FieldTypeCode::Datetime
         | tidb_datatype::FieldTypeCode::Timestamp
         | tidb_datatype::FieldTypeCode::Duration => {
+            // Go `GetTimeValue`: a value `ParseTime` refuses is an invalid
+            // default, while the truncation `parseDatetime` appends directly
+            // (`'2020-03-27 20:20:20 123456'` has a seventh part) is the
+            // statement's warning and the default is kept.
+            #[derive(Default)]
+            struct Warnings(std::cell::RefCell<Vec<tidb_error::terror::TerrorError>>);
+            impl tidb_datatype::ConversionWarningAppender for Warnings {
+                fn append_conversion_warning(&self, warning: tidb_error::terror::TerrorError) {
+                    self.0.borrow_mut().push(warning);
+                }
+            }
+            let warnings = Warnings::default();
+            let context = tidb_datatype::ConversionContext::new(
+                flags,
+                tidb_datatype::ConversionLocation::from_time_zone(zone),
+                &warnings,
+            );
             let converted = value
-                .convert_to_in(field_type, flags, zone)
+                .convert_to_in_context(field_type, &context, zone)
                 .map_err(|_| invalid())?;
-            if converted
-                .event
-                .as_ref()
-                .is_some_and(|event| !crate::driver::conversion_event_is_silent(event))
-            {
+            if converted.error.is_some() {
                 return Err(invalid());
+            }
+            if let Some(ctx) = ctx {
+                for warning in warnings.0.into_inner() {
+                    let warning = warning.to_sql_error();
+                    ctx.append_warning_parts(warning.code, &warning.message);
+                }
             }
             converted.value
         }

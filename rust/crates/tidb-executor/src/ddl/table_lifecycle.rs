@@ -252,8 +252,8 @@ pub fn run_rename_table_in(
     for (from, to) in &pairs {
         let (from_db, from_name) = crate::driver::split_table_path_pub(from, current_db)?;
         let (from_db, from_name) = (from_db.go_to_lower(), from_name.go_to_lower());
-        let (to_db, to_name) = crate::driver::split_table_path_pub(to, current_db)?;
-        let (to_db, to_name) = (to_db.go_to_lower(), to_name.go_to_lower());
+        let (to_db, written_to_name) = crate::driver::split_table_path_pub(to, current_db)?;
+        let (to_db, to_name) = (to_db.go_to_lower(), written_to_name.go_to_lower());
 
         super::refuse_local_temporary_table_ddl(catalog, &from_db, &from_name, "RENAME TABLE")?;
         if !check_rename(RenameAdmission {
@@ -288,6 +288,7 @@ pub fn run_rename_table_in(
             from_name,
             to_db,
             to_name,
+            written_to_name: written_to_name.to_owned(),
             source_cached,
         });
     }
@@ -320,7 +321,7 @@ pub fn run_rename_table_in(
             &rename.from_db,
             &rename.from_name,
             &rename.to_db,
-            &rename.to_name,
+            &rename.written_to_name,
         );
     }
     Ok(())
@@ -333,6 +334,9 @@ struct Rename {
     from_name: String,
     to_db: String,
     to_name: String,
+    /// The target name as written, which the table stores (Go
+    /// `TableInfo.Name` after `onRenameTable`).
+    written_to_name: String,
     source_cached: bool,
 }
 

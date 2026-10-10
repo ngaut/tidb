@@ -579,12 +579,45 @@ fn first_unknown_output_column(predicate: &tidb_ast::Expr, columns: &[&str]) -> 
     collector.missing
 }
 
+/// Whether `expr` names any column.
+fn references_column(expr: &tidb_ast::Expr) -> bool {
+    first_unknown_output_column(expr, &[]).is_some()
+}
+
+/// Go `buildShow`: `LIKE <pattern>` is `<first output column> LIKE
+/// <pattern>`, planned as a Selection over the SHOW's own rows, so an
+/// identifier in the pattern names one of those columns. One the output does
+/// not have is 1054 when the statement is built, whatever the rows, spelled
+/// in lower case as Go reports it.
+fn show_like_predicate(
+    pattern: &tidb_ast::Expr,
+    columns: &[&str],
+) -> Result<tidb_ast::Expr, DriverError> {
+    if let Some(missing) = first_unknown_output_column(pattern, columns) {
+        return Err(DriverError::UnknownColumnInClause {
+            column: go_to_lower(&missing),
+            clause: "where clause".into(),
+        });
+    }
+    let first = columns.first().copied().unwrap_or_default();
+    Ok(tidb_ast::Expr::Like {
+        expr: Box::new(tidb_ast::Expr::Column(vec![first.to_owned()])),
+        pattern: Box::new(pattern.clone()),
+        not: false,
+        ilike: false,
+        escape: None,
+    })
+}
+
 /// An evaluated SHOW LIKE operand, including whether Go's predicate extractor
 /// lower-cases both the metadata name and a literal pattern.
 pub(crate) struct ShowLikePattern {
     value: Option<String>,
     fold_lowercase: bool,
     literal_name: Option<String>,
+    /// A pattern that names columns: Go plans it as a predicate over each
+    /// row ([`show_like_predicate`]) instead of a literal match.
+    row_pattern: Option<tidb_ast::Expr>,
 }
 
 impl ShowLikePattern {
@@ -602,6 +635,14 @@ impl ShowLikePattern {
                     | tidb_ast::Expr::RawString(_)
                     | tidb_ast::Expr::Bool(_)
             );
+        if references_column(expr) {
+            return Self {
+                value: None,
+                fold_lowercase: false,
+                literal_name: None,
+                row_pattern: Some(expr.clone()),
+            };
+        }
         let literal_name = if extracted_literal {
             value.clone().filter(|name| !name.is_empty())
         } else {
@@ -615,7 +656,18 @@ impl ShowLikePattern {
             },
             fold_lowercase: extracted_literal,
             literal_name,
+            row_pattern: None,
         }
+    }
+
+    /// The per-row predicate for a pattern that names columns, after Go's
+    /// build-time 1054 for a column `columns` does not have; `None` for a
+    /// literal pattern.
+    fn row_predicate(&self, columns: &[&str]) -> Result<Option<tidb_ast::Expr>, DriverError> {
+        self.row_pattern
+            .as_ref()
+            .map(|pattern| show_like_predicate(pattern, columns))
+            .transpose()
     }
 
     fn column_name(&self, base: &str) -> String {
@@ -625,6 +677,10 @@ impl ShowLikePattern {
     }
 
     fn matches(&self, text: &str) -> bool {
+        // A row predicate is applied where the whole row is known.
+        if self.row_pattern.is_some() {
+            return true;
+        }
         let Some(pattern) = &self.value else {
             return false;
         };
@@ -656,11 +712,16 @@ pub(crate) fn filter_show_output(
         return Ok(output);
     };
     let column_names: Vec<&str> = columns.iter().map(|(name, _)| name.as_str()).collect();
+    let like_predicate = match &like_pattern {
+        Some(pattern) => pattern.row_predicate(&column_names)?,
+        None => None,
+    };
     let mut filtered = Vec::with_capacity(rows.len());
     for row in rows {
-        let matches_like = match &like_pattern {
-            None => true,
-            Some(pattern) => row
+        let matches_like = match (&like_predicate, &like_pattern) {
+            (Some(predicate), _) => show_row_matches(predicate, &column_names, &row)?,
+            (None, None) => true,
+            (None, Some(pattern)) => row
                 .first()
                 .and_then(datum_text)
                 .is_some_and(|text| pattern.matches(&text)),
@@ -1241,13 +1302,15 @@ impl Session {
                     Some(tidb_ast::Expr::String(text)) => {
                         Some(tidb_util::stringutil::go_to_lower(text))
                     }
-                    Some(_) => {
-                        return Err(DriverError::unsupported(
-                            "SHOW VARIABLES LIKE takes a string pattern",
-                        ))
-                    }
-                    None => None,
+                    _ => None,
                 };
+                let like_predicate = match &show.like {
+                    Some(expr) if !matches!(expr, tidb_ast::Expr::String(_)) => {
+                        Some(show_like_predicate(expr, SHOW_VARIABLE_COLUMNS)?)
+                    }
+                    _ => None,
+                };
+                let predicate = show.where_clause.as_ref().or(like_predicate.as_ref());
                 let text =
                     || tidb_datatype::FieldType::new(tidb_datatype::FieldTypeCode::VarString);
                 let mut rows = Vec::new();
@@ -1291,7 +1354,7 @@ impl Session {
                     ];
                     // Go plans the WHERE as a selection over the same
                     // virtual rows, which is what this filter is.
-                    if let Some(predicate) = &show.where_clause {
+                    if let Some(predicate) = predicate {
                         if !show_row_matches(predicate, SHOW_VARIABLE_COLUMNS, &row)? {
                             continue;
                         }
@@ -1323,16 +1386,19 @@ impl Session {
                     Some(tidb_ast::ShowStatusFilter::Like(tidb_ast::Expr::String(text))) => {
                         Some(text.clone())
                     }
-                    Some(tidb_ast::ShowStatusFilter::Like(_)) => {
-                        return Err(DriverError::unsupported(
-                            "SHOW STATUS LIKE takes a string pattern",
-                        ))
+                    _ => None,
+                };
+                let like_predicate = match &show.filter {
+                    Some(tidb_ast::ShowStatusFilter::Like(expr))
+                        if !matches!(expr, tidb_ast::Expr::String(_)) =>
+                    {
+                        Some(show_like_predicate(expr, SHOW_VARIABLE_COLUMNS)?)
                     }
                     _ => None,
                 };
                 let predicate = match &show.filter {
                     Some(tidb_ast::ShowStatusFilter::Where(expr)) => Some(expr),
-                    _ => None,
+                    _ => like_predicate.as_ref(),
                 };
                 let text =
                     || tidb_datatype::FieldType::new(tidb_datatype::FieldTypeCode::VarString);
@@ -1409,17 +1475,19 @@ impl Session {
                     Some(tidb_ast::ShowCharsetFilter::Like(tidb_ast::Expr::String(text))) => {
                         Some(text.clone())
                     }
-                    Some(tidb_ast::ShowCharsetFilter::Like(_)) => {
-                        return Err(DriverError::unsupported(
-                            "SHOW CHARSET LIKE takes a string pattern",
-                        ))
+                    _ => None,
+                };
+                let like_predicate = match &show.filter {
+                    Some(tidb_ast::ShowCharsetFilter::Like(expr))
+                        if !matches!(expr, tidb_ast::Expr::String(_)) =>
+                    {
+                        Some(show_like_predicate(expr, SHOW_CHARSET_COLUMNS)?)
                     }
-                    None => None,
-                    Some(tidb_ast::ShowCharsetFilter::Where(_)) => None,
+                    _ => None,
                 };
                 let predicate = match &show.filter {
                     Some(tidb_ast::ShowCharsetFilter::Where(expr)) => Some(expr),
-                    _ => None,
+                    _ => like_predicate.as_ref(),
                 };
                 let text =
                     || tidb_datatype::FieldType::new(tidb_datatype::FieldTypeCode::VarString);
@@ -1484,16 +1552,19 @@ impl Session {
                     Some(tidb_ast::ShowEnginesFilter::Like(tidb_ast::Expr::String(text))) => {
                         Some(text.as_str())
                     }
-                    Some(tidb_ast::ShowEnginesFilter::Like(_)) => {
-                        return Err(DriverError::unsupported(
-                            "SHOW ENGINES LIKE takes a string pattern",
-                        ));
+                    _ => None,
+                };
+                let like_predicate = match &show.filter {
+                    Some(tidb_ast::ShowEnginesFilter::Like(expr))
+                        if !matches!(expr, tidb_ast::Expr::String(_)) =>
+                    {
+                        Some(show_like_predicate(expr, SHOW_ENGINES_COLUMNS)?)
                     }
                     _ => None,
                 };
                 let predicate = match &show.filter {
                     Some(tidb_ast::ShowEnginesFilter::Where(expr)) => Some(expr),
-                    _ => None,
+                    _ => like_predicate.as_ref(),
                 };
                 let text =
                     || tidb_datatype::FieldType::new(tidb_datatype::FieldTypeCode::VarString);
@@ -1560,17 +1631,19 @@ impl Session {
                     Some(tidb_ast::ShowCollationFilter::Like(tidb_ast::Expr::String(text))) => {
                         Some(tidb_util::stringutil::go_to_lower(text))
                     }
-                    Some(tidb_ast::ShowCollationFilter::Like(_)) => {
-                        return Err(DriverError::unsupported(
-                            "SHOW COLLATION LIKE takes a string pattern",
-                        ))
+                    _ => None,
+                };
+                let like_predicate = match &show.filter {
+                    Some(tidb_ast::ShowCollationFilter::Like(expr))
+                        if !matches!(expr, tidb_ast::Expr::String(_)) =>
+                    {
+                        Some(show_like_predicate(expr, SHOW_COLLATION_COLUMNS)?)
                     }
-                    None => None,
-                    Some(tidb_ast::ShowCollationFilter::Where(_)) => None,
+                    _ => None,
                 };
                 let predicate = match &show.filter {
                     Some(tidb_ast::ShowCollationFilter::Where(expr)) => Some(expr),
-                    _ => None,
+                    _ => like_predicate.as_ref(),
                 };
                 let text =
                     || tidb_datatype::FieldType::new(tidb_datatype::FieldTypeCode::VarString);
@@ -2125,6 +2198,10 @@ impl Session {
                 } else {
                     vec![name_column.as_str()]
                 };
+                let like_predicate = match &like_pattern {
+                    Some(pattern) => pattern.row_predicate(&column_names)?,
+                    None => None,
+                };
                 let mut rows = Vec::with_capacity(listed.len());
                 for (name, is_view, is_sequence) in listed {
                     let mut row = vec![Datum::Bytes(name.into_bytes())];
@@ -2132,6 +2209,11 @@ impl Session {
                         row.push(Datum::Bytes(
                             table_type_of(is_view, is_sequence).as_bytes().to_vec(),
                         ));
+                    }
+                    if let Some(predicate) = &like_predicate {
+                        if !show_row_matches(predicate, &column_names, &row)? {
+                            continue;
+                        }
                     }
                     if let Some(predicate) = where_clause {
                         if !show_row_matches(predicate, &column_names, &row)? {

@@ -255,3 +255,88 @@ fn partition_bound_literal_takes_the_connection_charset() {
         vec![vec!["C4E3BAC3"]]
     );
 }
+
+/// Go lists a table by `TableInfo.Name.O`: the spelling it was created or
+/// renamed with, in SHOW TABLES (byte order), SHOW TABLE STATUS and
+/// information_schema, while lookups stay case-insensitive.
+#[test]
+fn table_listings_keep_the_written_name() {
+    let mut session = Session::new();
+    session.run("create table caseSensitive (a int)").unwrap();
+    session.run("create view myView as select 1 as x").unwrap();
+    session.run("create sequence mySeq").unwrap();
+    assert_eq!(
+        row_text(session.run("show full tables")),
+        vec![
+            vec!["caseSensitive", "BASE TABLE"],
+            vec!["mySeq", "SEQUENCE"],
+            vec!["myView", "VIEW"],
+        ]
+    );
+    assert_eq!(
+        row_text(session.run(
+            "select table_name from information_schema.tables \
+             where table_schema = 'test' and table_name like '%ase%'"
+        )),
+        vec![vec!["caseSensitive"]]
+    );
+    session
+        .run("rename table casesensitive to CaseRenamed")
+        .unwrap();
+    assert_eq!(
+        row_text(session.run("show tables like 'case%'")),
+        vec![vec!["CaseRenamed"]]
+    );
+    assert_eq!(
+        row_text(session.run("show table status like 'case%'"))[0][0],
+        "CaseRenamed"
+    );
+    assert_eq!(
+        row_text(session.run(
+            "select table_name from information_schema.columns \
+             where table_schema = 'test' and column_name = 'a'"
+        )),
+        vec![vec!["CaseRenamed"]]
+    );
+}
+
+/// Go `buildShow`: `LIKE <pattern>` is `<first output column> LIKE <pattern>`
+/// over the SHOW's own rows, so an identifier names one of those columns
+/// (matching every row when it is the first one), and one the output does not
+/// have is 1054, lower-cased. Captured from Go TiDB.
+#[test]
+fn show_like_identifier_names_an_output_column() {
+    let mut session = Session::new();
+    session.run("create table t (id int, Field int)").unwrap();
+    for sql in [
+        "show columns from t like Field",
+        "show columns from t like `Field`",
+        "show columns from t like FIELD",
+    ] {
+        assert_eq!(
+            row_text(session.run(sql))
+                .into_iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>(),
+            ["id", "Field"],
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        row_text(session.run("show tables like Tables_in_test")),
+        vec![vec!["t"]]
+    );
+    for (sql, column) in [
+        ("show columns from t like id", "id"),
+        ("show tables like T", "t"),
+        ("show databases like X", "x"),
+        ("show variables like abc", "abc"),
+        ("show charset like X", "x"),
+    ] {
+        assert_eq!(
+            code(&mut session, sql),
+            (1054, format!("Unknown column '{column}' in 'where clause'")),
+            "{sql}"
+        );
+    }
+}

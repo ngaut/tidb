@@ -1114,17 +1114,36 @@ impl Catalog {
     /// stated once, here, because `SHOW TABLES`, `SHOW FULL TABLES` and
     /// `information_schema.tables` all enumerate through this one call and
     /// must not disagree.
+    ///
+    /// The names are Go's `TableInfo.Name.O`, the spelling the table was
+    /// created (or renamed) with, in byte order as Go's `fetchShowTables`
+    /// sorts them; the catalog's keys are lower-cased and only for lookup.
     #[must_use]
     pub fn table_names(&self, database: &str) -> Option<Vec<String>> {
         let database = self.databases.get(&database.go_to_lower())?;
+        let is_information_schema = database
+            .name
+            .eq_ignore_ascii_case(crate::driver::infoschema_meta::INFORMATION_SCHEMA);
         let mut names: Vec<String> = database
             .tables
             .iter()
-            .filter(|(_, entry)| {
-                !matches!(entry.as_ref(), TableEntry::Kv(table)
-                    if table.temp_table_type() == tidb_model::TempTableType::LOCAL)
+            .filter_map(|(key, entry)| match entry.as_ref() {
+                TableEntry::Kv(table)
+                    if table.temp_table_type() == tidb_model::TempTableType::LOCAL =>
+                {
+                    None
+                }
+                TableEntry::Kv(table) => Some(table.name.clone()),
+                TableEntry::View(view) => Some(view.name.clone()),
+                TableEntry::Sequence(sequence) => Some(sequence.name.clone()),
+                // A memory table carries no name of its own: its key, or the
+                // canonical spelling of an information_schema table.
+                TableEntry::Mem(_) if is_information_schema => Some(
+                    crate::driver::infoschema_meta::canonical_table_name(key)
+                        .map_or_else(|| key.clone(), str::to_owned),
+                ),
+                TableEntry::Mem(_) => Some(key.clone()),
             })
-            .map(|(name, _)| name.clone())
             .collect();
         names.sort();
         Some(names)
