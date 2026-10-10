@@ -417,6 +417,7 @@ fn locate_list_columns_condition(
                         &[tidb_datatype::UNSPECIFIED_LENGTH],
                         context.range_max_size(),
                         context.range_fallback_handler(),
+                        context.ranger_options(),
                     )
                     .map_err(|error| {
                         tidb_planner::plan_base::PlanError::internal(format!(
@@ -604,6 +605,7 @@ fn partition_indices_for_spec(
         &lengths,
         context.range_max_size(),
         context.range_fallback_handler(),
+        context.ranger_options(),
     ) else {
         return Ok(remap_partition_indices(
             partition,
@@ -1604,6 +1606,15 @@ impl InitStats<'_> {
             path.declared_columns.is_some()
         });
         source.access_path_min_selectivity = 1.0;
+        // Go `deriveStats4DataSource`: `EliminateNoPrecisionLossCast` over the
+        // pushed conditions before any index path is filled, so `cast(a AS
+        // SIGNED) = 1` on an INT key -- a UNION branch's widening cast --
+        // builds a point range.
+        let builder = tidb_expr::expr_util::RealFunctionBuilder::new(self.context);
+        for condition in &mut source.pushed_down_conds {
+            *condition =
+                tidb_expr::expr_util::eliminate_no_precision_loss_cast(condition, &builder);
+        }
         // Go `initStats` calls `GetStatsTable(..., ds.PhysicalTableID)`: a
         // static-pruning child owns one physical partition's statistics,
         // while an ordinary/dynamic source keeps the logical table ID here.
@@ -2420,6 +2431,7 @@ impl InitStats<'_> {
                             self.context.range_max_size(),
                             self.context.range_fallback_handler(),
                             &evaluate,
+                            self.context.ranger_options(),
                         ).map_err(|error| {
                             use tidb_planner::ranger::points::PointBuilderError;
                             match error {
@@ -2833,6 +2845,7 @@ impl DriverCteOptimizer<'_> {
                 max_size: ctx.range_max_size(),
                 fallback_handler: Some(ctx.range_fallback_handler()),
                 eval_ctx: Some(ctx),
+                ranger_options: ctx.ranger_options(),
             },
             catalog: self.catalog,
             select: None,
@@ -3337,6 +3350,7 @@ fn optimize_built_logical(
                     max_size: self.context.range_max_size(),
                     fallback_handler: Some(self.context.range_fallback_handler()),
                     eval_ctx: Some(self.context),
+                    ranger_options: self.context.ranger_options(),
                 },
                 catalog: self.catalog,
                 select: self.select,
@@ -4235,6 +4249,7 @@ mod statistics_initialization_tests {
                     let comparison_ranges = tidb_planner::ranger::detacher::detach_index_range_with_fallback_handler_in(
                         std::slice::from_ref(&comparison), std::slice::from_ref(&column), &[-1],
                         context.range_max_size(), context.range_fallback_handler(), &evaluate,
+                        context.ranger_options(),
                     ).unwrap();
                     assert!(comparison_ranges.ranges.is_empty());
                 }
@@ -4246,6 +4261,7 @@ mod statistics_initialization_tests {
                         context.range_max_size(),
                         context.range_fallback_handler(),
                         &evaluate,
+                        context.ranger_options(),
                     );
                 assert_eq!(direct.is_err(), !bound, "direct result: {direct:?}");
                 let expected_error = direct.err().map(|error| match error {

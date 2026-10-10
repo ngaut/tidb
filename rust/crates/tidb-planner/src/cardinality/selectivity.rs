@@ -489,6 +489,7 @@ fn detach_index_range(
             ctx.options.range_max_size,
             handler,
             ctx.evaluate,
+            ctx.options.ranger_options(),
         ),
         None => crate::ranger::detacher::detach_cond_and_build_range_for_index_in(
             exprs,
@@ -496,6 +497,7 @@ fn detach_index_range(
             lengths,
             ctx.options.range_max_size,
             ctx.evaluate,
+            ctx.options.ranger_options(),
         ),
     }?;
     ctx.skip_plan_cache(detached.skip_plan_cache_reason.as_deref());

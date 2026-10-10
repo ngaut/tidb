@@ -246,6 +246,33 @@ use super::points::{
     OP_NE, OP_NULL_EQ,
 };
 
+/// The session switches Go's `rangerctx.RangerContext` carries into the
+/// detacher: `RegardNULLAsPoint`, `OptPrefixIndexSingleScan` and the
+/// `OptimizerFixControl` entries the ranger reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangerOptions {
+    /// Go `RegardNULLAsPoint` (`tidb_regard_null_as_point`, default ON).
+    pub regard_null_as_point: bool,
+    /// Go `OptPrefixIndexSingleScan` (`tidb_opt_prefix_index_single_scan`,
+    /// default ON).
+    pub opt_prefix_index_single_scan: bool,
+    /// Go `fixcontrol.Fix44389` (default OFF).
+    pub fix_44389: bool,
+    /// Go `fixcontrol.Fix54337` (default OFF).
+    pub fix_54337: bool,
+}
+
+impl Default for RangerOptions {
+    fn default() -> Self {
+        Self {
+            regard_null_as_point: true,
+            opt_prefix_index_single_scan: true,
+            fix_44389: false,
+            fix_54337: false,
+        }
+    }
+}
+
 /// Go `valueInfo`: one index column's constant value, when it has one.
 /// `mutable` marks plan-cache parameters whose value cannot be trusted at
 /// plan time.
@@ -1097,6 +1124,7 @@ pub fn detach_simple_cond_and_build_range_for_index(
         lengths,
         range_max_size,
         &crate::ranger::points::evaluate_static,
+        RangerOptions::default(),
     )
 }
 
@@ -1107,6 +1135,7 @@ pub fn detach_simple_cond_and_build_range_for_index_in(
     lengths: &[i64],
     range_max_size: i64,
     eval_expression: &ExpressionEvaluator<'_>,
+    options: RangerOptions,
 ) -> Result<
     (super::types::Ranges, Vec<Expression>, Vec<Expression>),
     super::points::PointBuilderError,
@@ -1127,12 +1156,12 @@ pub fn detach_simple_cond_and_build_range_for_index_in(
         merge_consecutive: true,
         convert_to_sort_key: true,
         range_max_size,
-        regard_null_as_point: true,
+        regard_null_as_point: options.regard_null_as_point,
         range_fallback_handler: None,
-        opt_prefix_index_single_scan: true,
+        opt_prefix_index_single_scan: options.opt_prefix_index_single_scan,
         skip_plan_cache_reason: None,
-        fix_44389: false,
-        fix_54337: false,
+        fix_44389: options.fix_44389,
+        fix_54337: options.fix_54337,
     };
     let res = detacher.detach_cnf(conditions, false)?;
     Ok((res.ranges, res.access_conds, res.remained_conds))
@@ -1775,6 +1804,7 @@ pub fn detach_cond_and_build_range_for_index(
         lengths,
         range_max_size,
         &crate::ranger::points::evaluate_static,
+        RangerOptions::default(),
     )
 }
 
@@ -1785,6 +1815,7 @@ pub fn detach_cond_and_build_range_for_index_in(
     lengths: &[i64],
     range_max_size: i64,
     eval_expression: &ExpressionEvaluator<'_>,
+    options: RangerOptions,
 ) -> Result<DetachRangeResult, super::points::PointBuilderError> {
     detach_cond_and_build_range(
         conditions,
@@ -1795,6 +1826,7 @@ pub fn detach_cond_and_build_range_for_index_in(
         true,
         eval_expression,
         None,
+        options,
     )
 }
 
@@ -1813,6 +1845,7 @@ pub fn detach_index_range_with_fallback_handler(
         range_max_size,
         handler,
         &super::points::evaluate_static,
+        RangerOptions::default(),
     )
 }
 
@@ -1824,6 +1857,7 @@ pub fn detach_index_range_with_fallback_handler_in(
     range_max_size: i64,
     handler: &tidb_util::context::RangeFallbackHandler,
     eval_expression: &ExpressionEvaluator<'_>,
+    options: RangerOptions,
 ) -> Result<DetachRangeResult, super::points::PointBuilderError> {
     detach_cond_and_build_range(
         conditions,
@@ -1834,6 +1868,7 @@ pub fn detach_index_range_with_fallback_handler_in(
         true,
         eval_expression,
         Some(handler),
+        options,
     )
 }
 
@@ -1851,6 +1886,7 @@ pub fn detach_cond_and_build_range_for_partition(
         lengths,
         range_max_size,
         &crate::ranger::points::evaluate_static,
+        RangerOptions::default(),
     )
 }
 
@@ -1861,6 +1897,7 @@ pub fn detach_cond_and_build_range_for_partition_in(
     lengths: &[i64],
     range_max_size: i64,
     eval_expression: &ExpressionEvaluator<'_>,
+    options: RangerOptions,
 ) -> Result<DetachRangeResult, super::points::PointBuilderError> {
     detach_cond_and_build_range(
         conditions,
@@ -1871,6 +1908,7 @@ pub fn detach_cond_and_build_range_for_partition_in(
         false,
         eval_expression,
         None,
+        options,
     )
 }
 
@@ -1881,6 +1919,7 @@ pub fn detach_partition_range_with_fallback_handler(
     lengths: &[i64],
     range_max_size: i64,
     handler: &tidb_util::context::RangeFallbackHandler,
+    options: RangerOptions,
 ) -> Result<DetachRangeResult, super::points::PointBuilderError> {
     detach_cond_and_build_range(
         conditions,
@@ -1891,6 +1930,7 @@ pub fn detach_partition_range_with_fallback_handler(
         false,
         &super::points::evaluate_static,
         Some(handler),
+        options,
     )
 }
 
@@ -1904,6 +1944,7 @@ fn detach_cond_and_build_range(
     merge_consecutive: bool,
     eval_expression: &ExpressionEvaluator<'_>,
     range_fallback_handler: Option<&tidb_util::context::RangeFallbackHandler>,
+    options: RangerOptions,
 ) -> Result<DetachRangeResult, super::points::PointBuilderError> {
     let new_tp_slice: Vec<tidb_datatype::FieldType> = cols
         .iter()
@@ -1922,11 +1963,11 @@ fn detach_cond_and_build_range(
         convert_to_sort_key,
         range_max_size,
         range_fallback_handler,
-        regard_null_as_point: true,
-        opt_prefix_index_single_scan: true,
+        regard_null_as_point: options.regard_null_as_point,
+        opt_prefix_index_single_scan: options.opt_prefix_index_single_scan,
         skip_plan_cache_reason: None,
-        fix_44389: false,
-        fix_54337: false,
+        fix_44389: options.fix_44389,
+        fix_54337: options.fix_54337,
     };
     let mut res = detacher.detach_cond_and_build_range_for_cols(conditions)?;
     res.skip_plan_cache_reason = detacher.skip_plan_cache_reason;
@@ -2766,12 +2807,13 @@ pub fn add_gc_column_cond(
 pub fn add_expr4_eq_and_in_condition(
     conditions: &[Expression],
     cols: &[tidb_expr::column::Column],
+    regard_null_as_point: bool,
 ) -> Result<Vec<Expression>, super::points::PointBuilderError> {
     let mut accesses: Vec<Option<Expression>> = vec![None; cols.len()];
     let mut column_values: Vec<Option<ValueInfo>> = vec![None; cols.len()];
     let mut add_gc_cond = true;
     for cond in conditions {
-        let offset = get_potential_eq_or_in_col_offset(cond, cols, false);
+        let offset = get_potential_eq_or_in_col_offset(cond, cols, regard_null_as_point);
         if offset < 0 {
             continue;
         }

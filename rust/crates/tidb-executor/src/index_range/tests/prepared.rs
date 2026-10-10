@@ -167,6 +167,7 @@ fn prepared_range_shapes_preserve_current_values_and_residuals() {
             &lengths,
             0,
             &|expression| resolver.eval_constant(expression),
+            Default::default(),
         )
         .unwrap();
         let native_ranges: Vec<_> = native

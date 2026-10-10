@@ -2727,6 +2727,20 @@ impl StmtContext {
         self.opt_prefix_index_single_scan
     }
 
+    /// Go `sctx.GetRangerCtx()`'s session switches for this statement: the
+    /// estimator snapshot's, with this statement's prefix-index switch.
+    #[must_use]
+    pub fn ranger_options(&self) -> tidb_planner::ranger::detacher::RangerOptions {
+        tidb_planner::ranger::detacher::RangerOptions {
+            opt_prefix_index_single_scan: self.opt_prefix_index_single_scan,
+            ..self
+                .optimizer_cost_env()
+                .session
+                .estimator_options
+                .ranger_options()
+        }
+    }
+
     /// Returns `@@tidb_opt_always_keep_join_key`.
     pub fn always_keep_join_key(&self) -> bool {
         self.always_keep_join_key

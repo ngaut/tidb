@@ -69,6 +69,10 @@ impl AccessPathDerivationContext<'_> {
         lengths: &[i64],
     ) -> Result<crate::ranger::detacher::DetachRangeResult, crate::ranger::points::PointBuilderError>
     {
+        let options = crate::ranger::detacher::RangerOptions {
+            opt_prefix_index_single_scan: self.opt_prefix_index_single_scan,
+            ..self.estimator_options.ranger_options()
+        };
         let detached = match self.range_fallback_handler {
             Some(handler) => crate::ranger::detacher::detach_index_range_with_fallback_handler_in(
                 conditions,
@@ -77,6 +81,7 @@ impl AccessPathDerivationContext<'_> {
                 self.range_max_size,
                 handler,
                 self.expression_evaluator,
+                options,
             ),
             None => crate::ranger::detacher::detach_cond_and_build_range_for_index_in(
                 conditions,
@@ -84,6 +89,7 @@ impl AccessPathDerivationContext<'_> {
                 lengths,
                 self.range_max_size,
                 self.expression_evaluator,
+                options,
             ),
         }?;
         if let (Some(marker), Some(reason)) = (

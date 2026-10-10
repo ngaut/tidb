@@ -442,6 +442,8 @@ pub type DeferredExpressionEvaluator<'a> =
 pub struct CachedPlanRebuildContext<'a> {
     parameters: &'a [Datum],
     deferred_evaluator: Option<&'a DeferredExpressionEvaluator<'a>>,
+    /// The executing statement's Go `RangerContext` switches.
+    ranger_options: crate::ranger::detacher::RangerOptions,
     /// The first reason the ranger passed to Go's `SetSkipPlanCache` while
     /// rebuilding; like Go, the rebuild goes on to its range checks.
     skip_plan_cache: std::sync::OnceLock<String>,
@@ -455,8 +457,24 @@ impl<'a> CachedPlanRebuildContext<'a> {
         Self {
             parameters,
             deferred_evaluator: None,
+            ranger_options: crate::ranger::detacher::RangerOptions {
+                regard_null_as_point: true,
+                opt_prefix_index_single_scan: true,
+                fix_44389: false,
+                fix_54337: false,
+            },
             skip_plan_cache: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Installs the executing statement's ranger switches.
+    #[must_use]
+    pub const fn with_ranger_options(
+        mut self,
+        options: crate::ranger::detacher::RangerOptions,
+    ) -> Self {
+        self.ranger_options = options;
+        self
     }
 
     /// Installs the statement evaluator used by deferred constants and ranges.
@@ -860,6 +878,7 @@ fn rebuild_table_scan(
         &rebuild.common_handle_lengths,
         0,
         &|expr| context.evaluate(expr),
+        context.ranger_options,
     )
     .map_err(|error| PlanCacheRebuildError::RangeBuild(format!("{error:?}")))?;
     note_skipped(context, &result.skip_plan_cache_reason);
@@ -901,6 +920,7 @@ fn rebuild_index_scan(
         &rebuild.index_column_lengths,
         0,
         &|expr| context.evaluate(expr),
+        context.ranger_options,
     )
     .map_err(|error| PlanCacheRebuildError::RangeBuild(format!("{error:?}")))?;
     note_skipped(context, &result.skip_plan_cache_reason);
@@ -975,6 +995,7 @@ fn rebuild_point_ranges(
                     &rebuild.common_handle_lengths,
                     0,
                     &|expr| context.evaluate(expr),
+                    context.ranger_options,
                 )
                 .map_err(|error| PlanCacheRebuildError::RangeBuild(format!("{error:?}")))?;
                 note_skipped(context, &result.skip_plan_cache_reason);
@@ -1028,6 +1049,7 @@ fn rebuild_point_ranges(
                 &rebuild.index_column_lengths,
                 0,
                 &|expr| context.evaluate(expr),
+                context.ranger_options,
             )
             .map_err(|error| PlanCacheRebuildError::RangeBuild(format!("{error:?}")))?;
             note_skipped(context, &result.skip_plan_cache_reason);

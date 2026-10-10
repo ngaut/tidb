@@ -5659,3 +5659,49 @@ fn the_heuristic_unique_point_path_serves_every_property() {
         );
     }
 }
+
+/// Go `RangerContext.RegardNULLAsPoint` (`TestRegardNULLAsPoint`): with
+/// `tidb_regard_null_as_point` off, `a <=> NULL` is not a point, so the
+/// range stops at `[NULL,NULL]` and `b = 1` stays a filter; on, the NULL
+/// point extends to the next column.
+#[test]
+fn regard_null_as_point_decides_whether_a_null_equality_extends_the_range() {
+    let mut session = Session::new();
+    session
+        .run("create table tuk (a int, b int, c int, unique key (a, b, c))")
+        .unwrap();
+    let range_of = |session: &mut Session| {
+        row_text(session.run("explain format='brief' select * from tuk where a <=> null and b = 1"))
+            .into_iter()
+            .find(|row| row[0].contains("IndexRangeScan"))
+            .map(|row| row[4].clone())
+            .unwrap()
+    };
+    session
+        .run("set @@session.tidb_regard_null_as_point = false")
+        .unwrap();
+    assert!(range_of(&mut session).starts_with("range:[NULL,NULL]"));
+    session
+        .run("set @@session.tidb_regard_null_as_point = true")
+        .unwrap();
+    assert!(range_of(&mut session).starts_with("range:[NULL 1,NULL 1]"));
+}
+
+/// Go `deriveStats4DataSource`'s `EliminateNoPrecisionLossCast`
+/// (`TestDowncastPointGetOrRangeScan`): a UNION widens the INT branch with
+/// `cast(a AS bigint)`, and the pushed `cast(t2.a) = 1` still reads t2 by
+/// its handle.
+#[test]
+fn a_lossless_cast_over_a_key_still_reads_it_by_point() {
+    let mut session = Session::new();
+    session.run("create table t1 (a bigint key)").unwrap();
+    session.run("create table t2 (a int key)").unwrap();
+    let plan = row_text(session.run(
+        "explain format='brief' select * from (select a from t1 union all select a from t2) x where a = 1",
+    ));
+    let point_gets = plan
+        .iter()
+        .filter(|row| row[0].contains("Point_Get"))
+        .count();
+    assert_eq!(point_gets, 2, "{plan:?}");
+}

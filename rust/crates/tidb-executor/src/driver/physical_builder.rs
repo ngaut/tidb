@@ -713,6 +713,7 @@ fn correlated_index_range_rebuilder(
                 &rebuild.index_column_lengths,
                 0,
                 &|expression| tidb_expr::eval_expression_once(expression, &ctx),
+                ctx.ranger_options(),
             )
             .map_err(|error| crate::executor::ExecError::internal(format!("{error:?}")))?;
         Ok(executor_ranges(&ranges))
@@ -747,6 +748,7 @@ fn correlated_table_range_rebuilder(
                     &rebuild.common_handle_lengths,
                     0,
                     &evaluate,
+                    ctx.ranger_options(),
                 )
                 .map_err(|error| crate::executor::ExecError::internal(format!("{error:?}")))?
                 .ranges
@@ -4161,6 +4163,7 @@ fn point_partition_id(
             &rebuild.common_handle_lengths,
             0,
             &|expr| expr.eval(ctx, tidb_chunk::row::Row::empty()),
+            ctx.ranger_options(),
         )
         .map_err(|error| DriverError::unsupported(format!("point partition range: {error:?}")))?;
         let [range] = result.ranges.as_slice() else {

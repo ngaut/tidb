@@ -39,20 +39,28 @@ fn check_column_can_use_index(
     mut conditions: Vec<Expression>,
 ) -> bool {
     let detach = |columns: &[Column], lengths: &[i64]| {
+        let options = crate::ranger::detacher::RangerOptions {
+            opt_prefix_index_single_scan: ctx.opt_prefix_index_single_scan,
+            ..ctx.estimator_options.ranger_options()
+        };
         if let Some(handler) = ctx.range_fallback_handler {
-            crate::ranger::detacher::detach_index_range_with_fallback_handler(
+            crate::ranger::detacher::detach_index_range_with_fallback_handler_in(
                 &conditions,
                 columns,
                 lengths,
                 ctx.range_max_size,
                 handler,
+                &crate::ranger::points::evaluate_static,
+                options,
             )
         } else {
-            crate::ranger::detacher::detach_cond_and_build_range_for_index(
+            crate::ranger::detacher::detach_cond_and_build_range_for_index_in(
                 &conditions,
                 columns,
                 lengths,
                 ctx.range_max_size,
+                &crate::ranger::points::evaluate_static,
+                options,
             )
         }
     };

@@ -385,7 +385,11 @@ impl DataSource {
     /// `tidb_shard(a) = tidb_shard(10)` and `a IN (10, 20)` becomes the
     /// OR of such pairs. A failed rewrite keeps the original conditions.
     #[must_use]
-    pub fn add_prefix4_shard_indexes(&self, conds: Vec<Expression>) -> Vec<Expression> {
+    pub fn add_prefix4_shard_indexes(
+        &self,
+        conds: Vec<Expression>,
+        regard_null_as_point: bool,
+    ) -> Vec<Expression> {
         if !self.contain_expr_prefix_uk {
             return conds;
         }
@@ -404,7 +408,7 @@ impl DataSource {
             {
                 continue;
             }
-            match self.add_expr_prefix_cond(index, new_conds) {
+            match self.add_expr_prefix_cond(index, new_conds, regard_null_as_point) {
                 Ok(rewritten) => new_conds = rewritten,
                 Err(_) => return conds,
             }
@@ -418,6 +422,7 @@ impl DataSource {
         &self,
         index: &crate::plan_builder::catalog::SourceIndex,
         conds: Vec<Expression>,
+        regard_null_as_point: bool,
     ) -> Result<Vec<Expression>, crate::ranger::points::PointBuilderError> {
         let idx_cols: Vec<Column> = self
             .declared_index_columns(index)
@@ -431,10 +436,18 @@ impl DataSource {
         // per DNF item, anything else as one CNF list.
         if let [Expression::ScalarFunction(function)] = conds.as_slice() {
             if function.func_name.lowercase() == "or" {
-                return Ok(add_expr_prefix4_dnf_cond(function, &idx_cols));
+                return Ok(add_expr_prefix4_dnf_cond(
+                    function,
+                    &idx_cols,
+                    regard_null_as_point,
+                ));
             }
         }
-        crate::ranger::detacher::add_expr4_eq_and_in_condition(&conds, &idx_cols)
+        crate::ranger::detacher::add_expr4_eq_and_in_condition(
+            &conds,
+            &idx_cols,
+            regard_null_as_point,
+        )
     }
 
     /// Go `deriveStatsByFilter(ds, conds, ds.AllPossibleAccessPaths)`'s
@@ -1008,6 +1021,7 @@ pub fn is_shard_column(column: &Column) -> bool {
 fn add_expr_prefix4_dnf_cond(
     condition: &tidb_expr::scalar_function::ScalarFunction,
     idx_cols: &[Column],
+    regard_null_as_point: bool,
 ) -> Vec<Expression> {
     let original = || vec![Expression::ScalarFunction(condition.clone())];
     let mut new_access_items = Vec::new();
@@ -1026,7 +1040,11 @@ fn add_expr_prefix4_dnf_cond(
                 continue;
             }
         };
-        match crate::ranger::detacher::add_expr4_eq_and_in_condition(&accesses, idx_cols) {
+        match crate::ranger::detacher::add_expr4_eq_and_in_condition(
+            &accesses,
+            idx_cols,
+            regard_null_as_point,
+        ) {
             Ok(accesses) => {
                 new_access_items.extend(tidb_expr::simple_expr::compose_cnf_condition(accesses));
             }

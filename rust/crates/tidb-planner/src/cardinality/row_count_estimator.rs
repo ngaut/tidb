@@ -150,9 +150,26 @@ pub struct EstimatorOptions {
     /// Go `RangerContext.OptPrefixIndexSingleScan`
     /// (`tidb_opt_prefix_index_single_scan`).
     pub opt_prefix_index_single_scan: bool,
+    /// Go `RangerContext.RegardNULLAsPoint` (`tidb_regard_null_as_point`).
+    pub regard_null_as_point: bool,
+    /// Go `RangerContext.OptimizerFixControl`: `fixcontrol.Fix44389`.
+    pub fix_44389: bool,
+    /// Go `RangerContext.OptimizerFixControl`: `fixcontrol.Fix54337`.
+    pub fix_54337: bool,
 }
 
 impl EstimatorOptions {
+    /// The statement's Go `RangerContext` switches.
+    #[must_use]
+    pub fn ranger_options(&self) -> crate::ranger::detacher::RangerOptions {
+        crate::ranger::detacher::RangerOptions {
+            regard_null_as_point: self.regard_null_as_point,
+            opt_prefix_index_single_scan: self.opt_prefix_index_single_scan,
+            fix_44389: self.fix_44389,
+            fix_54337: self.fix_54337,
+        }
+    }
+
     /// Go `SessionVars.EnableEvalTopNEstimationForStrMatch`.
     #[must_use]
     pub fn enable_eval_top_n_estimation_for_str_match(&self) -> bool {
@@ -197,6 +214,9 @@ impl Default for EstimatorOptions {
                 tidb_vardef::defaults::DEF_TIDB_DEFAULT_STR_MATCH_SELECTIVITY as f64,
             range_max_size: tidb_vardef::defaults::DEF_TIDB_OPT_RANGE_MAX_SIZE,
             opt_prefix_index_single_scan: tidb_vardef::defaults::DEF_TIDB_OPT_PREFIX_INDEX_SINGLE_SCAN,
+            regard_null_as_point: true,
+            fix_44389: false,
+            fix_54337: false,
         }
     }
 }

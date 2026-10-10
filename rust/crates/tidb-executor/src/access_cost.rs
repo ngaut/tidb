@@ -3750,6 +3750,7 @@ mod tests {
                 max_size: 1,
                 fallback_handler: None,
                 eval_ctx: None,
+                ranger_options: Default::default(),
             },
         );
         // Each column group falls back to 0.8; independent union is 0.96.

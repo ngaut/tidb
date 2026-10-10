@@ -78,6 +78,8 @@ pub(crate) struct RangeContext<'a> {
     /// go's detacher folds under `StmtCtx`, so its constant-materialization
     /// warnings reach the client; a dry context drops them.
     pub eval_ctx: Option<&'a dyn tidb_expr::Columns>,
+    /// Go `sctx.GetRangerCtx()`'s session switches.
+    pub ranger_options: tidb_planner::ranger::detacher::RangerOptions,
 }
 
 impl Default for RangeContext<'_> {
@@ -86,6 +88,7 @@ impl Default for RangeContext<'_> {
             max_size: 64 * 1024 * 1024,
             fallback_handler: None,
             eval_ctx: None,
+            ranger_options: tidb_planner::ranger::detacher::RangerOptions::default(),
         }
     }
 }
@@ -3065,6 +3068,7 @@ pub(crate) fn detach_conjuncts_and_build_range_for_index_with_context<'a>(
                 context.max_size,
                 handler,
                 &evaluate,
+                context.ranger_options,
             )
         }
         None => tidb_planner::ranger::detacher::detach_cond_and_build_range_for_index_in(
@@ -3073,6 +3077,7 @@ pub(crate) fn detach_conjuncts_and_build_range_for_index_with_context<'a>(
             &lengths,
             context.max_size,
             &evaluate,
+            context.ranger_options,
         ),
     }?;
     if detached.access_conds.is_empty() {
@@ -3285,6 +3290,7 @@ mod tests {
                         max_size: quota,
                         fallback_handler: None,
                         eval_ctx: None,
+                        ranger_options: Default::default(),
                     },
                     &index,
                 )
@@ -3326,6 +3332,7 @@ mod tests {
                     max_size: quota,
                     fallback_handler: None,
                     eval_ctx: None,
+                    ranger_options: Default::default(),
                 },
                 &index,
             )

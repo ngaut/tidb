@@ -161,6 +161,7 @@ fn retained_conditions_rebuild_current_ranges_without_rewriting() {
                 &lengths,
                 0,
                 &evaluate,
+                Default::default(),
             )
             .unwrap();
             assert_eq!(ranges_to_go_string(&result.ranges), expected);
@@ -188,7 +189,12 @@ fn retained_conditions_rebuild_current_ranges_without_rewriting() {
         );
         assert_eq!(column.ranges[0].high_val, vec![Datum::MaxValue]);
         let partition = super::detacher::detach_cond_and_build_range_for_partition_in(
-            conditions, &cols, &lengths, 0, &evaluate,
+            conditions,
+            &cols,
+            &lengths,
+            0,
+            &evaluate,
+            Default::default(),
         )
         .unwrap();
         assert_eq!(
@@ -196,7 +202,12 @@ fn retained_conditions_rebuild_current_ranges_without_rewriting() {
             format!("[[{value},+inf]]")
         );
         let (simple, _, _) = super::detacher::detach_simple_cond_and_build_range_for_index_in(
-            conditions, &cols, &lengths, 0, &evaluate,
+            conditions,
+            &cols,
+            &lengths,
+            0,
+            &evaluate,
+            Default::default(),
         )
         .unwrap();
         assert_eq!(ranges_to_go_string(&simple), format!("[[{value},+inf]]"));
@@ -213,6 +224,7 @@ fn retained_conditions_rebuild_current_ranges_without_rewriting() {
             &lengths,
             0,
             &evaluate,
+            Default::default(),
         )
         .unwrap();
         assert!(result.ranges.is_empty());
@@ -2070,8 +2082,9 @@ fn shard_index_func_suites_match_go() {
         ),
     ];
     for (input, want) in cases {
-        let rewritten = add_expr4_eq_and_in_condition(std::slice::from_ref(*input), &shard_cols)
-            .expect("rewrites");
+        let rewritten =
+            add_expr4_eq_and_in_condition(std::slice::from_ref(*input), &shard_cols, true)
+                .expect("rewrites");
         assert_eq!(&stringify_conds(&rewritten, &column_name), want);
     }
 }
