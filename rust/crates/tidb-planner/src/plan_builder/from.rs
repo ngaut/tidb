@@ -845,6 +845,8 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
         // Go's preprocessor runs `checkNonUniqTableAlias` over each query
         // block's join tree before the block is built.
         check_non_uniq_table_alias_in_join(join, self.oracle_mode)?;
+        // Go `buildTableRefs` enters `buildResultSetNode(ctx, from, false)`.
+        self.is_cte = false;
         let result = self.build_join(join);
         // Go resets this per query block. Multiple recursive SELECT blocks
         // may each reference the CTE once; a second reference in one block

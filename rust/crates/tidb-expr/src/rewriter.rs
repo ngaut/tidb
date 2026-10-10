@@ -1015,6 +1015,27 @@ fn binary_expression(
                         args,
                     ));
                     crate::builtin_compare::refine_comparison_dyn(&mut expression, ctx)?;
+                    // Go `NewFunction` folds the comparison it built: an
+                    // always-false refinement (`refineArgs` returning `0, 1`
+                    // for `int_not_null = 0.12`) becomes the constant 0. This
+                    // tier settles a string comparison's collation after
+                    // construction, so only a comparison of two plain INT
+                    // constants -- which no collation can change -- folds
+                    // here.
+                    let integer_constants = matches!(
+                        &expression,
+                        Expression::ScalarFunction(function)
+                            if function.args.iter().all(|argument| matches!(
+                                argument,
+                                Expression::Constant(constant)
+                                    if constant.param_marker.is_none()
+                                        && constant.deferred_expr.is_none()
+                                        && matches!(constant.value, tidb_datatype::Datum::Int(_))
+                            ))
+                    );
+                    if integer_constants {
+                        resolver.fold_constant(&mut expression, ConstantFoldMode::Normal);
+                    }
                     return Ok(expression);
                 } else {
                     crate::builtin_compare::refine_integer_comparison_for_rewrite(name, &mut args);

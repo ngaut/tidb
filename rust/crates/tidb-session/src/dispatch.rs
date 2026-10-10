@@ -2366,6 +2366,17 @@ impl Session {
         // three consumers below share this one walk instead of each cloning
         // and re-walking the statement.
         let scan = crate::binding::scan_statement_tables(&mut stmt);
+        // Go `preprocessor.Enter`'s `*ast.ColumnName` arm: the commit-TS
+        // pseudo column is not yet usable by SELECT, UPDATE or DELETE.
+        if scan.names_commit_ts {
+            return Err(DriverError::Mysql(tidb_executor::MysqlError::new(
+                1815,
+                format!(
+                    "Usage of column name '{}' is not supported for now",
+                    tidb_planner::plan_builder::EXTRA_COMMIT_TS_NAME
+                ),
+            )));
+        }
         self.validate_snapshot_statement(&stmt)?;
         if self.vars.snapshot_ts() != 0
             && self.in_transaction()

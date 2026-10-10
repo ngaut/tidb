@@ -76,6 +76,7 @@ pub(crate) struct StatementVarSnapshot {
     tiflash_pre_agg_mode: String,
     partial_ordered_index_for_topn: bool,
     enable_unsafe_substitute: bool,
+    enable_force_inline_cte: bool,
     enable_semi_join_rewrite: bool,
     allow_in_subq_to_join_and_agg: bool,
     enable_no_decorrelate_in_select: bool,
@@ -921,6 +922,7 @@ impl Session {
                 .get_system(tidb_vardef::tidb_vars::TIDB_OPT_PARTIAL_ORDERED_INDEX_FOR_TOP_N)
                 .is_ok_and(|value| value.eq_ignore_ascii_case("COST")),
             enable_unsafe_substitute: on(tidb_vardef::tidb_vars::TIDB_ENABLE_UNSAFE_SUBSTITUTE),
+            enable_force_inline_cte: on(tidb_vardef::tidb_vars::TIDB_OPT_FORCE_INLINE_CTE),
             enable_semi_join_rewrite: on(tidb_vardef::tidb_vars::TIDB_OPT_ENABLE_SEMI_JOIN_REWRITE),
             allow_in_subq_to_join_and_agg: on(
                 tidb_vardef::tidb_vars::TIDB_OPT_IN_SUBQ_TO_JOIN_AND_AGG,
@@ -1172,6 +1174,7 @@ impl Session {
         let tiflash_pre_agg_mode = snapshot.tiflash_pre_agg_mode.clone();
         let partial_ordered_index_for_topn = snapshot.partial_ordered_index_for_topn;
         let enable_unsafe_substitute = snapshot.enable_unsafe_substitute;
+        let enable_force_inline_cte = snapshot.enable_force_inline_cte;
         let enable_semi_join_rewrite = snapshot.enable_semi_join_rewrite;
         let allow_in_subq_to_join_and_agg =
             if self.stmt_hints.has_allow_in_subq_to_join_and_agg_hint {
@@ -1436,6 +1439,7 @@ impl Session {
                     .with_opt_prefix_index_single_scan(opt_prefix_index_single_scan)
                     .with_always_keep_join_key(always_keep_join_key)
                     .with_enable_unsafe_substitute(enable_unsafe_substitute)
+                    .with_enable_force_inline_cte(enable_force_inline_cte)
                     .with_enable_semi_join_rewrite(enable_semi_join_rewrite)
                     .with_allow_in_subq_to_join_and_agg(allow_in_subq_to_join_and_agg)
                     .with_enable_no_decorrelate_in_select(enable_no_decorrelate_in_select)
@@ -1556,6 +1560,7 @@ impl Session {
                 .with_opt_prefix_index_single_scan(opt_prefix_index_single_scan)
                 .with_always_keep_join_key(always_keep_join_key)
                 .with_enable_unsafe_substitute(enable_unsafe_substitute)
+                .with_enable_force_inline_cte(enable_force_inline_cte)
                 .with_enable_semi_join_rewrite(enable_semi_join_rewrite)
                 .with_allow_in_subq_to_join_and_agg(allow_in_subq_to_join_and_agg)
                 .with_enable_no_decorrelate_in_select(enable_no_decorrelate_in_select)

@@ -5705,3 +5705,76 @@ fn a_lossless_cast_over_a_key_still_reads_it_by_point() {
         .count();
     assert_eq!(point_gets, 2, "{plan:?}");
 }
+
+/// Go `NewFunction` folds the comparison it builds: `refineArgs` turns an
+/// INT NOT NULL column compared with a fractional constant into the
+/// always-false `0 = 1`, which folds to 0, so an IN of only such members is
+/// a TableDual and mixed members keep just the real one.
+#[test]
+fn an_always_false_refined_comparison_folds_away() {
+    let mut session = Session::new();
+    session
+        .run("create table t (a int not null, b int)")
+        .unwrap();
+    let plan =
+        row_text(session.run("explain format='brief' select * from t where a in (0.12, 3.47)"));
+    assert!(plan[0][0].starts_with("TableDual"), "{plan:?}");
+    let plan =
+        row_text(session.run("explain format='brief' select * from t where a in (15, 0.12, 3.47)"));
+    assert!(
+        plan.iter().any(|row| row[4] == "eq(test.t.a, 15)"),
+        "{plan:?}"
+    );
+}
+
+/// Go preprocessor (`*ast.ColumnName`): SELECT, UPDATE and DELETE may not
+/// name `_tidb_commit_ts` yet (1815); INSERT reaches name resolution.
+#[test]
+fn the_commit_ts_pseudo_column_is_refused_by_name() {
+    let mut session = Session::new();
+    session
+        .run("create table t_commit_ts (a int primary key, b int)")
+        .unwrap();
+    for sql in [
+        "select _tidb_commit_ts from t_commit_ts where a = 1",
+        "delete from t_commit_ts where _tidb_commit_ts = 1",
+        "update t_commit_ts set b = b + 1 where _tidb_commit_ts = 1",
+    ] {
+        let error = session.run(sql).unwrap_err().to_mysql_error();
+        assert_eq!(error.code, 1815, "{sql}");
+        assert_eq!(
+            error.message,
+            "Usage of column name '_tidb_commit_ts' is not supported for now"
+        );
+    }
+}
+
+/// Go `tidb_opt_force_inline_cte` and `MERGE()`: a forced CTE inlines at
+/// every reference under its own alias, and `MERGE()` on a derived table in
+/// a CTE body is inapplicable -- `buildResultSetNode(..., false)` clears
+/// `isCTE` for every FROM node.
+#[test]
+fn force_inlined_ctes_keep_their_aliases_and_merge_warns_off_the_cte_body() {
+    let mut session = Session::new();
+    session.run("create table t (a int)").unwrap();
+    session.run("set tidb_opt_force_inline_cte = 1").unwrap();
+    let plan = row_text(session.run(
+        "explain format='brief' with cte as (select * from t) select * from cte cte1, cte cte2",
+    ));
+    assert!(plan.iter().all(|row| !row[0].contains("CTE")), "{plan:?}");
+    session.run("set tidb_opt_force_inline_cte = 0").unwrap();
+    session.run("create table t2 (b int)").unwrap();
+    session
+        .run(
+            "explain format='brief' with cte1 as (select * from t, \
+             (select /*+ MERGE() */ * from t2) ttt) select * from cte1",
+        )
+        .unwrap();
+    let warnings = row_text(session.run("show warnings"));
+    assert!(
+        warnings
+            .iter()
+            .any(|row| row[1] == "1815" && row[2].starts_with("Hint merge() is inapplicable")),
+        "{warnings:?}"
+    );
+}

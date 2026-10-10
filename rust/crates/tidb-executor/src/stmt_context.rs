@@ -980,6 +980,8 @@ pub struct StmtContextData {
     always_keep_join_key: bool,
     /// Go `SessionVars.EnableUnsafeSubstitute`.
     enable_unsafe_substitute: bool,
+    /// Go `SessionVars.EnableForceInlineCTE` (`tidb_opt_force_inline_cte`).
+    enable_force_inline_cte: bool,
     /// Go `SessionVars.EnableSemiJoinRewrite`.
     enable_semi_join_rewrite: bool,
     /// Go `SessionVars.GetAllowInSubqToJoinAndAgg()`.
@@ -1244,6 +1246,13 @@ context_configuration! {
     #[must_use]
     pub fn with_enable_unsafe_substitute(mut self, enable: bool) -> Self {
         self.enable_unsafe_substitute = enable;
+        self
+    }
+
+    /// Sets `@@tidb_opt_force_inline_cte` for this statement.
+    #[must_use]
+    pub fn with_enable_force_inline_cte(mut self, enable: bool) -> Self {
+        self.enable_force_inline_cte = enable;
         self
     }
 
@@ -2260,6 +2269,7 @@ impl StmtContext {
             opt_prefix_index_single_scan: true,
             always_keep_join_key: tidb_vardef::defaults::DEF_OPT_ALWAYS_KEEP_JOIN_KEY,
             enable_unsafe_substitute: false,
+            enable_force_inline_cte: false,
             enable_semi_join_rewrite: tidb_vardef::defaults::DEF_OPT_ENABLE_SEMI_JOIN_REWRITE,
             allow_in_subq_to_join_and_agg: true,
             enable_no_decorrelate_in_select:
@@ -2749,6 +2759,11 @@ impl StmtContext {
     /// Returns `@@tidb_enable_unsafe_substitute`.
     pub fn enable_unsafe_substitute(&self) -> bool {
         self.enable_unsafe_substitute
+    }
+
+    /// Returns `@@tidb_opt_force_inline_cte`.
+    pub fn enable_force_inline_cte(&self) -> bool {
+        self.enable_force_inline_cte
     }
 
     /// Returns `@@tidb_opt_enable_semi_join_rewrite`.

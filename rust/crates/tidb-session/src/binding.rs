@@ -149,6 +149,9 @@ pub(crate) struct StatementTableScan {
     pub(crate) names: Vec<(String, String)>,
     /// Whether any table ref carries `AS OF TIMESTAMP`.
     pub(crate) has_as_of: bool,
+    /// Go preprocessor's `ast.ColumnName` check: `_tidb_commit_ts` was named
+    /// while the statement type was SELECT, UPDATE or DELETE.
+    pub(crate) names_commit_ts: bool,
 }
 
 /// Collects [`StatementTableScan`] in one in-place walk, no clone.
@@ -156,9 +159,35 @@ pub(crate) fn scan_statement_tables(stmt: &mut Stmt) -> StatementTableScan {
     struct Scanner {
         names: Vec<(String, String)>,
         has_as_of: bool,
+        // Go `preprocessor.stmtTp`: set on entering each SELECT, UPDATE,
+        // DELETE or INSERT node and never restored on leave.
+        in_select_update_or_delete: bool,
+        names_commit_ts: bool,
+    }
+    fn is_commit_ts(path: &[String]) -> bool {
+        path.last().is_some_and(|name| {
+            name.eq_ignore_ascii_case(tidb_planner::plan_builder::EXTRA_COMMIT_TS_NAME)
+        })
     }
     impl Visitor for Scanner {
         fn enter(&mut self, node: &mut dyn Any) -> bool {
+            if node.is::<tidb_ast::SelectStmt>()
+                || node.is::<tidb_ast::UpdateStmt>()
+                || node.is::<tidb_ast::DeleteStmt>()
+            {
+                self.in_select_update_or_delete = true;
+            } else if node.is::<tidb_ast::InsertStmt>() {
+                self.in_select_update_or_delete = false;
+            }
+            if self.in_select_update_or_delete {
+                let names_commit_ts = match node.downcast_ref::<tidb_ast::Expr>() {
+                    Some(tidb_ast::Expr::Column(path)) => is_commit_ts(path),
+                    _ => node
+                        .downcast_ref::<tidb_ast::Assignment>()
+                        .is_some_and(|assignment| is_commit_ts(&assignment.col)),
+                };
+                self.names_commit_ts |= names_commit_ts;
+            }
             if let Some(table_ref) = node.downcast_mut::<tidb_ast::TableRef>() {
                 if table_ref.as_of.is_some() {
                     self.has_as_of = true;
@@ -180,11 +209,14 @@ pub(crate) fn scan_statement_tables(stmt: &mut Stmt) -> StatementTableScan {
     let mut scanner = Scanner {
         names: Vec::new(),
         has_as_of: false,
+        in_select_update_or_delete: false,
+        names_commit_ts: false,
     };
     stmt.accept(&mut scanner);
     StatementTableScan {
         names: scanner.names,
         has_as_of: scanner.has_as_of,
+        names_commit_ts: scanner.names_commit_ts,
     }
 }
 

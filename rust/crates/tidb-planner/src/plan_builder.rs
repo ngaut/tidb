@@ -3062,6 +3062,10 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
     ///
     /// Any error from the arm that applies, or an unported `FROM` shape.
     pub fn build_result_set_node(&mut self, node: &JoinNode) -> Result<LogicalPlan, PlanError> {
+        // Go `b.isCTE = isCTE` with `isCTE = false`: every FROM-clause node is
+        // outside the CTE body proper, so a derived table's `MERGE()` there is
+        // inapplicable.
+        self.is_cte = false;
         match node {
             JoinNode::Table(table_ref) => self.build_data_source(table_ref),
             // Both the single-table wrapper (`Join{Right: nil}`) and a real

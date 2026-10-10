@@ -974,7 +974,19 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
                 let result = self.build_data_source_from_cte_merge(&saved[0]);
                 self.building_cte = saved_building;
                 self.outer_ctes.extend(saved);
-                return result.map(Some);
+                // Go `buildResultSetNode`'s `*ast.TableSource` arm renames
+                // every visible output name to the reference's alias, so two
+                // inlined references `cte cte1, cte cte2` stay distinct.
+                return result.map(|mut plan| {
+                    if let Some(alias) = as_name.filter(|alias| !alias.is_empty()) {
+                        let mut names = plan.output_names().to_vec();
+                        for name in names.iter_mut().filter(|name| !name.hidden) {
+                            name.names.table = IdentifierMetadata::new(alias);
+                        }
+                        set_own_output_names(&mut plan, names);
+                    }
+                    Some(plan)
+                });
             }
 
             return self.build_logical_cte_reference(index, as_name).map(Some);
