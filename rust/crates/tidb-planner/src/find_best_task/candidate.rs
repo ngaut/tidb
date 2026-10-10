@@ -144,9 +144,10 @@ pub(crate) fn index_candidate_metrics(
         ) {
             match expression {
                 Expression::Column(column) => {
+                    // Go `extractCol2LenFromExpr`: `EqualByExprAndID`.
                     if let Some((_, length)) = columns
                         .clone()
-                        .find(|(key, _)| key.unique_id == column.unique_id)
+                        .find(|(key, _)| column.equal_by_expr_and_id_column(key))
                     {
                         result.insert(column.unique_id, *length);
                     }

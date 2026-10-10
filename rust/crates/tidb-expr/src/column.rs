@@ -119,6 +119,14 @@ impl Column {
         let Expression::Column(other) = expr else {
             return false;
         };
+        self.equal_by_expr_and_id_column(other)
+    }
+
+    /// [`Self::equal_by_expr_and_id`] against a column: two expression
+    /// indexes on the same expression own different hidden columns, and this
+    /// treats them as one.
+    #[must_use]
+    pub fn equal_by_expr_and_id_column(&self, other: &Column) -> bool {
         other.unique_id == self.unique_id || self.same_virtual_expression(other)
     }
 

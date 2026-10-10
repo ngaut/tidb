@@ -460,8 +460,22 @@ impl DataSource {
                 }
                 crate::access_path::PossiblePath::Index { index: position } => {
                     if let Some(index) = self.indexes.get(*position) {
+                        // The path's `IdxCols`: the schema columns behind the
+                        // collection's ids, a prefix up to the first absent one.
+                        let schema = self.base.base.schema();
                         let columns = hist_coll
-                            .map(|coll| coll.index_columns(index.id).to_vec())
+                            .map(|coll| {
+                                coll.index_columns(index.id)
+                                    .iter()
+                                    .map_while(|id| {
+                                        schema?
+                                            .columns
+                                            .iter()
+                                            .find(|column| column.unique_id == *id)
+                                            .cloned()
+                                    })
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         paths.insert(index.id, columns);
                     }
@@ -1187,8 +1201,16 @@ fn index_covers_column(
             || length == tidb_datatype::UNSPECIFIED_LENGTH
             || field_type.is_some_and(|field_type| length == field_type.flen())
     };
+    // Go `isIndexColsCoveringCol` matches by `EqualByExprAndID`: another
+    // expression index's hidden column with the same expression is covered
+    // too.
     if source_index.columns.iter().any(|index_column| {
-        full_length(index_column.length) && index_column.name.eq_ignore_ascii_case(&column.name)
+        full_length(index_column.length)
+            && (index_column.name.eq_ignore_ascii_case(&column.name)
+                || schema_column.is_some_and(|schema_column| {
+                    ds.schema_column_for_index_column(index_column)
+                        .is_some_and(|indexed| schema_column.equal_by_expr_and_id_column(indexed))
+                }))
     }) {
         return true;
     }

@@ -27,9 +27,11 @@ use super::{LogicalPlan, PlanError};
 /// Go `GcSubstituter`.
 pub struct GcSubstituter;
 
-type Candidate = (Expression, Column);
+pub(crate) type Candidate = (Expression, Column);
 
-fn collect_candidates(
+/// Go `collectGenerateColumn`: every indexed virtual generated column under
+/// `plan` (CTEs and TiFlash-preferring sources excepted) with its expression.
+pub(crate) fn collect_candidates(
     plan: &LogicalPlan,
     candidates: &mut Vec<Candidate>,
     enable_unsafe_substitute: bool,

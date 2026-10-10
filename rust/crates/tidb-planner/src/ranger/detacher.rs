@@ -342,8 +342,10 @@ fn get_potential_eq_or_in_col_offset_in(
             {
                 return -1;
             }
+            // Go: a generated expression column is compared by its virtual
+            // expression (`EqualByExprAndID`).
             for (i, col) in cols.iter().enumerate() {
-                if col.equal_column(&Expression::Column(column.clone())) {
+                if col.equal_by_expr_and_id_column(column) {
                     return i as i64;
                 }
             }

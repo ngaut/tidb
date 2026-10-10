@@ -1370,3 +1370,82 @@ fn a_shard_unique_key_gains_its_tidb_shard_prefix() {
         vec![vec!["1"], vec!["3"], vec!["5"]]
     );
 }
+
+/// Go `EqualByExprAndID`: two expression indexes on `a+1` own different
+/// hidden columns, and the ranger, the covering check and selectivity treat
+/// them as one (issue 25729), so `(a+1, b)` is chosen and covers `b` whichever
+/// hidden column the substitution picked.
+#[test]
+fn expression_indexes_on_one_expression_share_their_hidden_columns() {
+    let mut s = Session::new();
+    s.run("CREATE TABLE tt (a INT, b INT, KEY k((a+1)), KEY k1((a+1), b), KEY k2((a+1), b), KEY k3((a+1)))")
+        .unwrap();
+    let plan = |s: &mut Session, sql: &str| {
+        rows(s, &format!("EXPLAIN FORMAT='brief' {sql}"))
+            .into_iter()
+            .map(|row| row.join(" | "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let star = plan(&mut s, "SELECT * FROM tt WHERE a+1 = 5 AND b = 3");
+    assert!(
+        star.contains("index:k1(`a` + 1, b) | range:[5 3,5 3]"),
+        "{star}"
+    );
+    let covered = plan(&mut s, "SELECT b FROM tt WHERE a+1 = 5 AND b = 3");
+    assert!(
+        covered.starts_with("IndexReader") && !covered.contains("TableRowIDScan"),
+        "{covered}"
+    );
+    s.run("INSERT INTO tt VALUES (4, 3)").unwrap();
+    assert_eq!(
+        rows(&mut s, "SELECT * FROM tt WHERE a+1 = 5 AND b = 3"),
+        vec![vec!["4", "3"]]
+    );
+}
+
+/// Go `buildProjection(..., expandGenerateColumn)`: with an ORDER BY, the
+/// projection carries each indexed virtual column, so `ORDER BY a+1` is
+/// substituted by `c` and `idx_c` supplies the order.
+#[test]
+fn order_by_an_indexed_generated_expression_reads_the_index_in_order() {
+    let mut s = Session::new();
+    s.run("CREATE TABLE t (a INT, b REAL, c BIGINT AS ((a+1)) VIRTUAL, KEY idx_c(c))")
+        .unwrap();
+    let plan = rows(
+        &mut s,
+        "EXPLAIN FORMAT='brief' SELECT a+1 FROM t ORDER BY a+1",
+    )
+    .into_iter()
+    .map(|row| row.join(" | "))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        plan.contains("index:idx_c(c) | keep order:true") && !plan.contains("Sort"),
+        "{plan}"
+    );
+    s.run("INSERT INTO t (a, b) VALUES (3, 1), (1, 2), (2, 3)")
+        .unwrap();
+    assert_eq!(
+        rows(&mut s, "SELECT a+1 FROM t ORDER BY a+1"),
+        vec![vec!["2"], vec!["3"], vec!["4"]]
+    );
+}
+
+/// Go `positionToScalarFunc` (issue 26214): the expression index's hidden
+/// column that `expandGenerateColumn` projects for an ORDER BY is not a
+/// position the statement can name.
+#[test]
+fn an_order_by_position_never_names_a_hidden_column() {
+    let mut s = Session::new();
+    s.run("CREATE TABLE t (a INT, b INT, c INT, KEY expression_index ((CASE WHEN a < 0 THEN 1 ELSE 2 END)))")
+        .unwrap();
+    assert_eq!(
+        code(
+            &mut s,
+            "SELECT * FROM t WHERE CASE WHEN a < 0 THEN 1 ELSE 2 END <= 1 ORDER BY 4"
+        ),
+        Some(1054)
+    );
+    assert_eq!(code(&mut s, "SELECT * FROM t ORDER BY 3"), None);
+}

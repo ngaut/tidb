@@ -285,7 +285,7 @@ impl ConditionChecker<'_> {
     /// Go `matchColumn` (`EqualByExprAndID`).
     fn match_column(&self, expr: &Expression) -> bool {
         self.checker_col
-            .is_some_and(|column| column.equal_column(expr))
+            .is_some_and(|column| column.equal_by_expr_and_id(expr))
     }
 
     /// Go `checkColumn`.

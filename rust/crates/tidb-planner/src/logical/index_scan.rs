@@ -235,6 +235,6 @@ pub fn matches_indices_prop(
         col_lens.get(i).copied() == Some(UNSPECIFIED_LENGTH)
             && idx_cols
                 .get(i)
-                .is_some_and(|col| col.unique_id == item.col.unique_id)
+                .is_some_and(|col| item.col.equal_by_expr_and_id_column(col))
     })
 }

@@ -719,6 +719,9 @@ pub struct PlanBuilder<'a, S: TableSource, C: Columns> {
     /// rewriter's narrowing of `SessionVars` and nothing in it reads the SQL
     /// mode. Go likewise reads the mode off `SQLMode`, not off the rewriter.
     pub only_full_group_by: bool,
+    /// Go `SessionVars.EnableUnsafeSubstitute`, read by `collectGenerateColumn`
+    /// when `buildProjection` expands the generated columns.
+    pub enable_unsafe_substitute: bool,
     /// Whether the session `sql_mode` carries `ORACLE`, under which Go's
     /// preprocessor skips `checkNonUniqTableAlias`.
     pub oracle_mode: bool,
@@ -1424,6 +1427,7 @@ impl<'a, S: TableSource, C: Columns> PlanBuilder<'a, S, C> {
             no_index_lookup_push_down_hints: Vec::new(),
             // Go's default `sql_mode` carries `ONLY_FULL_GROUP_BY`.
             only_full_group_by: true,
+            enable_unsafe_substitute: false,
             oracle_mode: false,
             ignore_truncate_err_for_view_predicate_folding: false,
             new_only_full_group_by_check: false,
@@ -3643,11 +3647,11 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
     /// (`logical_plan_builder.go:1767`), returning the projection and the
     /// expressions Go's second result carries.
     ///
-    /// Narrowed from Go's six-argument form: `considerWindow` and
-    /// `expandGenerateColumn` gate batch 6e and the generated-column
-    /// substitution respectively. Go's third result `oldLen` is the caller's
-    /// here, because it is the caller ([`Self::resolve_order_by`]) that
-    /// appends the hidden fields past it.
+    /// Go's `considerWindow` form is [`Self::build_projection_consider_window`]
+    /// and its `expandGenerateColumn` form is the main SELECT's call of
+    /// [`Self::build_projection_with_order_by`]. Go's third result `oldLen` is
+    /// the caller's here, because it is the caller ([`Self::resolve_order_by`])
+    /// that appends the hidden fields past it.
     ///
     /// # Errors
     ///
@@ -3658,7 +3662,7 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
         fields: &[ProjectionField],
         markers: &BTreeMap<MarkerKind, Vec<Column>>,
     ) -> Result<(LogicalPlan, Vec<Expression>), PlanError> {
-        self.build_projection_with_order_by(plan, fields, markers, None)
+        self.build_projection_with_order_by(plan, fields, markers, None, false)
     }
 
     /// [`Self::build_projection`] with the `[from, to)` slice of fields
@@ -3666,12 +3670,16 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
     /// dedicated `orderByResolver` (`curClause = orderByClause`), so an
     /// unknown name there is reported `in 'order clause'` rather than
     /// `in 'field list'`.
+    ///
+    /// `expand_generate_column` is Go's flag of that name, set when the
+    /// SELECT has an ORDER BY.
     fn build_projection_with_order_by(
         &mut self,
         plan: LogicalPlan,
         fields: &[ProjectionField],
         markers: &BTreeMap<MarkerKind, Vec<Column>>,
         order_by_range: Option<(usize, usize)>,
+        expand_generate_column: bool,
     ) -> Result<(LogicalPlan, Vec<Expression>), PlanError> {
         self.opt_flag |= flags::ELIMINATE_PROJECTION;
         let mut plan = plan;
@@ -3755,6 +3763,35 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
             &mut projection_names,
             &mut exprs,
         );
+        if expand_generate_column {
+            // Go `buildProjection` (`:1843`): "add c into the projection so
+            // that we can replace a+1 with c" -- each indexed virtual
+            // generated column the child produces, as its own expression, so
+            // `GcSubstituter` can substitute an ORDER BY expression above.
+            let mut candidates = Vec::new();
+            crate::logical::rule_generate_column_substitute::collect_candidates(
+                &plan,
+                &mut candidates,
+                self.enable_unsafe_substitute,
+            );
+            let (child_schema, child_names) = snapshot_schema_and_names(&plan);
+            for (expr, column) in candidates {
+                let Ok(child_index) = usize::try_from(child_schema.column_index(&column)) else {
+                    continue;
+                };
+                if projection_columns
+                    .iter()
+                    .any(|projected| projected.unique_id == column.unique_id)
+                {
+                    continue;
+                }
+                let mut output = column;
+                output.index = projection_columns.len() as i64;
+                projection_columns.push(output);
+                projection_names.push(child_names[child_index].clone());
+                exprs.push(expr);
+            }
+        }
         let mut projection =
             LogicalProjection::new(self.base(LogicalProjection::TYPE), exprs.clone());
         projection.fd_expression_ids_registered = self.new_only_full_group_by_check;
@@ -3928,9 +3965,15 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
             let scratch = Self::clause_scratch(&item.expr);
             let mut built = match Self::order_by_position(&scratch) {
                 Some(position) => {
+                    // Go `positionToScalarFunc`: a position naming a hidden
+                    // column -- an expression index's, which
+                    // `expandGenerateColumn` may have projected -- is unknown.
+                    // (This tier also marks auxiliary fields hidden; Go does
+                    // not, and they stay addressable.)
                     let column = position
                         .checked_sub(1)
                         .and_then(|index| schema.columns.get(index))
+                        .filter(|column| !(column.is_hidden && column.virtual_expr.is_some()))
                         .ok_or_else(|| {
                             PlanError::unknown_column_in_clause(
                                 position.to_string(),
@@ -4708,6 +4751,7 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
             &fields,
             &markers,
             Some((order_by_from, order_by_to)),
+            !select.order_by.is_empty(),
         )?;
         plan = projected;
 

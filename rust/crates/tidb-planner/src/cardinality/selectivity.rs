@@ -60,7 +60,7 @@ pub struct SelectivityContext<'a> {
 /// access path that carries an index, with the unique IDs of that path's
 /// `IdxCols` when the estimate runs. A common-handle table path carries its
 /// PRIMARY index with no columns until `deriveCommonHandleTablePathStats`.
-pub type FilledPaths = std::collections::BTreeMap<i64, Vec<i64>>;
+pub type FilledPaths = std::collections::BTreeMap<i64, Vec<Column>>;
 
 impl<'a> SelectivityContext<'a> {
     /// A context with no range-fallback recorder and plan caching off.
@@ -189,10 +189,10 @@ pub fn selectivity(
         }
         // Go `findPrefixOfIndexByCol`: a possible path decides by its own
         // `IdxCols`; an index without one by `Idx2ColUniqueIDs`.
-        let index_column_ids = filled_paths
-            .and_then(|paths| paths.get(&index_id))
-            .map_or_else(|| coll.index_columns(index_id), Vec::as_slice);
-        let index_columns = find_prefix_of_index(&extracted, index_column_ids);
+        let index_columns = match filled_paths.and_then(|paths| paths.get(&index_id)) {
+            Some(path_columns) => find_prefix_of_index_by_col(&extracted, path_columns),
+            None => find_prefix_of_index(&extracted, coll.index_columns(index_id)),
+        };
         if index_columns.is_empty() {
             continue;
         }
@@ -559,6 +559,23 @@ fn covered_mask(exprs: &[Expression], access: &[Expression]) -> i64 {
 
 /// Go `findPrefixOfIndex`: the index's leading columns that appear among
 /// `columns`, stopping at the first one that does not.
+/// Go `findPrefixOfIndexByCol` with a cached path: the extracted columns
+/// matching the path's `IdxCols` in order, by UniqueID or by virtual
+/// expression, stopping at the first index column none matches.
+fn find_prefix_of_index_by_col(columns: &[Column], index_columns: &[Column]) -> Vec<Column> {
+    let mut prefix = Vec::with_capacity(index_columns.len());
+    for index_column in index_columns {
+        match columns
+            .iter()
+            .find(|column| column.equal_by_expr_and_id_column(index_column))
+        {
+            Some(column) => prefix.push(column.clone()),
+            None => break,
+        }
+    }
+    prefix
+}
+
 fn find_prefix_of_index(columns: &[Column], index_column_ids: &[i64]) -> Vec<Column> {
     let mut prefix = Vec::with_capacity(index_column_ids.len());
     for id in index_column_ids {
