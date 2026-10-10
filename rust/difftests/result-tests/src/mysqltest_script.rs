@@ -260,7 +260,11 @@ pub fn parse_test(text: &str) -> Result<Vec<Item>, String> {
             // drops it. An `--echo` argument keeps its own text intact.
             let name = name.trim_end_matches(';');
             match name {
-                "error" => expect_error = true,
+                // mysql-tester's `--error 0,1265` lists 0, "no error", among
+                // the accepted codes: the statement may succeed, and then the
+                // recording holds its rows. Only the recorded `Error ...` line
+                // says which happened.
+                "error" => expect_error = !rest.split(',').any(|code| code.trim() == "0"),
                 "sorted_result" => sorted = true,
                 "enable_warnings" => warnings = true,
                 "disable_warnings" => warnings = false,

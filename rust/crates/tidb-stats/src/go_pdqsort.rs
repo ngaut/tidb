@@ -28,7 +28,10 @@
 
 use std::cmp::Ordering;
 
-pub(crate) fn go_sort_func_by<T>(data: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
+/// Go's unstable pdqsort: `slices.SortFunc(data, compare)`, and equally
+/// `sort.Sort` over a `Less` of `compare(a, b) < 0` -- both are generated
+/// from the same template, so equal elements end in the same positions.
+pub fn go_sort_func_by<T>(data: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
     let limit = usize::BITS as usize - data.len().leading_zeros() as usize;
     pdqsort(data, 0, data.len(), limit, &mut compare);
 }

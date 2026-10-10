@@ -2838,7 +2838,7 @@ impl ScalarFunction {
                 "instr" if self.args.len() == 2 => {
                     let a = self.args[0].eval(ctx, row)?;
                     let b = self.args[1].eval(ctx, row)?;
-                    return crate::string_fn::locate(&b, &a, collation);
+                    return crate::string_fn::instr(&a, &b, collation);
                 }
                 "strcmp" if self.args.len() == 2 => {
                     let vals = [self.args[0].eval(ctx, row)?, self.args[1].eval(ctx, row)?];

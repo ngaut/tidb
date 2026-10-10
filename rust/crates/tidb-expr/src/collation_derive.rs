@@ -390,12 +390,6 @@ pub fn infer_collation(exprs: &[Expression]) -> Option<ExprCollation> {
 }
 
 /// Go `CheckAndDeriveCollationFromExprs`.
-///
-/// `safeConvert`'s encoding-validity check is DEFERRED (documented): it only
-/// rejects when the aggregated charset cannot represent an argument's bytes,
-/// and every charset this tier's columns can hold is `utf8mb4` or `binary`,
-/// where Go's `FindEncodingTakeUTF8AsNoop` is a no-op and the check always
-/// passes. It becomes reachable when a `gbk`/`latin1` column can hold a value.
 pub fn check_and_derive_collation_from_exprs(
     func_name: &str,
     eval_type: EvalType,
@@ -428,7 +422,82 @@ fn check_and_derive_collation_from_exprs_with_connection(
         ec.coer = Coercibility::COERCIBLE;
         ec.repe = Repertoire::ASCII;
     }
-    Ok(ec)
+    if !safe_convert(&ec, args) {
+        return Err(illegal_mix_collation_err(func_name, args));
+    }
+    Ok(fix_string_type_for_max_length(func_name, args, ec))
+}
+
+/// Go `safeConvert`: every argument outside the derived charset must be
+/// representable in it. A constant is checked by its value (`'ㅂ'` has no
+/// GBK form, so `CONCAT('ㅂ', x COLLATE gbk_bin)` is an illegal mix); any
+/// other non-ASCII, non-binary argument only converts into a Unicode or
+/// binary charset.
+fn safe_convert(ec: &ExprCollation, args: &[Expression]) -> bool {
+    let encoding = tidb_datatype::find_encoding_take_utf8_as_noop(&ec.charset);
+    for arg in args {
+        let field_type = ret_type_of(arg);
+        if field_type.charset_name() == ec.charset {
+            continue;
+        }
+        let is_binary_str = field_type.collation_name() == COLLATION_BIN
+            && matches!(field_type.eval_type(), EvalType::String)
+            && !field_type.is_hybrid();
+        if repertoire_of(arg) == Repertoire::ASCII || is_binary_str {
+            continue;
+        }
+        if let Expression::Constant(constant) = arg {
+            match constant.literal_value() {
+                Some(value) if value.is_null() => {}
+                Some(value) => match value.as_raw_bytes() {
+                    Some(bytes) if !encoding.is_valid(bytes) => return false,
+                    _ => {}
+                },
+                None => {}
+            }
+        } else if field_type.collation_name() != COLLATION_BIN
+            && ec.charset != CHARSET_BIN
+            && !crate::expr_collation::is_unicode_collation(&ec.charset)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Go `fixStringTypeForMaxLength`: a JSON argument has a huge maximum length,
+/// which in MySQL turns these string results into LONGBLOB, so the derived
+/// collation becomes its charset's `_bin` one (`collate.ConvertAndGetBinCollation`).
+/// `args` are the arguments [`derive_collation`] aggregated, not the call's.
+fn fix_string_type_for_max_length(
+    func_name: &str,
+    args: &[Expression],
+    mut ec: ExprCollation,
+) -> ExprCollation {
+    let is_json = |index: usize| {
+        args.get(index)
+            .is_some_and(|arg| ret_type_of(arg).eval_type() == EvalType::Json)
+    };
+    let should_change_to_bin = match func_name {
+        "reverse" | "lower" | "upper" | "substring_index" | "trim" | "ltrim_with"
+        | "rtrim_with" | "quote" | "insert_func" | "substr" | "repeat" | "replace" => is_json(0),
+        "concat" | "concat_ws" | "elt" | "make_set" => (0..args.len()).any(is_json),
+        "export_set" => {
+            (args.len() >= 2 && (is_json(0) || is_json(1))) || (args.len() >= 3 && is_json(2))
+        }
+        _ => false,
+    };
+    if should_change_to_bin {
+        ec.collation = match ec.collation.as_str() {
+            "utf8_general_ci" | "utf8_unicode_ci" => "utf8_bin",
+            "utf8mb4_general_ci" | "utf8mb4_unicode_ci" | "utf8mb4_0900_ai_ci" => "utf8mb4_bin",
+            "gbk_chinese_ci" => "gbk_bin",
+            "gb18030_chinese_ci" => "gb18030_bin",
+            other => other,
+        }
+        .to_owned();
+    }
+    ec
 }
 
 /// Go `deriveCollation`: which arguments a function aggregates, and what the
@@ -463,9 +532,10 @@ pub fn derive_collation_with_connection(
                 func_name, ret_type, args, connection,
             )
         }
-        // Only the first argument decides.
-        "left" | "right" | "repeat" | "trim" | "ltrim" | "rtrim" | "substr" | "substring"
-        | "mid" | "substring_index" | "replace" | "translate"
+        // Only the first argument decides. `ltrim_with`/`rtrim_with` are
+        // `TRIM(LEADING|TRAILING r FROM s)`, Go's `ast.Trim` with a direction.
+        "left" | "right" | "repeat" | "trim" | "ltrim" | "rtrim" | "ltrim_with" | "rtrim_with"
+        | "substr" | "substring" | "mid" | "substring_index" | "replace" | "translate"
             if !args.is_empty() =>
         {
             check_and_derive_collation_from_exprs_with_connection(
@@ -749,6 +819,34 @@ pub fn apply_derived_collation(expr: &mut Expression, ec: &ExprCollation) {
 #[must_use]
 pub fn collation_of_node(expr: &Expression) -> Collation {
     Collation::from_name(ret_type_of(expr).collation_name()).unwrap_or(Collation::Utf8Mb4Bin)
+}
+
+/// Go `FoldConstant`'s epilogue (`constant_fold.go:40`): whatever folding
+/// replaced `original` with -- its value, or the branch a constant IF, IFNULL
+/// or CASE condition picked -- keeps the original's coercibility, charset,
+/// collation and repertoire. `IF(true, 'x', 'y' COLLATE utf8mb4_unicode_ci)`
+/// folds to 'x' and still reports utf8mb4_unicode_ci.
+pub fn keep_collation_after_fold(original: &Expression, folded: &mut Expression) {
+    let coercibility = coercibility_of(original);
+    let repertoire = repertoire_of(original);
+    let original_type = ret_type_of(original);
+    let (charset, collation) = (
+        original_type.charset_name().to_owned(),
+        original_type.collation_name().to_owned(),
+    );
+    if let Some(field_type) = ret_type_mut(folded) {
+        field_type.set_charset_name(charset);
+        field_type.set_collation_name(collation);
+    }
+    let info = collation_info_mut(folded);
+    info.set_coercibility(coercibility);
+    info.set_repertoire(repertoire);
+}
+
+/// Go `Expression.SetCoercibility`: overrides only the coercibility, as
+/// `castCollationForIn` does for the casts it builds.
+pub fn set_coercibility(expr: &mut Expression, coercibility: Coercibility) {
+    collation_info_mut(expr).set_coercibility(coercibility);
 }
 
 /// Marks an expression as carrying an EXPLICIT `COLLATE` clause.

@@ -2168,8 +2168,7 @@ impl Partial {
                     // `utf8mb4_general_ci` column holding 'a','B','A' the
                     // answers are max=B, min=a -- NOT the binary a/A
                     // (captured from TiDB).
-                    let ordering =
-                        tidb_expr::compare_datums_with_collation(&input, current, collation)?;
+                    let ordering = crate::remote_scan::compare_extreme(&input, current, collation)?;
                     if (*is_max && ordering == Ordering::Greater)
                         || (!*is_max && ordering == Ordering::Less)
                     {
@@ -2426,7 +2425,9 @@ impl Partial {
                         .iter()
                         .map(|(expr, _)| expr_collation(expr))
                         .collect();
-                    values.sort_by(|left, right| {
+                    // Go `topNRows.Less` in ascending terms; a comparison
+                    // error ends it as "not less" either way.
+                    let compare = |left: &(Vec<u8>, Vec<Datum>), right: &(Vec<u8>, Vec<Datum>)| {
                         for (position, (_, desc)) in order_by.iter().enumerate() {
                             let (Some(a), Some(b)) = (left.1.get(position), right.1.get(position))
                             else {
@@ -2436,15 +2437,33 @@ impl Partial {
                                 .get(position)
                                 .copied()
                                 .unwrap_or(tidb_datatype::Collation::DEFAULT);
-                            let ordering =
+                            let Ok(ordering) =
                                 tidb_expr::compare_datums_with_collation(a, b, collation)
-                                    .unwrap_or(Ordering::Equal);
+                            else {
+                                return Ordering::Equal;
+                            };
                             if ordering != Ordering::Equal {
                                 return if *desc { ordering.reverse() } else { ordering };
                             }
                         }
                         Ordering::Equal
-                    });
+                    };
+                    // Go `topNRows.tryToAdd` pushes each row, in arrival
+                    // order, onto a heap that keeps the greatest on top, and
+                    // `concat` then runs `sort.Sort(sort.Reverse(h))` -- an
+                    // unstable pdqsort over the heap's layout. Rows the ORDER
+                    // BY ties (`abc`/`Abc` under general_ci) therefore come out
+                    // in that schedule's order, not their arrival order.
+                    let mut heap = Vec::with_capacity(values.len());
+                    for value in values {
+                        heap.push(value);
+                        let last = heap.len() - 1;
+                        crate::topn_chunk_heap::go_heap::up(&mut heap, last, &mut |a, b| {
+                            compare(a, b) == Ordering::Greater
+                        });
+                    }
+                    tidb_stats::go_sort_func_by(&mut heap, |a, b| compare(a, b));
+                    values = heap;
                 }
                 let mut joined = Vec::new();
                 for (index, (value, _)) in values.iter().enumerate() {

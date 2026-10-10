@@ -107,7 +107,9 @@ fn fold_constant_in_mode_inner(
     }
     match replacement {
         Some(Folded::Constant(folded, is_deferred)) => {
-            let original = std::mem::replace(expr, Expression::Constant(folded));
+            let mut folded = Expression::Constant(folded);
+            crate::collation_derive::keep_collation_after_fold(expr, &mut folded);
+            let original = std::mem::replace(expr, folded);
             if is_deferred {
                 let Expression::Constant(folded) = expr else {
                     unreachable!()
@@ -115,7 +117,10 @@ fn fold_constant_in_mode_inner(
                 folded.deferred_expr = Some(Box::new(original));
             }
         }
-        Some(Folded::Branch(branch)) => *expr = branch,
+        Some(Folded::Branch(mut branch)) => {
+            crate::collation_derive::keep_collation_after_fold(expr, &mut branch);
+            *expr = branch;
+        }
         None => {}
     }
 }

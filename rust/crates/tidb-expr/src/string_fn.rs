@@ -419,22 +419,74 @@ pub(crate) fn position_with_collation(
     let (Some(substr), Some(str)) = (substr, str) else {
         return Datum::Null;
     };
-    let needle: Vec<char> = substr.chars().collect();
-    let haystack: Vec<char> = str.chars().collect();
-    if needle.is_empty() {
+    if substr.is_empty() {
         return Datum::Int(1);
     }
-    if needle.len() > haystack.len() {
-        return Datum::Int(0);
+    Datum::Int(locate_string_with_collation(&str, &substr, collation))
+}
+
+/// Go `locateStringWithCollation` (`util.go:821`): the needle's collation
+/// key is searched inside the haystack's, and the byte offset found is
+/// walked back to a character count -- so under `utf8mb4_unicode_ci` the
+/// one character 'ß' is found at the two characters 'ss'.
+fn locate_string_with_collation(
+    str: &str,
+    substr: &str,
+    collation: tidb_datatype::Collation,
+) -> i64 {
+    let collator = tidb_datatype::get_collator(collation.name());
+    let str_key = collator.key_without_trim_right_space(str.as_bytes());
+    let substr_key = collator.key_without_trim_right_space(substr.as_bytes());
+    let Some(found) = (if substr_key.is_empty() {
+        Some(0)
+    } else {
+        str_key
+            .windows(substr_key.len())
+            .position(|window| window == substr_key.as_slice())
+    }) else {
+        return 0;
+    };
+    if found == 0 {
+        return 1;
     }
-    let needle_bytes = substr.as_bytes();
-    for start in 0..=(haystack.len() - needle.len()) {
-        let window: String = haystack[start..start + needle.len()].iter().collect();
-        if collation.compare(window.as_bytes(), needle_bytes) == std::cmp::Ordering::Equal {
-            return Datum::Int(start as i64 + 1);
+    let mut index = found as i64;
+    let mut count = 0_i64;
+    let mut buffer = [0_u8; 4];
+    for character in str.chars() {
+        count += 1;
+        index -= collator
+            .key_without_trim_right_space(character.encode_utf8(&mut buffer).as_bytes())
+            .len() as i64;
+        if index <= 0 {
+            return count + 1;
         }
     }
-    Datum::Int(0)
+    count + 1
+}
+
+/// Go `INSTR(str, substr)`: `builtinInstrSig` matches bytes under a binary
+/// collation; `builtinInstrUTF8Sig` lowercases both strings under a
+/// case-insensitive collation (`strings.ToLower`) and reports the character
+/// offset of the first byte match -- not the collation-key search LOCATE
+/// uses.
+pub(crate) fn instr(
+    str: &Datum,
+    substr: &Datum,
+    collation: tidb_datatype::Collation,
+) -> Result<Datum, EvalError> {
+    if collation == tidb_datatype::Collation::Binary {
+        return locate(substr, str, collation);
+    }
+    let (Some(mut str), Some(mut substr)) = (coerce_str(str)?, coerce_str(substr)?) else {
+        return Ok(Datum::Null);
+    };
+    if tidb_datatype::is_ci_collation(collation.name()) {
+        str = tidb_hack::go_to_lower(&str);
+        substr = tidb_hack::go_to_lower(&substr);
+    }
+    Ok(Datum::Int(str.find(substr.as_str()).map_or(0, |index| {
+        str[..index].chars().count() as i64 + 1
+    })))
 }
 
 /// `REPLACE(str, from, to)`: every non-overlapping occurrence of `from` in

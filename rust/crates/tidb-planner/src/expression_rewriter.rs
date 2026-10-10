@@ -1351,7 +1351,11 @@ impl<'a, C: Columns> ExpressionRewriter<'a, C> {
     ) -> Result<LogicalPlan, RewriteError> {
         let func_name = if use_min { "min" } else { "max" };
         let func_max_or_min = self.new_agg_func(func_name, vec![rexpr.clone()], false)?;
-        let col_max_or_min = self.env.new_plan_column(func_max_or_min.ret_type().clone());
+        let mut col_max_or_min = self.env.new_plan_column(func_max_or_min.ret_type().clone());
+        // Go `colMaxOrMin.SetCoercibility(rexpr.Coercibility())`.
+        col_max_or_min
+            .collation
+            .set_coercibility(tidb_expr::collation_derive::coercibility_of(rexpr));
 
         let base = self.env.base(LogicalAggregation::TYPE);
         let mut agg = LogicalAggregation::new(base, vec![func_max_or_min], Vec::new());
@@ -1597,7 +1601,12 @@ impl<'a, C: Columns> ExpressionRewriter<'a, C> {
     ) -> Result<(LogicalPlan, Column, Column), RewriteError> {
         let max_func = self.new_agg_func("max", vec![rexpr.clone()], false)?;
         let count_func = self.new_agg_func("count", vec![rexpr.clone()], true)?;
-        let max_col = self.env.new_plan_column(max_func.ret_type().clone());
+        let mut max_col = self.env.new_plan_column(max_func.ret_type().clone());
+        // Go `maxResultCol.SetCoercibility(rexpr.Coercibility())`: the
+        // comparison against MAX keeps the subquery operand's collation.
+        max_col
+            .collation
+            .set_coercibility(tidb_expr::collation_derive::coercibility_of(rexpr));
         let count_col = self.env.new_plan_column(count_func.ret_type().clone());
         let base = self.env.base(LogicalAggregation::TYPE);
         let mut agg = LogicalAggregation::new(base, vec![max_func, count_func], Vec::new());

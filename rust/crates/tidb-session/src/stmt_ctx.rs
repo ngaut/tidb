@@ -43,6 +43,7 @@ pub(crate) struct StatementVarSnapshot {
     time_zone: tidb_executor::SessionTimeZone,
     connection_charset: String,
     connection_collation: String,
+    default_collation_for_utf8mb4: String,
     allow_write_row_id: bool,
     /// `tidb_enable_ordered_result_mode` (Go `EnableStableResultMode`).
     stable_result_mode: bool,
@@ -821,6 +822,10 @@ impl Session {
                 .vars
                 .get_system("collation_connection")
                 .unwrap_or_else(|_| "utf8mb4_bin".to_owned()),
+            default_collation_for_utf8mb4: self
+                .vars
+                .get_system("default_collation_for_utf8mb4")
+                .unwrap_or_else(|_| "utf8mb4_bin".to_owned()),
             allow_write_row_id: on(tidb_vardef::tidb_vars::TIDB_OPT_WRITE_ROW_ID),
             stable_result_mode: on(tidb_vardef::tidb_vars::TIDB_ENABLE_ORDERED_RESULT_MODE),
             sysdate_is_now: on(tidb_vardef::tidb_vars::TIDB_SYSDATE_IS_NOW),
@@ -1145,6 +1150,7 @@ impl Session {
         let version = snapshot.version.clone();
         let connection_charset = snapshot.connection_charset.clone();
         let connection_collation = snapshot.connection_collation.clone();
+        let default_collation_for_utf8mb4 = snapshot.default_collation_for_utf8mb4.clone();
         let zone = snapshot.time_zone.clone();
         let allow_write_row_id = snapshot.allow_write_row_id;
         let sysdate_is_now = snapshot.sysdate_is_now;
@@ -1314,6 +1320,7 @@ impl Session {
             select_limit: snapshot.select_limit,
             connection_charset,
             connection_collation,
+            default_collation_for_utf8mb4,
             ddl_sql_mode: sql_mode.0,
         };
         if !is_dml {

@@ -2741,8 +2741,7 @@ fn merge_state(dst: &mut AggState, src: &mut AggState, func: &AggFunc) -> Result
             (_, None) => {}
             (None, Some(value)) => *dst_value = Some(value),
             (Some(current), Some(value)) => {
-                let ordering =
-                    tidb_expr::compare_datums_with_collation(&value, current, dst.collation)?;
+                let ordering = crate::remote_scan::compare_extreme(&value, current, dst.collation)?;
                 if (*is_max && ordering == Ordering::Greater)
                     || (!*is_max && ordering == Ordering::Less)
                 {

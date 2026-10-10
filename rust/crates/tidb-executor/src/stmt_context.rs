@@ -427,6 +427,8 @@ pub struct StmtContextSessionState {
     pub connection_charset: String,
     /// Captured connection collation.
     pub connection_collation: String,
+    /// Captured `@@default_collation_for_utf8mb4`.
+    pub default_collation_for_utf8mb4: String,
     /// Complete typed SQL mode used by DDL.
     pub ddl_sql_mode: i64,
 }
@@ -453,6 +455,7 @@ impl Default for StmtContextSessionState {
             select_limit: u64::MAX,
             connection_charset: "utf8mb4".to_owned(),
             connection_collation: "utf8mb4_bin".to_owned(),
+            default_collation_for_utf8mb4: "utf8mb4_bin".to_owned(),
             ddl_sql_mode: tidb_mysql::get_sql_mode(tidb_mysql::DefaultSQLMode)
                 .map_or(0, |mode| mode.0),
         }
@@ -608,6 +611,9 @@ pub struct StmtContextData {
     /// `@@character_set_connection` and `@@collation_connection`.
     connection_charset: String,
     connection_collation: String,
+    /// Go `SessionVars.DefaultCollationForUTF8MB4`: the collation a
+    /// `_utf8mb4'...'` literal takes (`adjustUTF8MB4Collation`).
+    default_collation_for_utf8mb4: String,
     /// Go expression BuildContext.NewCollationEnabled, captured for this task.
     new_collation_enabled: bool,
     /// Go `SessionVars.Rng`: the SESSION-scoped generator unseeded `RAND()`
@@ -2154,6 +2160,7 @@ impl StmtContext {
             select_limit: session.select_limit,
             connection_charset: session.connection_charset,
             connection_collation: session.connection_collation,
+            default_collation_for_utf8mb4: session.default_collation_for_utf8mb4,
             new_collation_enabled: tidb_datatype::new_collation_enabled(),
             rand_session: None,
             user_vars: None,
@@ -4830,6 +4837,11 @@ impl Columns for StmtContext {
         // trait already has a general variable channel.
         if name.eq_ignore_ascii_case("group_concat_max_len") {
             return Some(Datum::UInt(self.group_concat_max_len));
+        }
+        if name.eq_ignore_ascii_case("default_collation_for_utf8mb4") {
+            return Some(Datum::Bytes(
+                self.default_collation_for_utf8mb4.clone().into_bytes(),
+            ));
         }
         if name.eq_ignore_ascii_case("error_count") {
             return Some(Datum::UInt(self.client_error_count as u64));

@@ -151,6 +151,33 @@ pub fn extreme_collation(input: Option<&Expression>) -> tidb_datatype::Collation
     })
 }
 
+/// The MIN/MAX ordering of `candidate` against `current`. An ENUM or SET
+/// orders by its NAME under the collator -- Go `maxMin4Enum`/`maxMin4Set`,
+/// and the cop's `Datum.Compare` (`compareMysqlEnum`) -- so MIN over
+/// enum('a','B','c') under general_ci is 'a', where the binary bytes would
+/// pick 'B'.
+///
+/// # Errors
+///
+/// An unordered scalar pair, as [`tidb_expr::compare_datums_with_collation`].
+pub fn compare_extreme(
+    candidate: &tidb_datatype::Datum,
+    current: &tidb_datatype::Datum,
+    collation: tidb_datatype::Collation,
+) -> Result<std::cmp::Ordering, tidb_expr::EvalError> {
+    fn name(datum: &tidb_datatype::Datum) -> Option<&[u8]> {
+        match datum {
+            tidb_datatype::Datum::Enum(value, _) => Some(value.name_bytes()),
+            tidb_datatype::Datum::Set(value, _) => Some(value.name_bytes()),
+            _ => None,
+        }
+    }
+    if let (Some(left), Some(right)) = (name(candidate), name(current)) {
+        return Ok(collation.compare(left, right));
+    }
+    tidb_expr::compare_datums_with_collation(candidate, current, collation)
+}
+
 /// Whether `candidate` becomes the new MIN/MAX, under [`extreme_collation`].
 #[must_use]
 pub fn extreme_replaces(
@@ -159,7 +186,7 @@ pub fn extreme_replaces(
     is_max: bool,
     collation: tidb_datatype::Collation,
 ) -> bool {
-    tidb_expr::compare_datums_with_collation(candidate, current, collation).is_ok_and(|ordering| {
+    compare_extreme(candidate, current, collation).is_ok_and(|ordering| {
         if is_max {
             ordering.is_gt()
         } else {

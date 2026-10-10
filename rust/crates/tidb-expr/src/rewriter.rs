@@ -179,6 +179,20 @@ pub trait ColumnResolver {
         crate::collation_derive::connection_charset_info()
     }
 
+    /// Go `GetDefaultCollationForUTF8MB4`: the collation a `_utf8mb4'...'`
+    /// literal takes (`adjustUTF8MB4Collation`). A resolver bound to a live
+    /// statement reads the session variable through it.
+    fn default_collation_for_utf8mb4(&self) -> String {
+        self.comparison_context()
+            .and_then(|ctx| ctx.sysvar(None, "default_collation_for_utf8mb4"))
+            .and_then(|value| {
+                value
+                    .as_raw_bytes()
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            })
+            .unwrap_or_else(|| "utf8mb4_bin".to_owned())
+    }
+
     /// Length of the process identity returned by `TIDB_VERSION()`.
     /// Go reads the process globals while building this function and uses the
     /// same rendered value to set its result width.
@@ -1949,8 +1963,13 @@ fn rewrite_leaf_literal(
         // the result as explicitly introduced.
         Expr::CharsetString { charset, value } => {
             let charset = charset.to_ascii_lowercase();
-            let collation_name = tidb_datatype::get_default_collation_legacy(&charset)
+            let mut collation_name = tidb_datatype::get_default_collation_legacy(&charset)
                 .map_err(|_| EvalError::Unsupported("unknown character introducer"))?;
+            // Go `adjustUTF8MB4Collation`: a `_utf8mb4` introducer takes the
+            // session's `default_collation_for_utf8mb4`.
+            if charset == "utf8mb4" {
+                collation_name = resolver.default_collation_for_utf8mb4();
+            }
             let collation = tidb_datatype::Collation::from_name(&collation_name)
                 .ok_or(EvalError::Unsupported("unknown character introducer"))?;
             let mut ft = FieldType::new(FieldTypeCode::VarString);
@@ -2052,6 +2071,39 @@ fn rewrite_leaf_compound(
                 })
             });
             if !all_same_type || list.len() == 1 {
+                // Go `deriveCollationForIn` + `castCollationForIn`: one
+                // collation over the whole IN, and each string member not
+                // already in it cast to it (EXPLICIT) before the equalities
+                // are built, so `a IN ('b' COLLATE utf8mb4_general_ci, 'A', 3)`
+                // compares `a` with 'A' under general_ci.
+                let derived = crate::collation_derive::check_and_derive_collation_from_exprs(
+                    "IN",
+                    EvalType::Int,
+                    &args,
+                )?;
+                if tidb_datatype::new_collation_enabled() {
+                    for index in 1..args.len() {
+                        let compares_as_string = crate::builtin_compare::get_accurate_cmp_type(
+                            operand(&args[0]),
+                            operand(&args[index]),
+                        ) == EvalType::String;
+                        if let Some(mut cast) = crate::simple_expr::build_cast_collation_function(
+                            &args[index],
+                            &derived,
+                            compares_as_string,
+                            &|expression| {
+                                resolver.fold_constant(expression, ConstantFoldMode::Normal);
+                            },
+                        )? {
+                            crate::collation_derive::set_coercibility(
+                                &mut cast,
+                                crate::expr_collation::Coercibility::EXPLICIT,
+                            );
+                            args[index] = cast;
+                        }
+                    }
+                }
+                let left = &args[0];
                 let mut equalities = Vec::with_capacity(list.len());
                 for right in &args[1..] {
                     equalities.push(binary_expression(
@@ -2238,14 +2290,65 @@ fn rewrite_leaf_compound(
                 resolve_type4_between([&value, &low, &high]),
                 resolver.connection_charset_info(),
             )?;
+            // Go `betweenToExpression`: one collation over all three
+            // operands, each cast to it, so `a BETWEEN binary_col AND
+            // ci_col` compares both bounds as binary instead of picking a
+            // collation per comparison.
+            let derived = crate::collation_derive::check_and_derive_collation_from_exprs(
+                "BETWEEN",
+                EvalType::Int,
+                &[value.clone(), low.clone(), high.clone()],
+            )?;
+            let accurate = |left: &Expression, right: &Expression| match (
+                left.static_type(),
+                right.static_type(),
+            ) {
+                (Some(left_type), Some(right_type)) => {
+                    crate::builtin_compare::get_accurate_cmp_type(
+                        crate::builtin_compare::CmpOperand {
+                            field_type: left_type,
+                            is_constant: matches!(left, Expression::Constant(_)),
+                            is_column: matches!(left, Expression::Column(_)),
+                        },
+                        crate::builtin_compare::CmpOperand {
+                            field_type: right_type,
+                            is_constant: matches!(right, Expression::Constant(_)),
+                            is_column: matches!(right, Expression::Column(_)),
+                        },
+                    )
+                }
+                _ => EvalType::Int,
+            };
+            let enum_or_set_real_type_is_str =
+                accurate(&value, &low) != EvalType::Int && accurate(&value, &high) != EvalType::Int;
+            let cast = |operand: Expression| -> Result<Expression, EvalError> {
+                Ok(crate::simple_expr::build_cast_collation_function(
+                    &operand,
+                    &derived,
+                    enum_or_set_real_type_is_str,
+                    &|expression| {
+                        resolver.fold_constant(expression, ConstantFoldMode::Normal);
+                    },
+                )?
+                .unwrap_or(operand))
+            };
+            let (value, low, high) = (cast(value)?, cast(low)?, cast(high)?);
             let (lower_op, upper_op, joiner) = if *not {
                 (BinaryOp::Lt, BinaryOp::Gt, "or")
             } else {
                 (BinaryOp::Ge, BinaryOp::Le, "and")
             };
             let compare = binary_expression;
-            let lower = compare(lower_op, value.clone(), low, resolver)?;
-            let upper = compare(upper_op, value, high, resolver)?;
+            let mut lower = compare(lower_op, value.clone(), low, resolver)?;
+            let mut upper = compare(upper_op, value, high, resolver)?;
+            // Go builds each bound with `NewFunction`, which settles its
+            // collation and folds it on the spot; the joining AND then folds
+            // over two constants, so `'a' BETWEEN 'g' AND 'f'` is a constant
+            // false and the scan becomes a TableDual.
+            for bound in [&mut lower, &mut upper] {
+                derive_tree_collation_with_connection(bound, resolver.connection_charset_info())?;
+                resolver.fold_constant(bound, resolver.fold_mode());
+            }
             // The joining `AND`/`OR` is a `booleanFunctions` name, so the whole
             // `BETWEEN` result is boolean-flagged: `JSON_ARRAY(x BETWEEN l AND h)`
             // is `[true]`/`[false]`, not `[1]`/`[0]`.
@@ -3090,6 +3193,24 @@ fn rewrite_leaf_call(expr: &Expr, resolver: &impl ColumnResolver) -> Result<Expr
             };
             let charset_name = ret_type.charset_name().to_owned();
             let collation_name = ret_type.collation_name().to_owned();
+            // Go's rewriter overrides the coercibility of the CAST it builds:
+            // IMPLICIT for a string target (ASCII repertoire only for the
+            // ascii charset), NUMERIC/ASCII for any other. A CAST AS DATE in
+            // a UNION branch therefore yields to the string branch's
+            // collation instead of dragging the result to binary.
+            let (coer, repe) = if ret_type.eval_type() == tidb_datatype::EvalType::String {
+                let repe = if charset_name == "ascii" {
+                    crate::expr_collation::Repertoire::ASCII
+                } else {
+                    crate::expr_collation::Repertoire::UNICODE
+                };
+                (crate::expr_collation::Coercibility::IMPLICIT, repe)
+            } else {
+                (
+                    crate::expr_collation::Coercibility::NUMERIC,
+                    crate::expr_collation::Repertoire::ASCII,
+                )
+            };
             let mut node = Expression::ScalarFunction(ScalarFunction::new(
                 CiString::new(name),
                 ret_type,
@@ -3107,8 +3228,8 @@ fn rewrite_leaf_call(expr: &Expr, resolver: &impl ColumnResolver) -> Result<Expr
             crate::collation_derive::apply_derived_collation(
                 &mut node,
                 &crate::expr_collation::ExprCollation {
-                    coer: crate::expr_collation::Coercibility::IMPLICIT,
-                    repe: crate::expr_collation::Repertoire::UNICODE,
+                    coer,
+                    repe,
                     charset: charset_name,
                     collation: collation_name,
                 },

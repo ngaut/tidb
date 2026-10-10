@@ -42,6 +42,7 @@ pub mod fmsketch;
 pub mod fmsketch_codec;
 pub mod global_stats;
 mod go_pdqsort;
+pub use go_pdqsort::go_sort_func_by;
 mod go_stable_sort;
 pub mod histogram;
 pub mod independent_index_analyze;

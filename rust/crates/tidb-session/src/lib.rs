@@ -1875,13 +1875,21 @@ impl Session {
         // schema the account cannot see is never distinguishable from one
         // that does not exist.
         self.require_visible_database(name)?;
-        let exists = self.with_catalog_mut(|catalog| Ok(catalog.has_database(name)))?;
-        if !exists {
+        let charset = self.with_catalog_mut(|catalog| Ok(catalog.database_charset(name)))?;
+        let Some(charset) = charset else {
             return Err(DriverError::Schema(SchemaErrorKind::UnknownDatabase(
                 name.to_owned(),
             )));
-        }
+        };
         self.current_db = name.to_owned();
+        // The schema's collation, substituted when new collations do not
+        // support it, becomes `collation_database`; that variable's hook
+        // mirrors its charset into `character_set_database`.
+        let collation =
+            tidb_datatype::substitute_missing_collation_to_default(charset.collation.name());
+        self.vars
+            .set_system("collation_database", collation)
+            .map_err(crate::variables::var_error)?;
         Ok(())
     }
 

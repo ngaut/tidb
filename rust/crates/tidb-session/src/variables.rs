@@ -291,17 +291,35 @@ impl Session {
                             bound = tidb_ast::Expr::String(word.clone());
                         }
                     }
-                    let sql = match &bound {
-                        tidb_ast::Expr::Subquery(query) => query.restore(),
-                        _ => format!("SELECT {}", bound.restore()),
+                    // Go `buildSet` rewrites the parsed assignment expression
+                    // itself. Restoring it to text and reparsing would print a
+                    // plain literal with a `_UTF8MB4` introducer, which pins
+                    // utf8mb4_bin where Go's literal takes the connection
+                    // collation -- and the variable stores that type. The
+                    // expression is substituted into a parsed one-field SELECT
+                    // instead.
+                    let query = match &bound {
+                        tidb_ast::Expr::Subquery(query) => query.clone(),
+                        _ => {
+                            let Stmt::Query(mut query) = tidb_parser::parse_with_sql_mode(
+                                "SELECT 1",
+                                self.scanner_sql_mode(),
+                            )
+                            .map_err(|error| DriverError::Parse(format!("{error:?}")))?
+                            else {
+                                unreachable!("SELECT 1 parses as a query")
+                            };
+                            let tidb_ast::QueryStmt::Select(select) = &mut *query else {
+                                unreachable!("SELECT 1 is a plain SELECT")
+                            };
+                            select.fields.fields_mut()[0] = tidb_ast::SelectField::Expr {
+                                expr: bound.clone(),
+                                alias: None,
+                            };
+                            query
+                        }
                     };
                     let ctx = self.statement_context(false);
-                    let Stmt::Query(query) =
-                        tidb_parser::parse_with_sql_mode(&sql, self.scanner_sql_mode())
-                            .map_err(|error| DriverError::Parse(format!("{error:?}")))?
-                    else {
-                        unreachable!("SET RHS is planned as a query")
-                    };
                     let database = self.current_database().to_owned();
                     let physical = self.with_catalog_mut(|catalog| {
                         tidb_executor::plan_query_meta_stmt(&query, catalog, &database, &ctx)

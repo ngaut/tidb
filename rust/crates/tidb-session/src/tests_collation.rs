@@ -515,3 +515,248 @@ fn projected_collate_expressions_stay_explicit() {
         vec![vec!["binary"]]
     );
 }
+
+/// Go's rewriter sets an explicit CAST's coercibility: NUMERIC for a
+/// non-string target, so a DATE branch of a UNION yields to the string
+/// branch's PAD SPACE collation and '2010-09-09  ' deduplicates against it.
+/// A string function over JSON is `fixStringTypeForMaxLength`'s `_bin`
+/// collation, which then wins BETWEEN's derivation over general_ci bounds.
+#[test]
+fn cast_coercibility_and_json_string_functions_follow_go() {
+    let mut s = Session::new();
+    assert_eq!(
+        one(&mut s, "with cte as (select cast('2010-09-09' as date) a union select '2010-09-09  ') select count(*) from cte"),
+        "1"
+    );
+    assert_eq!(
+        row_text(s.run("select collation(cast('[]' as json)), coercibility(cast('[]' as json))")),
+        vec![vec!["utf8mb4_bin", "5"]]
+    );
+    s.run("set names utf8mb4 collate utf8mb4_general_ci")
+        .unwrap();
+    assert_eq!(
+        one(
+            &mut s,
+            "select insert('[]', 0, 100, cast('[]' as json)) between 'W' and 'm'"
+        ),
+        "0"
+    );
+    assert_eq!(
+        one(
+            &mut s,
+            "select reverse(cast('[]' as json)) between 'W' and 'm'"
+        ),
+        "1"
+    );
+    assert_eq!(
+        one(&mut s, "select collation(reverse(cast('[]' as json)))"),
+        "utf8mb4_bin"
+    );
+}
+
+/// Go `betweenToExpression` derives one collation over all three operands
+/// and casts each to it, and folds the bounds as it builds them; Go
+/// `deriveCollationForIn`/`castCollationForIn` do the same for an IN that is
+/// rewritten to equalities.
+#[test]
+fn between_and_in_cast_to_one_derived_collation() {
+    let mut s = Session::new();
+    s.run("create table t1(a char(20)) collate utf8mb4_general_ci")
+        .unwrap();
+    s.run("create table t2(b binary(20), c char(20)) collate utf8mb4_general_ci")
+        .unwrap();
+    s.run("insert into t1 values ('a')").unwrap();
+    s.run("insert into t2 values (0x0, 'A')").unwrap();
+    assert!(row_text(s.run("select * from t1, t2 where t1.a between t2.b and t2.c")).is_empty());
+    assert!(
+        row_text(s.run("explain select * from t1 where 'a' between 'g' and 'f'"))[0][0]
+            .starts_with("TableDual")
+    );
+    s.run("create table tin (a varchar(10) collate utf8mb4_bin)")
+        .unwrap();
+    s.run("insert into tin values ('a')").unwrap();
+    assert_eq!(
+        row_text(s.run("select * from tin where a in ('b' collate utf8mb4_general_ci, 'A', 3)")),
+        vec![vec!["a"]]
+    );
+}
+
+/// Go `locateStringWithCollation` searches collation keys, so 'ß' is found
+/// at 'ss' under unicode_ci; `builtinInstrUTF8Sig` lowercases under a `_ci`
+/// collation and reports the character offset.
+#[test]
+fn locate_searches_collation_keys_and_instr_lowercases() {
+    let mut s = Session::new();
+    assert_eq!(
+        one(
+            &mut s,
+            "select locate('ß', 'ss' collate utf8mb4_unicode_ci)"
+        ),
+        "1"
+    );
+    assert_eq!(
+        one(
+            &mut s,
+            "select instr('aßB' collate utf8mb4_general_ci, 'b')"
+        ),
+        "3"
+    );
+    // general_ci's key folds 'ß' to 's'; Go's INSTR lowercases instead.
+    assert_eq!(
+        one(&mut s, "select instr('ß' collate utf8mb4_general_ci, 's')"),
+        "0"
+    );
+}
+
+/// The quantified and scalar subquery rewrites keep the subquery column's
+/// coercibility (Go `SetCoercibility(rexpr.Coercibility())`), so a COLLATE
+/// inside the subquery decides the comparison.
+#[test]
+fn subquery_rewrites_keep_the_subquery_collation() {
+    let mut s = Session::new();
+    s.run("create table t (a varchar(10) collate utf8mb4_bin)")
+        .unwrap();
+    s.run("create table t1 (a varchar(10) collate utf8mb4_bin)")
+        .unwrap();
+    s.run("insert into t values ('A')").unwrap();
+    s.run("insert into t1 values ('a')").unwrap();
+    for sql in [
+        "select a from t where t.a = all (select a collate utf8mb4_general_ci from t1)",
+        "select a from t where t.a = (select a collate utf8mb4_general_ci from t1)",
+    ] {
+        assert_eq!(row_text(s.run(sql)), vec![vec!["A"]], "{sql}");
+    }
+    assert!(row_text(
+        s.run("select a from t where t.a != any (select a collate utf8mb4_general_ci from t1)")
+    )
+    .is_empty());
+}
+
+/// Go `FoldConstant` keeps the folded expression's collation: a constant IF
+/// that picks its first branch still reports the derived unicode_ci.
+#[test]
+fn a_folded_if_keeps_its_derived_collation() {
+    let mut s = Session::new();
+    s.run("set names utf8mb4 collate utf8mb4_general_ci")
+        .unwrap();
+    assert_eq!(
+        one(
+            &mut s,
+            "select collation(IF('a' < 'B' collate utf8mb4_general_ci, 'smaller', 'greater' collate utf8mb4_unicode_ci))"
+        ),
+        "utf8mb4_unicode_ci"
+    );
+}
+
+/// Go `buildSet` rewrites the assigned expression itself, so a plain literal
+/// takes the connection collation and the variable stores that type.
+#[test]
+fn a_user_variable_stores_the_connection_collation() {
+    let mut s = Session::new();
+    s.run("set names utf8mb4 collate utf8mb4_general_ci")
+        .unwrap();
+    s.run("set @v1 = 'a', @v2 = (select 'a')").unwrap();
+    assert_eq!(
+        row_text(s.run("select collation(@v1), collation(@v2), coercibility(@v1)")),
+        vec![vec!["utf8mb4_general_ci", "utf8mb4_general_ci", "2"]]
+    );
+}
+
+/// Go `adjustUTF8MB4Collation`: a `_utf8mb4` introducer takes
+/// `default_collation_for_utf8mb4`.
+#[test]
+fn a_utf8mb4_introducer_takes_the_default_collation_for_utf8mb4() {
+    let mut s = Session::new();
+    s.run("set @@session.default_collation_for_utf8mb4 = 'utf8mb4_0900_ai_ci'")
+        .unwrap();
+    assert_eq!(
+        one(&mut s, "select collation(_utf8mb4'12345')"),
+        "utf8mb4_0900_ai_ci"
+    );
+}
+
+/// Go `topNRows`: GROUP_CONCAT's ORDER BY pushes rows onto a heap and then
+/// runs Go's unstable pdqsort, so rows the ORDER BY ties come out in that
+/// schedule's order (captured from TiDB: `Abc,abc,abc,def`).
+#[test]
+fn group_concat_order_by_ties_follow_go_sort_schedule() {
+    let mut s = Session::new();
+    s.run("create table t(id int, value varchar(20) collate utf8mb4_general_ci)")
+        .unwrap();
+    s.run("insert into t values (1, 'abc'), (4, 'Abc'), (3, 'def'), (5, 'abc')")
+        .unwrap();
+    assert_eq!(
+        one(&mut s, "select group_concat(value order by 1) from t"),
+        "Abc,abc,abc,def"
+    );
+}
+
+/// Go `maxMin4Enum`/`maxMin4Set` and the cop's `Datum.Compare` order ENUM and
+/// SET values by NAME under the collation, both at the root and in the
+/// coprocessor's partial aggregate.
+#[test]
+fn min_max_over_enum_and_set_compare_names_under_the_collation() {
+    let mut s = Session::new();
+    s.run(
+        "create table tt(b enum('a', 'B', 'c'), c set('a', 'B', 'c')) collate utf8mb4_general_ci",
+    )
+    .unwrap();
+    s.run("insert into tt values ('a', 'a'), ('B', 'B'), ('c', 'c')")
+        .unwrap();
+    assert_eq!(
+        row_text(s.run("select min(b), max(b), min(c), max(c) from tt")),
+        vec![vec!["a", "c", "a", "c"]]
+    );
+    assert_eq!(
+        one(&mut s, "select /*+ AGG_TO_COP() */ min(b) from tt"),
+        "a"
+    );
+}
+
+/// Go `executeUse` sets `collation_database` from the schema, and the
+/// variable's hook mirrors `character_set_database`.
+#[test]
+fn use_sets_the_database_charset_variables() {
+    let mut s = Session::new();
+    s.run("create database cd_utf8 character set utf8 collate utf8_bin")
+        .unwrap();
+    s.run("use cd_utf8").unwrap();
+    assert_eq!(
+        row_text(s.run("select @@character_set_database, @@collation_database")),
+        vec![vec!["utf8", "utf8_bin"]]
+    );
+}
+
+/// `CONVERT(binary USING gb18030)` and the implicit `from_binary` are text in
+/// the target charset: SUBSTRING counts characters, and a hex literal against
+/// a gb18030 index converts once into the index's collation key.
+#[test]
+fn decoded_binary_is_text_in_the_target_charset() {
+    let mut s = Session::new();
+    assert_eq!(
+        one(
+            &mut s,
+            "select hex(substring(convert(0x81308131813081328130813381308134 using gb18030), 1, 2))"
+        ),
+        "8130813181308132"
+    );
+    s.run("create table g (c varchar(100) character set gb18030, key(c(20)))")
+        .unwrap();
+    s.run("insert into g values (0x8130883281308833)").unwrap();
+    assert_eq!(
+        row_text(s.run("select hex(c) from g where c = 0x8130883281308833")),
+        vec![vec!["8130883281308833"]]
+    );
+}
+
+/// Go `safeConvert`: a constant the derived charset cannot represent is an
+/// illegal mix ('ㅂ' has no GBK form).
+#[test]
+fn an_unrepresentable_constant_is_an_illegal_mix() {
+    let mut s = Session::new();
+    let (code, message) = error_of(
+        &mut s,
+        "select collation(concat('ㅂ', convert('啊' using gbk) collate gbk_bin))",
+    );
+    assert_eq!(code, 1267, "{message}");
+}

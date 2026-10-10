@@ -1877,6 +1877,14 @@ impl<'a, S: TableSource, C: Columns> PlanBuilder<'a, S, C> {
                         }),
                     );
                     constant.subquery_ref_id = id;
+                    // Go `constant.SetCoercibility(np.Schema().Columns[i].Coercibility())`:
+                    // `t.a = (SELECT a COLLATE utf8mb4_general_ci ...)` keeps
+                    // the subquery column's EXPLICIT collation.
+                    constant.collation.set_coercibility(
+                        tidb_expr::collation_derive::coercibility_of(&Expression::Column(
+                            column.clone(),
+                        )),
+                    );
                     constants.push(Expression::Constant(constant));
                 }
                 if constants.len() == 1 {

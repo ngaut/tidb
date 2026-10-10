@@ -767,7 +767,10 @@ pub fn build_cast_function(
         | FieldTypeCode::MediumBlob
         | FieldTypeCode::LongBlob
         | FieldTypeCode::Enum
-        | FieldTypeCode::Set => {
+        | FieldTypeCode::Set
+        // Go's `TypeNull` is `ETString`, so `castAsStringFunctionClass`
+        // builds its cast (`castCollationForIn` over an `IN (NULL)` member).
+        | FieldTypeCode::Null => {
             if target.charset_name() == "binary" {
                 "cast_binary"
             } else {
@@ -781,6 +784,58 @@ pub fn build_cast_function(
         target,
         vec![expr],
     )))
+}
+
+/// Go `BuildCastCollationFunction` (`builtin_cast.go:2577`): a string
+/// operand whose collation is not the derived one is cast to it, so a
+/// comparison built over the operands afterwards compares under that one
+/// collation. `None` is Go's `return expr`: a non-string operand, one already
+/// in the collation, or an ENUM/SET compared as a number.
+///
+/// A character string cast to the binary charset becomes a VARSTRING, not a
+/// fixed-length BINARY: zero padding would change what it compares equal to.
+///
+/// `fold` is Go `BuildCastFunction`'s closing `FoldConstant`, which the
+/// caller supplies with its statement context.
+pub(crate) fn build_cast_collation_function(
+    expr: &Expression,
+    ec: &crate::expr_collation::ExprCollation,
+    enum_or_set_real_type_is_str: bool,
+    fold: &dyn Fn(&mut Expression),
+) -> Result<Option<Expression>, EvalError> {
+    let Some(source) = expr.static_type() else {
+        return Ok(None);
+    };
+    if source.eval_type() != tidb_datatype::EvalType::String
+        || source.collation_name() == ec.collation
+    {
+        return Ok(None);
+    }
+    let mut target = source.clone();
+    if source.is_hybrid() {
+        if !enum_or_set_real_type_is_str {
+            return Ok(None);
+        }
+        target = FieldType::new(FieldTypeCode::VarString);
+    } else if ec.charset == "binary" {
+        target.set_code(FieldTypeCode::VarString);
+    }
+    target.set_charset_name(ec.charset.clone());
+    target.set_collation_name(ec.collation.clone());
+    let mut cast = build_cast_function(expr.clone(), target, false)?;
+    // Go's `ast.Cast` arm of `deriveCollation`: the cast keeps its operand's
+    // coercibility and repertoire; the collation is the target's.
+    crate::collation_derive::apply_derived_collation(
+        &mut cast,
+        &crate::expr_collation::ExprCollation {
+            coer: crate::collation_derive::coercibility_of(expr),
+            repe: crate::collation_derive::repertoire_of(expr),
+            charset: ec.charset.clone(),
+            collation: ec.collation.clone(),
+        },
+    );
+    fold(&mut cast);
+    Ok(Some(cast))
 }
 
 /// Go `composeConditionWithBinaryOp` (`expression.go:825`): folds

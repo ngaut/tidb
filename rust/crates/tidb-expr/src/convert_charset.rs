@@ -180,8 +180,11 @@ pub fn from_binary(
     let (decoded, error) = find_encoding(target_charset)
         .transform(&bytes, TransformOp::DECODE)
         .into_parts();
+    // The decoded UTF-8 is text in the target charset, not binary: a later
+    // conversion to that charset (the ranger's point conversion) must not
+    // decode it a second time.
     if error.is_none() {
-        return Ok(Datum::new_bytes(decoded));
+        return Ok(retag(decoded, target_charset));
     }
     let error = tidb_error::terror::TerrorError::registered_std(
         tidb_error::terror::TerrorClass::Expression,
@@ -206,7 +209,7 @@ pub fn from_binary(
     if ctx.strict_sql_mode() {
         return Ok(Datum::Null);
     }
-    Ok(Datum::new_bytes(decoded))
+    Ok(retag(decoded, target_charset))
 }
 
 /// Go `util.FmtNonASCIIPrintableCharToHex`: printable ASCII as itself,
@@ -261,10 +264,13 @@ pub fn convert_using(
         let (decoded, error) = find_encoding(result_charset)
             .transform(&bytes, TransformOp::DECODE_REPLACE)
             .into_parts();
+        // The decoded text carries the target charset, as Go's result type
+        // does, so a later SUBSTRING or LEFT counts its characters rather
+        // than its UTF-8 bytes.
         return Ok(if error.is_some() {
             Datum::Null
         } else {
-            Datum::new_bytes(decoded)
+            retag(decoded, result_charset)
         });
     }
     if result_is_binary {
