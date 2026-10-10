@@ -21,6 +21,10 @@ pub(crate) struct MergeJoinKey {
     pub(crate) left: usize,
     /// Column offset within the right child's row.
     pub(crate) right: usize,
+    /// Go `GetCmpFunction(lhs, rhs)`'s string collation: the one
+    /// `CheckAndDeriveCollationFromExprs` derives from BOTH keys, which is
+    /// what decides whether two keys of different collations are equal.
+    pub(crate) collation: tidb_datatype::Collation,
 }
 
 /// The key order retained by Go's `PhysicalMergeJoin`.

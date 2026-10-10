@@ -300,7 +300,16 @@ pub(crate) fn append_join_projection_expr(
     let ret_type = expression.static_type().cloned().ok_or_else(|| {
         PlanError::internal("LogicalProjection.AppendExpr: expression has no static type")
     })?;
-    let column = Column::new(ctx.column_allocator.alloc(), ret_type);
+    let mut column = Column::new(ctx.column_allocator.alloc(), ret_type);
+    // Go `AppendExpr`: the new column keeps the expression's coercibility and
+    // repertoire, so a `COLLATE`d join key stays EXPLICIT on the projection
+    // output and the rebuilt equality compares under that collation.
+    column
+        .collation
+        .set_coercibility(tidb_expr::collation_derive::coercibility_of(&expression));
+    column
+        .collation
+        .set_repertoire(tidb_expr::collation_derive::repertoire_of(&expression));
     projection.exprs.push(expression);
     let mut schema = schema;
     schema.columns.push(column.clone());

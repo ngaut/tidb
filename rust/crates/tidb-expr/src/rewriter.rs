@@ -1891,14 +1891,20 @@ fn rewrite_leaf_literal(
             let Some(collation) = tidb_datatype::Collation::from_name(&name) else {
                 return Err(EvalError::UnknownCollation(name));
             };
+            let is_json = arg
+                .static_type()
+                .is_some_and(|ft| ft.code() == FieldTypeCode::Json);
             // go's FieldType for every NON-string result (numerics,
             // temporals) carries Charset 'binary', so `LOCATE(...) COLLATE
             // utf8mb4_general_ci` is 1253 against 'binary' even though the
             // signature's placeholder type left the charset at its default.
+            // A JSON value's charset is always utf8mb4.
             let arg_charset = arg
                 .static_type()
                 .map(|ft| {
-                    if ft.is_string() {
+                    if is_json {
+                        "utf8mb4".to_owned()
+                    } else if ft.is_string() {
                         ft.charset_name().to_owned()
                     } else {
                         "binary".to_owned()
@@ -1910,6 +1916,30 @@ fn rewrite_leaf_literal(
                     collation: name,
                     charset: arg_charset,
                 });
+            }
+            // Go: a COLUMN (or JSON) argument is wrapped in a CAST so the
+            // column's own FieldType stays untouched -- which is what makes
+            // `GROUP BY a COLLATE utf8mb4_bin` group by the cast rather than
+            // by `a` under its declared collation. Constants and scalar
+            // functions take the collation in place.
+            if matches!(arg, Expression::Column(_)) || is_json {
+                if arg
+                    .static_type()
+                    .is_some_and(|ft| matches!(ft.code(), FieldTypeCode::Enum | FieldTypeCode::Set))
+                {
+                    return Err(EvalError::Unsupported("use collate clause for enum or set"));
+                }
+                let mut expr_type = if is_json {
+                    let mut long_blob = FieldType::new(FieldTypeCode::LongBlob);
+                    long_blob.set_charset_name("utf8mb4");
+                    long_blob
+                } else {
+                    arg.static_type()
+                        .cloned()
+                        .unwrap_or_else(|| FieldType::new(FieldTypeCode::VarString))
+                };
+                expr_type.set_collation_name(collation.name());
+                arg = crate::simple_expr::build_cast_function(arg, expr_type, false)?;
             }
             crate::collation_derive::set_explicit_collation(&mut arg, collation);
             Ok(arg)

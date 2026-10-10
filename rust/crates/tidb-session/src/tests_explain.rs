@@ -5778,3 +5778,40 @@ fn force_inlined_ctes_keep_their_aliases_and_merge_warns_off_the_cte_body() {
         "{warnings:?}"
     );
 }
+
+/// Go `StmtCtx.SetHintWarning` from the expression rewriter: subquery hint
+/// warnings reach the statement (`NO_DECORRELATE()` with
+/// `SEMI_JOIN_REWRITE()`, or with no correlated columns).
+#[test]
+fn subquery_hint_warnings_reach_the_statement() {
+    let mut session = Session::new();
+    session.run("create table t1 (a int, b int)").unwrap();
+    session.run("create table t3 (a int, b int)").unwrap();
+    session
+        .run(
+            "select exists (select /*+ semi_join_rewrite(), no_decorrelate() */ * \
+             from t1 where t1.a = t3.a) from t3",
+        )
+        .unwrap();
+    let warnings = row_text(session.run("show warnings"));
+    assert_eq!(
+        warnings,
+        vec![vec![
+            "Warning",
+            "1815",
+            "NO_DECORRELATE() and SEMI_JOIN_REWRITE() are in conflict. Both will be ineffective."
+        ]]
+    );
+    session
+        .run("select t1.a, t1.b not in (select /*+ no_decorrelate() */ t3.b from t3) from t1")
+        .unwrap();
+    let warnings = row_text(session.run("show warnings"));
+    assert_eq!(
+        warnings,
+        vec![vec![
+            "Warning",
+            "1815",
+            "NO_DECORRELATE() is inapplicable because there are no correlated columns."
+        ]]
+    );
+}

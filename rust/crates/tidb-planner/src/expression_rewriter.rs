@@ -778,6 +778,17 @@ impl CompareOp {
     }
 }
 
+impl<C: Columns> Drop for ExpressionRewriter<'_, C> {
+    /// Go `StmtCtx.SetHintWarning`: each hint warning the rewrite raised --
+    /// `NO_DECORRELATE()` inapplicable or in conflict with
+    /// `SEMI_JOIN_REWRITE()` -- is a statement warning (1815).
+    fn drop(&mut self) {
+        for warning in self.hint_warnings.drain(..) {
+            self.env.ctx.append_warning(1815, &warning);
+        }
+    }
+}
+
 impl<'a, C: Columns> ExpressionRewriter<'a, C> {
     /// A rewriter over `env`, with an empty stack.
     #[must_use]

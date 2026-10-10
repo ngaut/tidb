@@ -59,7 +59,11 @@ fn large_duplicate_group_merge(memory: StatementMemory) -> super::JoinExec<tidb_
         memory,
     );
     join.set_merge_plan(MergeJoinPlan {
-        keys: vec![MergeJoinKey { left: 0, right: 0 }],
+        keys: vec![MergeJoinKey {
+            left: 0,
+            right: 0,
+            collation: tidb_datatype::Collation::Binary,
+        }],
         desc: false,
     });
     join
@@ -86,7 +90,11 @@ fn merge_path_matches_the_hash_path_row_for_row() {
         let right = sorted_fixture(200, 5, true);
         let mut merged = join_of(kind, vec![eq_on(0, 0, 2)], left.clone(), right.clone(), 2);
         merged.set_merge_plan(MergeJoinPlan {
-            keys: vec![MergeJoinKey { left: 0, right: 0 }],
+            keys: vec![MergeJoinKey {
+                left: 0,
+                right: 0,
+                collation: tidb_datatype::Collation::Binary,
+            }],
             desc: false,
         });
         assert!(merged.is_merge_join());
@@ -116,7 +124,11 @@ fn residual_conditions_still_filter_merged_groups() {
         2,
     );
     merged.set_merge_plan(MergeJoinPlan {
-        keys: vec![MergeJoinKey { left: 0, right: 0 }],
+        keys: vec![MergeJoinKey {
+            left: 0,
+            right: 0,
+            collation: tidb_datatype::Collation::Binary,
+        }],
         desc: false,
     });
     let mut hashed = join_of(JoinKind::Left, conditions, left, right, 2);
@@ -139,10 +151,18 @@ fn a_descending_merge_finds_the_same_matches() {
                 row.swap(0, 1);
             }
             let mut conditions = vec![eq_on(0, 1, 2)];
-            let mut keys = vec![MergeJoinKey { left: 0, right: 1 }];
+            let mut keys = vec![MergeJoinKey {
+                left: 0,
+                right: 1,
+                collation: tidb_datatype::Collation::Binary,
+            }];
             if composite {
                 conditions.push(eq_on(1, 0, 2));
-                keys.push(MergeJoinKey { left: 1, right: 0 });
+                keys.push(MergeJoinKey {
+                    left: 1,
+                    right: 0,
+                    collation: tidb_datatype::Collation::Binary,
+                });
             }
             let mut merged = join_of(kind, conditions.clone(), left.clone(), right.clone(), 2);
             merged.set_merge_plan(MergeJoinPlan { keys, desc: true });
@@ -169,7 +189,11 @@ fn an_empty_side_still_emits_the_preserved_rows() {
         let left = sorted_fixture(30, 7, false);
         let mut merged = join_of(kind, vec![eq_on(0, 0, 2)], left, Vec::new(), 2);
         merged.set_merge_plan(MergeJoinPlan {
-            keys: vec![MergeJoinKey { left: 0, right: 0 }],
+            keys: vec![MergeJoinKey {
+                left: 0,
+                right: 0,
+                collation: tidb_datatype::Collation::Binary,
+            }],
             desc: false,
         });
         assert_eq!(run(&mut merged).len(), expected, "{kind:?}");
@@ -190,7 +214,11 @@ fn a_group_spanning_chunks_is_still_one_group() {
     for (left, right) in [(large.clone(), small.clone()), (small, large)] {
         let mut merged = join_of(JoinKind::Inner, vec![eq_on(0, 0, 2)], left, right, 2);
         merged.set_merge_plan(MergeJoinPlan {
-            keys: vec![MergeJoinKey { left: 0, right: 0 }],
+            keys: vec![MergeJoinKey {
+                left: 0,
+                right: 0,
+                collation: tidb_datatype::Collation::Binary,
+            }],
             desc: false,
         });
         let rows = run(&mut merged);
@@ -211,7 +239,11 @@ fn a_single_row_inner_group_uses_child_until_chunk_boundary() {
     let right = left.clone();
     let mut merged = join_of(JoinKind::Inner, vec![eq_on(0, 0, 2)], left, right, 2);
     merged.set_merge_plan(MergeJoinPlan {
-        keys: vec![MergeJoinKey { left: 0, right: 0 }],
+        keys: vec![MergeJoinKey {
+            left: 0,
+            right: 0,
+            collation: tidb_datatype::Collation::Binary,
+        }],
         desc: false,
     });
     merged.open().unwrap();
@@ -260,7 +292,11 @@ fn a_large_outer_duplicate_run_remains_streaming() {
             StatementMemory::new(64 * 1024, OomAction::Cancel, 1),
         );
         merged.set_merge_plan(MergeJoinPlan {
-            keys: vec![MergeJoinKey { left: 0, right: 0 }],
+            keys: vec![MergeJoinKey {
+                left: 0,
+                right: 0,
+                collation: tidb_datatype::Collation::Binary,
+            }],
             desc: false,
         });
 
@@ -335,7 +371,11 @@ fn right_merge_spills_its_left_inner_group() {
             memory,
         );
         join.set_merge_plan(MergeJoinPlan {
-            keys: vec![MergeJoinKey { left: 0, right: 0 }],
+            keys: vec![MergeJoinKey {
+                left: 0,
+                right: 0,
+                collation: tidb_datatype::Collation::Binary,
+            }],
             desc: false,
         });
         join
@@ -439,7 +479,11 @@ fn merge_join_executes_the_marker_kinds() {
             2,
         );
         join.set_merge_plan(MergeJoinPlan {
-            keys: vec![MergeJoinKey { left: 0, right: 0 }],
+            keys: vec![MergeJoinKey {
+                left: 0,
+                right: 0,
+                collation: tidb_datatype::Collation::Binary,
+            }],
             desc: false,
         });
         assert!(join.is_merge_join(), "{kind:?} must run as a merge join");

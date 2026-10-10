@@ -2383,9 +2383,25 @@ fn join_equality_with_null(
     schema: &Schema,
     null_safe: bool,
 ) -> Result<Expression, DriverError> {
+    join_equality_with_collation(left, right, schema, null_safe, None)
+}
+
+/// [`join_equality_with_null`] comparing strings under `collation`, which the
+/// comparison's result type carries.
+fn join_equality_with_collation(
+    left: &Column,
+    right: &Column,
+    schema: &Schema,
+    null_safe: bool,
+    collation: Option<tidb_datatype::Collation>,
+) -> Result<Expression, DriverError> {
+    let mut ret_type = FieldType::new(FieldTypeCode::Tiny);
+    if let Some(collation) = collation {
+        ret_type.set_collation(collation);
+    }
     let expression = Expression::ScalarFunction(ScalarFunction::new(
         tidb_ast::CiString::new(if null_safe { "nulleq" } else { "eq" }),
-        FieldType::new(FieldTypeCode::Tiny),
+        ret_type,
         vec![
             Expression::Column(left.clone()),
             Expression::Column(right.clone()),
@@ -3212,16 +3228,30 @@ fn build_index_join(
     } else {
         (&join.outer_hash_keys, &join.inner_hash_keys)
     };
+    // Go `buildIndexLookUpJoin`: "Use the probe table's collation" -- the
+    // lookup keys and the outer hash types both take the INNER key's
+    // collation, so `ascii_bin` 'A' finds and matches `general_ci` 'a'.
+    let inner_keys = if join.inner_child_idx == 0 {
+        left_keys
+    } else {
+        right_keys
+    };
     let mut conditions = left_keys
         .iter()
         .zip(right_keys)
         .enumerate()
         .map(|(index, (left, right))| {
-            join_equality_with_null(
+            let collation = inner_keys
+                .get(index)
+                .and_then(|inner| inner.ret_type.as_ref())
+                .filter(|field_type| field_type.eval_type() == tidb_datatype::EvalType::String)
+                .map(FieldType::collation);
+            join_equality_with_collation(
                 left,
                 right,
                 &condition_schema,
                 join.is_null_eq.get(index).copied().unwrap_or(false),
+                collation,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -3927,22 +3957,43 @@ fn join_key_offsets(
     left_keys
         .iter()
         .zip(right_keys)
-        .map(|(left, right)| {
+        .map(|(left_key, right_key)| {
             let left = left_schema
                 .columns
                 .iter()
-                .position(|column| column.unique_id == left.unique_id)
+                .position(|column| column.unique_id == left_key.unique_id)
                 .ok_or_else(|| {
                     DriverError::unsupported("a physical merge key is absent on the left")
                 })?;
             let right = right_schema
                 .columns
                 .iter()
-                .position(|column| column.unique_id == right.unique_id)
+                .position(|column| column.unique_id == right_key.unique_id)
                 .ok_or_else(|| {
                     DriverError::unsupported("a physical merge key is absent on the right")
                 })?;
-            Ok(crate::merge_join_plan::MergeJoinKey { left, right })
+            // Go `GetCmpFunction(lhs, rhs)` compares strings under the
+            // collation `CheckAndDeriveCollationFromExprs` derives from both.
+            let fallback = left_key
+                .ret_type
+                .as_ref()
+                .map_or(tidb_datatype::Collation::Binary, |ty| ty.collation());
+            let collation = tidb_expr::collation_derive::check_and_derive_collation_from_exprs(
+                "",
+                tidb_datatype::EvalType::Int,
+                &[
+                    tidb_expr::expression::Expression::Column(left_key.clone()),
+                    tidb_expr::expression::Expression::Column(right_key.clone()),
+                ],
+            )
+            .ok()
+            .and_then(|derived| tidb_datatype::Collation::from_name(&derived.collation))
+            .unwrap_or(fallback);
+            Ok(crate::merge_join_plan::MergeJoinKey {
+                left,
+                right,
+                collation,
+            })
         })
         .collect()
 }

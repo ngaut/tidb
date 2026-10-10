@@ -3325,6 +3325,8 @@ impl<C: Columns + Clone + Send + Sync + 'static> JoinExec<C> {
         let desc = plan.desc;
         let left_keys: Vec<usize> = plan.keys.iter().map(|key| key.left).collect();
         let right_keys: Vec<usize> = plan.keys.iter().map(|key| key.right).collect();
+        let key_collations: Vec<tidb_datatype::Collation> =
+            plan.keys.iter().map(|key| key.collation).collect();
         let left_types = self.left_types.clone();
         let right_types = self.right_types.clone();
         let outer_is_left = self.outer_is_left();
@@ -3483,6 +3485,7 @@ impl<C: Columns + Clone + Send + Sync + 'static> JoinExec<C> {
                         inner_keys,
                         outer_types,
                         inner_types,
+                        &key_collations,
                         desc,
                     )
                 })?;
@@ -6002,11 +6005,13 @@ fn merge_join_rows_cmp(
     right_keys: &[usize],
     left_types: &[FieldType],
     right_types: &[FieldType],
+    collations: &[tidb_datatype::Collation],
     desc: bool,
 ) -> Result<Ordering, ExecError> {
     // Go MergeJoinExec.compare reads both current rows. Select the integer
     // comparison only when both columns have that domain; mixed domains keep
-    // the canonical datum comparison and the outer key's collation.
+    // the canonical datum comparison under the key pair's derived collation
+    // (Go `GetCmpFunction`).
     let signed_integer = |ft: &FieldType| {
         matches!(
             ft.code(),
@@ -6017,7 +6022,7 @@ fn merge_join_rows_cmp(
                 | tidb_datatype::FieldTypeCode::LongLong
         ) && !ft.is_unsigned()
     };
-    for (&left_offset, &right_offset) in left_keys.iter().zip(right_keys) {
+    for (key, (&left_offset, &right_offset)) in left_keys.iter().zip(right_keys).enumerate() {
         let left_type = &left_types[left_offset];
         let right_type = &right_types[right_offset];
         let (left_null, right_null) = (left.is_null(left_offset), right.is_null(right_offset));
@@ -6030,7 +6035,10 @@ fn merge_join_rows_cmp(
             tidb_expr::compare_datums_with_collation(
                 &left.get_datum(left_offset, left_type),
                 &right.get_datum(right_offset, right_type),
-                left_type.collation(),
+                collations
+                    .get(key)
+                    .copied()
+                    .unwrap_or_else(|| left_type.collation()),
             )?
         };
         if desc {

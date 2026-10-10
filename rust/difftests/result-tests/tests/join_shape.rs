@@ -588,19 +588,26 @@ fn join_operators_and_their_keep_order_match_recorded_tidb_plans() {
 
     // Recorded snapshot, not complete join parity. Every count moved the
     // right way when it was last re-recorded (more plans compared, all merge
-    // pairs reproduced, none extra); the six disagreements left are the
+    // pairs reproduced, none extra); the five disagreements left are the
     // TIDB_SMJ hint over a cross or other-condition join (four statements)
-    // and two subqueries Go decorrelates. The 757th plan is push_down's
+    // and rule_constant_propagation's `update t1 set value = (select
+    // count(*) ...)`, whose subquery Go decorrelates into a HashJoin. The
+    // other decorrelated subquery that disagreed now agrees. The 757th plan is push_down's
     // `t4a8656d1 join tld47bc815`, reachable once its multi-valued index
     // could be created: TiDB records an inner HashJoin with no keep order
     // (push_down.result:264), which the port reproduces. Plans 758-781 (and
     // the 115th merge pair) come from executor/index_merge_reader and the
     // planner's index, grouped-range and indexmerge_path topics, and all
-    // agree. Inspect recorded witnesses before updating these counts.
-    const COMPARED: usize = 781;
-    const BOTH_AGREE: usize = 775;
-    const RECORDED_MERGE_PAIRS: usize = 115;
-    const AGREED_MERGE_PAIRS: usize = 115;
+    // agree. Plans 782-785 (merge pairs 116-119) are
+    // join_reorder_through_projection's four `t1 join joined_cte cte`
+    // statements, reachable once an inlined CTE reference takes its alias:
+    // TiDB records MergeJoins on both sides of the CTE's Projection
+    // (join_reorder_through_projection.result:62), which the port
+    // reproduces. Inspect recorded witnesses before updating these counts.
+    const COMPARED: usize = 785;
+    const BOTH_AGREE: usize = 780;
+    const RECORDED_MERGE_PAIRS: usize = 119;
+    const AGREED_MERGE_PAIRS: usize = 119;
     const EXTRA_MERGE_PAIRS: usize = 0;
 
     assert_eq!(

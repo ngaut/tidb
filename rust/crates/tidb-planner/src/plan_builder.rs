@@ -2111,6 +2111,9 @@ impl<'a, S: TableSource, C: Columns> PlanBuilder<'a, S, C> {
                     // `#const#N` marker so the enclosing predicate's rewrite
                     // resolves it through [`PlanScopeResolver`] exactly like a
                     // column marker resolves to the Apply output.
+                    // The rewriter's hint warnings flush on drop, before the
+                    // builder is written.
+                    drop(rewriter);
                     let index = self.builder.subquery_constants.len();
                     self.builder.subquery_constants.push(value);
                     *expr = PlanMarker::new(MarkerKind::Constant, index).as_expr();
@@ -3747,7 +3750,14 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
                         .static_type()
                         .cloned()
                         .unwrap_or_else(|| FieldType::new(FieldTypeCode::LongLong));
-                    Column::new(self.column_ids.alloc(), ret_type)
+                    let column = Column::new(self.column_ids.alloc(), ret_type);
+                    // Go `buildProjectionField`:
+                    // `newCol.SetCoercibility(expr.Coercibility())`, so a
+                    // `COLLATE`d field stays EXPLICIT for a UNION above.
+                    column
+                        .collation
+                        .set_coercibility(tidb_expr::collation_derive::coercibility_of(&built));
+                    column
                 }
             };
             output.index = projection_columns.len() as i64;

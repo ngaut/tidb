@@ -1052,6 +1052,18 @@ fn exhaust_physical_plans(
                         else {
                             continue;
                         };
+                        // Go `getEnforcedMergeJoin`: a keyless merge join (the
+                        // keys' collations conflict) evaluates its equal
+                        // conditions as other conditions.
+                        let mut other_conditions = op.other_conditions.clone();
+                        if left_join_keys.is_empty() {
+                            other_conditions.extend(
+                                op.equal_conditions
+                                    .iter()
+                                    .cloned()
+                                    .map(tidb_expr::expression::Expression::ScalarFunction),
+                            );
+                        }
                         PhysicalPlan::MergeJoin(physical::PhysicalMergeJoin {
                             base,
                             join_type: op.join_type,
@@ -1060,7 +1072,7 @@ fn exhaust_physical_plans(
                             is_null_eq: Vec::new(),
                             left_conditions: op.left_conditions.clone(),
                             right_conditions: op.right_conditions.clone(),
-                            other_conditions: op.other_conditions.clone(),
+                            other_conditions,
                             default_values: op.default_values.clone(),
                             desc,
                         })

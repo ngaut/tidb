@@ -439,3 +439,79 @@ fn collate_clause_must_match_the_charset() {
         )
     );
 }
+
+/// Go `checkJoinKeyCollation`: a merge join cannot key on a binary column
+/// paired with a `general_ci` one, so the equality becomes an other
+/// condition evaluated under the derived (binary) collation.
+#[test]
+fn a_merge_join_over_conflicting_collations_compares_as_binary() {
+    let mut s = Session::new();
+    s.run("create table t1 (id int, v varchar(5) character set binary, key(v))")
+        .unwrap();
+    s.run(
+        "create table t2 (v varchar(5) character set utf8mb4 collate utf8mb4_general_ci, key(v))",
+    )
+    .unwrap();
+    s.run("insert into t1 values (1, 'a'), (2, 'À'), (3, 'b')")
+        .unwrap();
+    s.run("insert into t2 values ('a'), ('À'), ('b')").unwrap();
+    let rows = row_text(s.run(
+        "select /*+ TIDB_SMJ(t1, t2) */ t1.id, t2.v from t1, t2 where t1.v = t2.v order by t1.id",
+    ));
+    assert_eq!(rows, vec![vec!["1", "a"], vec!["2", "À"], vec!["3", "b"]]);
+}
+
+/// Go `buildIndexLookUpJoin` ("Use the probe table's collation"): an
+/// `ascii_bin` outer key finds and matches the `general_ci` inner index.
+#[test]
+fn an_index_join_matches_under_the_inner_key_collation() {
+    let mut s = Session::new();
+    s.run("create table a1 (a int, b char(10), key(b)) collate utf8mb4_general_ci")
+        .unwrap();
+    s.run("create table a2 (a int, b char(10), key(b)) collate ascii_bin")
+        .unwrap();
+    s.run("insert into a1 values (1, 'a')").unwrap();
+    s.run("insert into a2 values (1, 'A'), (2, 'a')").unwrap();
+    let mut joined =
+        row_text(s.run("select /*+ inl_join(a1) */ a1.b, a2.b from a1 join a2 where a1.b = a2.b"));
+    joined.sort();
+    assert_eq!(joined, vec![vec!["a", "A"], vec!["a", "a"]]);
+}
+
+/// Go `SetCollationExpr`: `a COLLATE x` over a column is a CAST, so the
+/// GROUP BY groups under `utf8mb4_bin`, not the column's `general_ci`.
+#[test]
+fn group_by_a_collated_column_groups_by_the_collation() {
+    let mut s = Session::new();
+    s.run("create table g (a char(10) collate utf8mb4_general_ci)")
+        .unwrap();
+    s.run("insert into g values ('a'), ('A'), ('a')").unwrap();
+    let mut counts = row_text(s.run("select count(1) from g group by a collate utf8mb4_bin"));
+    counts.sort();
+    assert_eq!(counts, vec![vec!["1"], vec!["2"]]);
+}
+
+/// Go `LogicalProjection.AppendExpr` and `buildProjectionField` keep the
+/// expression's coercibility on the column they create: a `COLLATE`d join
+/// key projected below the join, and a `COLLATE`d select field under a
+/// UNION, stay EXPLICIT.
+#[test]
+fn projected_collate_expressions_stay_explicit() {
+    let mut s = Session::new();
+    s.run("create table t (a varchar(10) collate utf8mb4_bin, b varchar(10) collate utf8mb4_general_ci, d date, i int)")
+        .unwrap();
+    s.run("insert into t values ('a', 'A', '2020-01-01', 1)")
+        .unwrap();
+    assert_eq!(
+        row_text(
+            s.run("select t1.a, t2.b from t t1, t t2 where t1.a = t2.b collate utf8mb4_general_ci")
+        ),
+        vec![vec!["a", "A"]]
+    );
+    assert_eq!(
+        row_text(s.run(
+            "select distinct collation(c) from (select d c from t union select i collate binary c from t) x"
+        )),
+        vec![vec!["binary"]]
+    );
+}

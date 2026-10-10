@@ -186,6 +186,10 @@ pub struct LogicalJoin {
     /// Whether the join carries null-aware equality keys (Go
     /// `LogicalJoin.NAEQConditions`); `CanUseHashJoinV2` refuses them.
     pub has_na_keys: bool,
+    /// Go `checkJoinKeyCollation`, per key pair: both keys are strings whose
+    /// charset or collation differ, so their children sort differently and a
+    /// merge join cannot use the pair as a key.
+    pub key_collation_conflicts: Vec<bool>,
 }
 
 /// Which parent an access path answers to.
@@ -495,8 +499,20 @@ fn enforced_merge_join_candidates(
             offsets.push(at);
         }
     }
-    let left_keys: Vec<i64> = offsets.iter().map(|at| join.left_keys[*at]).collect();
-    let right_keys: Vec<i64> = offsets.iter().map(|at| join.right_keys[*at]).collect();
+    let mut left_keys: Vec<i64> = offsets.iter().map(|at| join.left_keys[*at]).collect();
+    let mut right_keys: Vec<i64> = offsets.iter().map(|at| join.right_keys[*at]).collect();
+    // Go `checkJoinKeyCollation` (`physical_merge_join.go:200`): conflicting
+    // collations leave the join with no keys; its equal conditions become
+    // other conditions when the plan is materialized.
+    if offsets.iter().any(|at| {
+        join.key_collation_conflicts
+            .get(*at)
+            .copied()
+            .unwrap_or(false)
+    }) {
+        left_keys.clear();
+        right_keys.clear();
+    }
     let child_prop = |keys: &[i64]| PhysicalProperty {
         sort_items: keys.iter().map(|col| SortItem::new(*col, desc)).collect(),
         task_tp: TaskType::Root,
@@ -546,6 +562,15 @@ fn merge_join_candidates(join: &LogicalJoin, prop: &PhysicalProperty) -> Vec<Enu
         }
         let left_keys = left_keys[..prefix_len].to_vec();
         let right_keys = right_keys[..prefix_len].to_vec();
+        // Go `checkJoinKeyCollation` (`physical_merge_join.go:98`).
+        if offsets[..prefix_len].iter().any(|at| {
+            join.key_collation_conflicts
+                .get(*at)
+                .copied()
+                .unwrap_or(false)
+        }) {
+            continue;
+        }
         let Some(child_props) =
             merge_join_child_props(join.join_type, &left_keys, &right_keys, prop)
         else {
@@ -735,6 +760,21 @@ pub(crate) fn project_one_join(
     };
     let keys_contain_enum_or_set =
         left_key_cols.iter().any(&is_enum_or_set) || right_key_cols.iter().any(&is_enum_or_set);
+    let key_collation_conflicts = left_key_cols
+        .iter()
+        .zip(&right_key_cols)
+        .map(
+            |(left, right)| match (left.ret_type.as_ref(), right.ret_type.as_ref()) {
+                (Some(left), Some(right)) => {
+                    left.eval_type() == tidb_datatype::EvalType::String
+                        && right.eval_type() == tidb_datatype::EvalType::String
+                        && (left.charset() != right.charset()
+                            || left.collation_name() != right.collation_name())
+                }
+                _ => false,
+            },
+        )
+        .collect();
     let schema_ids = |child: &LogicalPlan| -> Vec<i64> {
         // Builder output carries a schema on or near every join child; the
         // lookup recurses only through schema-less pass-throughs.
@@ -759,6 +799,7 @@ pub(crate) fn project_one_join(
         has_null_eq,
         keys_contain_enum_or_set,
         has_na_keys: !left_na_keys.is_empty(),
+        key_collation_conflicts,
     })
 }
 
@@ -789,6 +830,7 @@ mod tests {
             has_null_eq: false,
             keys_contain_enum_or_set: false,
             has_na_keys: false,
+            key_collation_conflicts: Vec::new(),
         };
         let prop = PhysicalProperty::default();
         let candidates = merge_join_candidates(&join, &prop);
@@ -818,6 +860,7 @@ mod tests {
             has_null_eq: false,
             keys_contain_enum_or_set: false,
             has_na_keys: false,
+            key_collation_conflicts: Vec::new(),
         };
         let prop = PhysicalProperty {
             cte_producer_status: CteProducerStatus::AllCteCanMpp,
