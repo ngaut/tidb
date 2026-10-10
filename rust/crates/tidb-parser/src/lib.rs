@@ -159,6 +159,21 @@ impl ParseError {
     }
 }
 
+/// Go `HandParser.calcLineCol`: the yacc reader's position after `limit`
+/// bytes, counting a newline as the first column of its new line.
+fn go_line_column(source: &str, limit: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut column = 0;
+    for byte in source.as_bytes().iter().take(limit) {
+        if *byte == b'\n' {
+            line += 1;
+            column = 0;
+        }
+        column += 1;
+    }
+    (line, column)
+}
+
 /// The Go terror class of each errno this parser raises through
 /// `Parser::err_coded` with a bare message.
 fn go_terror_class(errno: u16) -> Option<&'static str> {
@@ -917,9 +932,34 @@ impl Parser {
         self.param_marker_position = 0;
     }
 
-    fn warn(&mut self, message: &'static str) {
+    /// Go `HandParser.warnNear(p.peek().Offset, ...)`: a recoverable warning
+    /// in the yacc scanner's layout, anchored at the next token with the rest
+    /// of the source quoted. It is no terror, so the session's
+    /// `util.SyntaxWarn` reports it as `ErrParse` (1064) behind the syntax
+    /// prefix.
+    fn warn_near_next(&mut self, message: &str) {
+        let offset = self.peek().offset.min(self.source.len());
+        let (line, column) = go_line_column(&self.source, offset);
+        let mut near_end = (offset + 2048).min(self.source.len());
+        while !self.source.is_char_boundary(near_end) {
+            near_end -= 1;
+        }
+        let near = &self.source[offset..near_end];
         self.warnings.push(HintDiagnostic {
-            message: message.to_owned(),
+            message: format!(
+                "[parser:1064]You have an error in your SQL syntax; check the manual that \
+                 corresponds to your TiDB version for the right syntax to use line {line} \
+                 column {column} near \"{near}\"{message} "
+            ),
+        });
+    }
+
+    /// A terror-coded parser warning (`p.warns = append(p.warns,
+    /// ErrX.FastGenByArgs(...))`), which `util.SyntaxWarn` passes through
+    /// with its own code.
+    fn warn_coded(&mut self, code: u16, message: &str) {
+        self.warnings.push(HintDiagnostic {
+            message: format!("[parser:{code}]{message}"),
         });
     }
 

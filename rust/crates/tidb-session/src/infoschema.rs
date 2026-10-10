@@ -112,12 +112,40 @@ impl SchemaVisibility {
     /// Go `RequestVerification(activeRoles, database, table, "", mask)`.
     #[must_use]
     fn allows(&self, database: &str, table: &str, mask: PrivMask) -> bool {
+        self.allows_bits(
+            database,
+            table,
+            match mask {
+                PrivMask::Any => crate::privilege::any_priv_mask(),
+                PrivMask::Column => crate::privilege::column_privs_mask(),
+            },
+        )
+    }
+
+    /// Go `dataForColumnsInTable`'s `priv`: each of `mysql.AllColumnPrivs`
+    /// the session holds on the table, joined lower-case as `PrivToString`
+    /// prints them. A session with no privilege checker sees all four.
+    fn column_privileges(&self, database: &str, table: &str) -> String {
+        use crate::privilege::GlobalPriv;
+        if self.context.is_none() {
+            return PRIVILEGES.to_owned();
+        }
+        [
+            (GlobalPriv::Select, "select"),
+            (GlobalPriv::Insert, "insert"),
+            (GlobalPriv::Update, "update"),
+            (GlobalPriv::References, "references"),
+        ]
+        .iter()
+        .filter(|(privilege, _)| self.allows_bits(database, table, privilege.bit()))
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>()
+        .join(",")
+    }
+
+    fn allows_bits(&self, database: &str, table: &str, mask: u64) -> bool {
         let Some(context) = &self.context else {
             return true;
-        };
-        let mask = match mask {
-            PrivMask::Any => crate::privilege::any_priv_mask(),
-            PrivMask::Column => crate::privilege::column_privs_mask(),
         };
         let has_restricted_tables_admin = context.registry.has_dynamic_priv_with_roles(
             &context.user,
@@ -2360,6 +2388,7 @@ fn columns_rows(
 ) -> Vec<Vec<Datum>> {
     let mut rows = Vec::new();
     for (schema, table_name) in visible_tables(catalog, visibility, PrivMask::Column) {
+        let privileges = visibility.column_privileges(&schema, &table_name);
         match catalog.table_in(&schema, &table_name) {
             Some(TableEntry::Kv(table)) => {
                 // Hidden columns are absent here, and ORDINAL_POSITION
@@ -2369,7 +2398,15 @@ fn columns_rows(
                 // Captured: a table with an expression index and columns
                 // `a`, `z` reports exactly a|1, z|2.
                 for (offset, column) in table.visible_columns().iter().enumerate() {
-                    rows.push(column_row(&schema, &table_name, table, offset, column, ctx));
+                    rows.push(column_row(
+                        &schema,
+                        &table_name,
+                        table,
+                        offset,
+                        column,
+                        &privileges,
+                        ctx,
+                    ));
                 }
             }
             // A view's columns are its body's, resolved now rather than
@@ -2389,6 +2426,7 @@ fn columns_rows(
                         name,
                         field_type,
                         offset,
+                        &privileges,
                     ));
                 }
             }
@@ -2405,6 +2443,7 @@ fn column_row(
     table: &KvTable,
     offset: usize,
     column: &tidb_executor::KvColumn,
+    privileges: &str,
     ctx: &tidb_executor::StmtContext,
 ) -> Vec<Datum> {
     let field_type = &column.field_type;
@@ -2473,7 +2512,7 @@ fn column_row(
                 .as_ref()
                 .is_some_and(tidb_executor::column_default::ColumnDefault::is_default_generated),
         )),
-        text(PRIVILEGES),
+        text(privileges),
         // Go `COLUMN_COMMENT`, from `ColumnInfo.Comment`.
         text(&column.comment),
         // Go `GENERATION_EXPRESSION`, `ColumnInfo.GeneratedExprString`.
@@ -2594,6 +2633,7 @@ fn view_column_row(
     name: &str,
     field_type: &FieldType,
     offset: usize,
+    privileges: &str,
 ) -> Vec<Datum> {
     let TypeCells {
         char_max,
@@ -2623,7 +2663,7 @@ fn view_column_row(
         text(&field_type.info_schema_str(STRICT_INTEGER_DISPLAY_WIDTH)),
         text(""),
         text(""),
-        text(PRIVILEGES),
+        text(privileges),
         text(""),
         text(""),
         Datum::Null,

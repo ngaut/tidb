@@ -153,7 +153,8 @@ impl Parser {
             }
             let global = if self.is_kw("GLOBAL") {
                 self.bump();
-                self.warn("'DROP STATS ... GLOBAL' is deprecated and will be removed in a future release. Please use DROP STATS ... instead");
+                // Go `ErrWarnDeprecatedSyntax` (1287).
+                self.warn_coded(1287, "'DROP STATS ... GLOBAL' is deprecated and will be removed in a future release. Please use DROP STATS ... instead");
                 true
             } else {
                 false
@@ -166,7 +167,8 @@ impl Parser {
                     self.bump();
                     partitions.push(self.parse_non_string_ident_like_name()?);
                 }
-                self.warn("'DROP STATS ... PARTITION ...' is deprecated and will be removed in a future release.");
+                // Go `ErrWarnDeprecatedSyntaxNoReplacement` (1681).
+                self.warn_coded(1681, "'DROP STATS ... PARTITION ...' is deprecated and will be removed in a future release.");
             }
             Ok(Stmt::Admin(tidb_ast::NodeBox::new(AdminStmt::DropStats(
                 Box::new(DropStatsStmt {

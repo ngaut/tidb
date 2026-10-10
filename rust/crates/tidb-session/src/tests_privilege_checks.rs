@@ -165,3 +165,81 @@ fn a_locking_read_needs_a_write_or_lock_privilege() {
         )
     );
 }
+
+/// `executor/explain.test`: under EXPLAIN Go's `BuildDataSourceFromView`
+/// wants SHOW VIEW on every view it expands and SELECT on a view nested in
+/// another, refusing either with `ErrViewNoExplain` (1345); the statement
+/// itself still runs on SELECT alone.
+#[test]
+fn explain_over_a_view_needs_show_view_and_select_on_nested_views() {
+    let (registry, mut root) = setup();
+    root.run("create database ev").unwrap();
+    root.run("create table ev.t (id int)").unwrap();
+    root.run("create view ev.v as select * from ev.t").unwrap();
+    root.run("create view ev.v1 as select * from ev.t").unwrap();
+    root.run("create view ev.v2 as select * from ev.v1")
+        .unwrap();
+    root.run("create user explainer").unwrap();
+    root.run("grant select on ev.v to explainer").unwrap();
+    root.run("grant select, show view on ev.v2 to explainer")
+        .unwrap();
+    root.run("grant show view on ev.v1 to explainer").unwrap();
+    let mut user = session_as(&registry, root.shared_catalog(), "explainer", "%");
+    user.run("select * from ev.v").unwrap();
+    let denied = (
+        1345,
+        "EXPLAIN/SHOW can not be issued; lacking privileges for underlying table".to_owned(),
+    );
+    assert_eq!(
+        error_of(&mut user, "explain format='plan_tree' select * from ev.v"),
+        denied
+    );
+    assert_eq!(
+        error_of(&mut user, "explain format='plan_tree' select * from ev.v2"),
+        denied
+    );
+    root.run("grant select on ev.v1 to explainer").unwrap();
+    let mut user = session_as(&registry, root.shared_catalog(), "explainer", "%");
+    user.run("explain format='plan_tree' select * from ev.v2")
+        .unwrap();
+}
+
+/// `privilege/privileges.test`: Go's `fetchShowColumns` wants a column
+/// privilege on the table (refusing as a denied SELECT), SHOW CREATE TABLE
+/// any privilege but CREATE TEMPORARY TABLES (refusing as a denied SHOW),
+/// and `information_schema.COLUMNS.PRIVILEGES` lists only the column
+/// privileges the user holds.
+#[test]
+fn show_columns_show_create_and_column_privileges_follow_the_grants() {
+    let (registry, mut root) = setup();
+    root.run("create database sp").unwrap();
+    root.run("create table sp.t1 (a int)").unwrap();
+    root.run("create view sp.v as select 1").unwrap();
+    root.run("create user nobody, viewer").unwrap();
+    root.run("grant show view on sp.v to viewer").unwrap();
+    let mut nobody = session_as(&registry, root.shared_catalog(), "nobody", "%");
+    assert_eq!(
+        error_of(&mut nobody, "show create table sp.t1"),
+        (
+            1142,
+            "SHOW command denied to user 'nobody'@'%' for table 't1'".to_owned()
+        )
+    );
+    let mut viewer = session_as(&registry, root.shared_catalog(), "viewer", "%");
+    assert_eq!(
+        error_of(&mut viewer, "desc sp.v"),
+        (
+            1142,
+            "SELECT command denied to user 'viewer'@'%' for table 'v'".to_owned()
+        )
+    );
+    root.run("grant update, select on sp.v to viewer").unwrap();
+    let mut viewer = session_as(&registry, root.shared_catalog(), "viewer", "%");
+    viewer.run("desc sp.v").unwrap();
+    assert_eq!(
+        row_text(viewer.run(
+            "select privileges from information_schema.columns where table_schema='sp' and table_name='v'"
+        )),
+        [["select,update"]]
+    );
+}

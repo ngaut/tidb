@@ -547,13 +547,15 @@ fn drop_parser_source_boundaries() {
 
     assert!(parse("DROP STATS t PARTITION 'p'").is_err());
     for (sql, expected) in [
+        // Go raises both as parser terrors: ErrWarnDeprecatedSyntax (1287)
+        // and ErrWarnDeprecatedSyntaxNoReplacement (1681).
         (
             "DROP STATS t GLOBAL",
-            "'DROP STATS ... GLOBAL' is deprecated and will be removed in a future release. Please use DROP STATS ... instead",
+            "[parser:1287]'DROP STATS ... GLOBAL' is deprecated and will be removed in a future release. Please use DROP STATS ... instead",
         ),
         (
             "DROP STATS t PARTITION p",
-            "'DROP STATS ... PARTITION ...' is deprecated and will be removed in a future release.",
+            "[parser:1681]'DROP STATS ... PARTITION ...' is deprecated and will be removed in a future release.",
         ),
     ] {
         let output = parse_with_warnings(sql).unwrap();

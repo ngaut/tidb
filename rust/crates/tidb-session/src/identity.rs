@@ -108,7 +108,7 @@ impl Session {
     /// manager as "miss privilege checker" and refuse; this tier's in-process
     /// sessions legitimately have none, so they pass instead -- the rule
     /// every check here already followed, now stated once.
-    fn privilege_context(&self) -> Option<(&privilege::PrivilegeRegistry, &str, &str)> {
+    pub(crate) fn privilege_context(&self) -> Option<(&privilege::PrivilegeRegistry, &str, &str)> {
         if self.privilege_bypassed {
             return None;
         }

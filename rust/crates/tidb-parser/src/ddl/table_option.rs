@@ -360,6 +360,11 @@ impl Parser {
             "AFFINITY" => string_option!(TableOption::Affinity),
             _ => None,
         };
+        // Go `parseTableOption` warns at the next token for the options it
+        // parses but no storage engine honours.
+        if let Some(message) = option.as_ref().and_then(ignored_table_option_warning) {
+            self.warn_near_next(message);
+        }
         Ok(option)
     }
 
@@ -409,4 +414,49 @@ impl Parser {
             _ => Err(self.err_here("expected a table option value")),
         }
     }
+}
+
+/// The warning Go's `parseTableOption` raises for a table option it parses
+/// but ignores.
+fn ignored_table_option_warning(option: &TableOption) -> Option<&'static str> {
+    Some(match option {
+        TableOption::Encryption(value) if matches!(value.as_str(), "Y" | "y") => {
+            "The ENCRYPTION clause is parsed but ignored by all storage engines."
+        }
+        TableOption::StatsAutoRecalc(_) => {
+            "The STATS_AUTO_RECALC is parsed but ignored by all storage engines."
+        }
+        TableOption::StatsSamplePages(_) => {
+            "The STATS_SAMPLE_PAGES is parsed but ignored by all storage engines."
+        }
+        TableOption::SecondaryEngine(_) | TableOption::SecondaryEngineNull => {
+            "The SECONDARY_ENGINE clause is parsed but ignored by all storage engines."
+        }
+        TableOption::StorageMedia(_) => {
+            "The STORAGE clause is parsed but ignored by all storage engines."
+        }
+        TableOption::PageChecksum(_) => {
+            "The PAGE_CHECKSUM option is parsed but ignored by all storage engines."
+        }
+        TableOption::PageCompressed(_) => {
+            "The PAGE_COMPRESSED option is parsed but ignored by all storage engines."
+        }
+        TableOption::PageCompressionLevel(_) => {
+            "The PAGE_COMPRESSION_LEVEL option is parsed but ignored by all storage engines."
+        }
+        TableOption::Transactional(_) => {
+            "The TRANSACTIONAL option is parsed but ignored by all storage engines."
+        }
+        TableOption::IetfQuotes(_) => {
+            "The IETF_QUOTES option is parsed but ignored by all storage engines."
+        }
+        TableOption::Sequence(_) => {
+            "The SEQUENCE option is parsed but ignored by all storage engines. Use CREATE SEQUENCE instead."
+        }
+        TableOption::AutoextendSize(_) => {
+            "The AUTOEXTEND_SIZE option is parsed but ignored by all storage engines."
+        }
+        TableOption::Union(_) => "The UNION option is parsed but ignored by all storage engines.",
+        _ => return None,
+    })
 }

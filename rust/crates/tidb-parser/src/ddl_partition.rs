@@ -760,7 +760,7 @@ pub(super) fn parse_alter_partition_action(
         } else {
             parse_partition_name_list(parser)?
         };
-        parser.warn("The CHECK PARTITIONING clause is parsed but not implement yet.");
+        parser.warn_near_next("The CHECK PARTITIONING clause is parsed but not implement yet.");
         return Ok(Some(AlterPartitionAction::Check { all, names }));
     }
     if parser.is_kw("IMPORT") && parser.is_kw_at(1, "PARTITION") {
@@ -774,7 +774,7 @@ pub(super) fn parse_alter_partition_action(
             parse_partition_name_list(parser)?
         };
         parser.expect_kw("TABLESPACE")?;
-        parser.warn(
+        parser.warn_near_next(
             "The IMPORT PARTITION TABLESPACE clause is parsed but ignored by all storage engines.",
         );
         return Ok(Some(AlterPartitionAction::ImportTablespace { all, names }));
@@ -790,7 +790,7 @@ pub(super) fn parse_alter_partition_action(
             parse_partition_name_list(parser)?
         };
         parser.expect_kw("TABLESPACE")?;
-        parser.warn(
+        parser.warn_near_next(
             "The DISCARD PARTITION TABLESPACE clause is parsed but ignored by all storage engines.",
         );
         return Ok(Some(AlterPartitionAction::DiscardTablespace { all, names }));
@@ -1013,7 +1013,7 @@ pub(super) fn parse_no_write_to_binlog(parser: &mut Parser) -> bool {
 
 fn warn_no_write_to_binlog(parser: &mut Parser, present: bool) {
     if present {
-        parser.warn("The NO_WRITE_TO_BINLOG option is parsed but ignored for now.");
+        parser.warn_near_next("The NO_WRITE_TO_BINLOG option is parsed but ignored for now.");
     }
 }
 

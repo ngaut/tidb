@@ -911,3 +911,33 @@ fn explain_plan_cache_names_the_hint_only_refusal() {
         ]]
     );
 }
+
+/// `executor/explain.test`: Go's `buildExplain` optimizes an EXPLAIN ANALYZE
+/// FORMAT = 'plan_cache' through the non-prepared cache too, so a refusal
+/// warns and a repeat runs the cached plan.
+#[test]
+fn explain_analyze_plan_cache_goes_through_the_cache() {
+    let mut session = cache_session();
+    session.run("create table t2 (a int)").unwrap();
+    session
+        .run("explain analyze format = 'plan_cache' select * from (select * from t2) t1 limit 1")
+        .unwrap();
+    assert_eq!(
+        row_text(session.run("show warnings")),
+        [[
+            "Warning",
+            "1105",
+            "skip non-prepared plan-cache: queries that have sub-queries are not supported"
+        ]]
+    );
+    session
+        .run("explain analyze format = 'plan_cache' select * from t2")
+        .unwrap();
+    session
+        .run("explain analyze format = 'plan_cache' select * from t2")
+        .unwrap();
+    assert_eq!(
+        scalar_text(&mut session, "select @@last_plan_from_cache").as_deref(),
+        Some("1")
+    );
+}

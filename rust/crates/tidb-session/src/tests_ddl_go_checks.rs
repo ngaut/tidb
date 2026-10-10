@@ -364,3 +364,24 @@ fn inline_keys_and_hidden_columns_are_checked() {
         )
     );
 }
+
+/// `ddl/table_create_compat.test`: Go's parser warns, at the next token, for
+/// a table option no storage engine honours (`HandParser.warnNear`), and
+/// `util.SyntaxWarn` reports it as 1064 behind the syntax prefix.
+#[test]
+fn an_ignored_table_option_warns_as_go_parser_does() {
+    let mut session = Session::new();
+    session
+        .run("CREATE TABLE a (id INT PRIMARY KEY) AUTOEXTEND_SIZE=4M")
+        .unwrap();
+    assert_eq!(
+        warnings(&mut session),
+        [[
+            "Warning",
+            "1064",
+            "You have an error in your SQL syntax; check the manual that corresponds to your \
+             TiDB version for the right syntax to use line 1 column 54 near \"\"The \
+             AUTOEXTEND_SIZE option is parsed but ignored by all storage engines. "
+        ]]
+    );
+}

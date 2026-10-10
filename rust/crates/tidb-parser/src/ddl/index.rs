@@ -153,7 +153,9 @@ impl Parser {
                 self.bump();
                 self.expect_kw("PARSER")?;
                 options.parser_name = Some(self.parse_non_string_ident_like_name()?);
-                self.warn("The WITH PARASER clause is parsed but ignored by all storage engines.");
+                self.warn_near_next(
+                    "The WITH PARASER clause is parsed but ignored by all storage engines.",
+                );
             } else if self.is_kw("VISIBLE") {
                 self.bump();
                 options.visibility = Some(IndexVisibility::Visible);
@@ -356,7 +358,7 @@ impl Parser {
                 // parser stricter than TiDB's yacc grammar.
                 ForeignKeyMatch::None
             };
-            self.warn("The MATCH clause is parsed but ignored by all storage engines.");
+            self.warn_near_next("The MATCH clause is parsed but ignored by all storage engines.");
             match_type
         } else {
             ForeignKeyMatch::None
@@ -463,7 +465,9 @@ impl Parser {
                 Ok(ReferentialAction::SetNull)
             } else if self.is_kw("DEFAULT") {
                 self.bump();
-                self.warn("The SET DEFAULT clause is parsed but ignored by all storage engines.");
+                self.warn_near_next(
+                    "The SET DEFAULT clause is parsed but ignored by all storage engines.",
+                );
                 Ok(ReferentialAction::SetDefault)
             } else {
                 Ok(ReferentialAction::NoOption)

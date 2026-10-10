@@ -2870,6 +2870,31 @@ pub fn explain_physical_plan(
     render_physical_plan(ctx, ctx, &physical, catalog, format, false, None, &[])
 }
 
+/// `EXPLAIN ANALYZE FORMAT = 'plan_cache'` over the plan the non-prepared
+/// cache gave the statement: that plan RUNS, and each operator reports what
+/// it produced, as [`explain_analyze_select_stmt`] does for a fresh plan.
+pub fn explain_analyze_physical_plan(
+    physical: &PhysicalPlan,
+    catalog: &Catalog,
+    ctx: &crate::StmtContext,
+    format: ExplainFormat,
+) -> Result<SelectMeta, DriverError> {
+    let mut physical = physical.deep_clone();
+    crate::driver::physical_builder::prepare_execution_plan(&mut physical, catalog, ctx)?;
+    let runtime =
+        crate::driver::physical_builder::execute_for_explain(&mut physical, catalog, ctx)?;
+    render_physical_plan(
+        ctx,
+        ctx,
+        &physical,
+        catalog,
+        format,
+        true,
+        Some(&runtime),
+        &[],
+    )
+}
+
 /// Plans `select` and reports the plan as EXPLAIN rows, executing nothing:
 /// the driver builds the pipeline, the trace records it, and it is dropped
 /// undrained.

@@ -80,6 +80,7 @@ impl Session {
         // EXPLAIN follows the same resolved privilege boundary as execution;
         // ANALYZE can write, and plain EXPLAIN still exposes the target plan.
         self.require_statement_table_privileges(target)?;
+        self.require_explain_view_privileges(target)?;
         self.activate_statement_resource_group(target);
         let current_db = self.current_db.clone();
         // Both forms plan through the driver's own build path (see
@@ -96,6 +97,14 @@ impl Session {
             .with_in_explain_stmt(true)
             .with_explain_format(format);
         if explain.analyze {
+            if format == tidb_executor::ExplainFormat::PlanCache {
+                if let Some(output) =
+                    self.explain_through_non_prepared_cache(target, &ctx, format, true)?
+                {
+                    self.drain_eval_warnings(&ctx);
+                    return Ok(Some(output));
+                }
+            }
             let (columns, rows) = match target {
                 Stmt::Query(query) => self.with_catalog_mut(|catalog| match &**query {
                     tidb_ast::QueryStmt::Select(select) => {
@@ -163,7 +172,9 @@ impl Session {
             return Ok(Some(StmtOutput::Rows { columns, rows }));
         }
         if format == tidb_executor::ExplainFormat::PlanCache {
-            if let Some(output) = self.explain_through_non_prepared_cache(target, &ctx, format)? {
+            if let Some(output) =
+                self.explain_through_non_prepared_cache(target, &ctx, format, false)?
+            {
                 self.drain_eval_warnings(&ctx);
                 return Ok(Some(output));
             }
@@ -245,12 +256,14 @@ impl Session {
     /// `OptimizeAstNodeNoCache`), and the plan it gets is the one reported.
     /// A statement the cache refuses says why (`skip non-prepared
     /// plan-cache: <reason>`, `getPlanFromNonPreparedPlanCache`) and is
-    /// planned as usual: `None` hands it to the ordinary EXPLAIN.
+    /// planned as usual: `None` hands it to the ordinary EXPLAIN. ANALYZE
+    /// runs the plan it got.
     fn explain_through_non_prepared_cache(
         &mut self,
         target: &Stmt,
         ctx: &tidb_executor::StmtContext,
         format: tidb_executor::ExplainFormat,
+        analyze: bool,
     ) -> Result<Option<StmtOutput>, DriverError> {
         let Stmt::Query(query) = target else {
             return Ok(None);
@@ -296,7 +309,11 @@ impl Session {
         let ctx = ctx.clone().with_prepared_params(execution.parameters());
         let rendered = execution.with_plan(|_, physical| {
             self.with_catalog_mut(|catalog| {
-                tidb_executor::explain_physical_plan(physical, catalog, &ctx, format)
+                if analyze {
+                    tidb_executor::explain_analyze_physical_plan(physical, catalog, &ctx, format)
+                } else {
+                    tidb_executor::explain_physical_plan(physical, catalog, &ctx, format)
+                }
             })
         });
         let Some(rendered) = rendered else {
@@ -305,5 +322,68 @@ impl Session {
         let (columns, rows) = rendered?;
         self.found_in_plan_cache = execution.cache_hit();
         Ok(Some(StmtOutput::Rows { columns, rows }))
+    }
+
+    /// Go `BuildDataSourceFromView` under `InExplainStmt`: a view nested in
+    /// another needs SELECT on itself, refused while its parent is built,
+    /// and every view the EXPLAIN expands adds a SHOW VIEW `visitInfo`; both
+    /// fail with `ErrViewNoExplain` (1345).
+    fn require_explain_view_privileges(&self, target: &Stmt) -> Result<(), DriverError> {
+        if self.privilege_context().is_none() {
+            return Ok(());
+        }
+        let mut views = Vec::new();
+        {
+            let catalog = self.lock_catalog()?;
+            collect_expanded_views(target, &self.current_db, &catalog, 0, &mut views);
+        }
+        let denied = || {
+            DriverError::Mysql(tidb_executor::MysqlError::new(
+                1345,
+                "EXPLAIN/SHOW can not be issued; lacking privileges for underlying table",
+            ))
+        };
+        for (database, view, depth) in &views {
+            if *depth > 0
+                && !self.has_scoped_privilege(database, view, crate::privilege::GlobalPriv::Select)
+            {
+                return Err(denied());
+            }
+        }
+        for (database, view, _) in &views {
+            if !self.has_scoped_privilege(database, view, crate::privilege::GlobalPriv::ShowView) {
+                return Err(denied());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The views `stmt` expands, depth first as Go builds them, each with its
+/// nesting depth (Go `StmtCtx.ViewDepth`): 0 for a view the statement names.
+fn collect_expanded_views(
+    stmt: &Stmt,
+    current_db: &str,
+    catalog: &tidb_executor::Catalog,
+    depth: usize,
+    views: &mut Vec<(String, String, usize)>,
+) {
+    for path in crate::binding::collect_physical_table_refs(stmt) {
+        let (database, name) = match path.as_slice() {
+            [name] => (current_db, name.as_str()),
+            [database, name] => (database.as_str(), name.as_str()),
+            _ => continue,
+        };
+        let Some(tidb_executor::TableEntry::View(view)) = catalog.table_in(database, name) else {
+            continue;
+        };
+        // A view cannot reach itself (CREATE VIEW refuses the cycle); the
+        // depth cap only bounds a corrupt definition.
+        if depth < 64 {
+            if let Ok(body) = tidb_parser::parse(&view.select_sql) {
+                collect_expanded_views(&body, database, catalog, depth + 1, views);
+            }
+        }
+        views.push((database.to_owned(), name.to_owned(), depth));
     }
 }

@@ -1140,7 +1140,7 @@ impl Parser {
         } else if self.is_kw("SECONDARY_LOAD") || self.is_kw("SECONDARY_UNLOAD") {
             let load = self.is_kw("SECONDARY_LOAD");
             self.bump();
-            self.warn(if load {
+            self.warn_near_next(if load {
                 "The SECONDARY_LOAD clause is parsed but not implement yet."
             } else {
                 "The SECONDARY_UNLOAD VALIDATION clause is parsed but not implement yet."
@@ -1150,7 +1150,7 @@ impl Parser {
             let import = self.is_kw("IMPORT");
             self.bump();
             self.expect_kw("TABLESPACE")?;
-            self.warn(if import {
+            self.warn_near_next(if import {
                 "The IMPORT TABLESPACE clause is parsed but ignored by all storage engines."
             } else {
                 "The DISCARD TABLESPACE clause is parsed but ignored by all storage engines."

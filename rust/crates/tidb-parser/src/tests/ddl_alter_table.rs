@@ -941,48 +941,80 @@ fn alter_table_drop_index() {
 /// `pkg/parser/ddl_alter_handlers.go` recoverable warnings.
 #[test]
 fn alter_table_source_warnings() {
-    for (sql, expected) in [
+    // Go `HandParser.warnNear`, as `ParseSQL` returns it (oracle-captured);
+    // `util.SyntaxWarn` later reports it as 1064 behind the syntax prefix.
+    const PREFIX: &str = "[parser:1064]You have an error in your SQL syntax; check the manual \
+                          that corresponds to your TiDB version for the right syntax to use ";
+    let cases: &[(&str, &[&str])] = &[
         (
             "ALTER TABLE t ADD PARTITION NO_WRITE_TO_BINLOG",
-            "The NO_WRITE_TO_BINLOG option is parsed but ignored for now.",
+            &["line 1 column 46 near \"\"The NO_WRITE_TO_BINLOG option is parsed but ignored for now. "],
         ),
         (
             "ALTER TABLE t COALESCE PARTITION LOCAL 1",
-            "The NO_WRITE_TO_BINLOG option is parsed but ignored for now.",
+            &["line 1 column 39 near \"1\"The NO_WRITE_TO_BINLOG option is parsed but ignored for now. "],
         ),
         (
             "ALTER TABLE t LAST PARTITION LESS THAN (10) LOCAL",
-            "The NO_WRITE_TO_BINLOG option is parsed but ignored for now.",
+            &["line 1 column 49 near \"\"The NO_WRITE_TO_BINLOG option is parsed but ignored for now. "],
         ),
         (
             "ALTER TABLE t CHECK PARTITION ALL",
-            "The CHECK PARTITIONING clause is parsed but not implement yet.",
+            &["line 1 column 33 near \"\"The CHECK PARTITIONING clause is parsed but not implement yet. "],
         ),
         (
             "ALTER TABLE t IMPORT TABLESPACE",
-            "The IMPORT TABLESPACE clause is parsed but ignored by all storage engines.",
+            &["line 1 column 31 near \"\"The IMPORT TABLESPACE clause is parsed but ignored by all storage engines. "],
         ),
         (
             "ALTER TABLE t DISCARD PARTITION ALL TABLESPACE",
-            "The DISCARD PARTITION TABLESPACE clause is parsed but ignored by all storage engines.",
+            &["line 1 column 46 near \"\"The DISCARD PARTITION TABLESPACE clause is parsed but ignored by all storage engines. "],
         ),
         (
             "ALTER TABLE t SECONDARY_LOAD",
-            "The SECONDARY_LOAD clause is parsed but not implement yet.",
+            &["line 1 column 28 near \"\"The SECONDARY_LOAD clause is parsed but not implement yet. "],
         ),
         (
             "ALTER TABLE t SECONDARY_UNLOAD",
-            "The SECONDARY_UNLOAD VALIDATION clause is parsed but not implement yet.",
+            &["line 1 column 30 near \"\"The SECONDARY_UNLOAD VALIDATION clause is parsed but not implement yet. "],
         ),
-    ] {
+        (
+            "CREATE TABLE a (id INT PRIMARY KEY) AUTOEXTEND_SIZE=4M",
+            &["line 1 column 54 near \"\"The AUTOEXTEND_SIZE option is parsed but ignored by all storage engines. "],
+        ),
+        (
+            "CREATE TABLE a (id INT PRIMARY KEY) PAGE_CHECKSUM=1, ENGINE=InnoDB",
+            &["line 1 column 51 near \", ENGINE=InnoDB\"The PAGE_CHECKSUM option is parsed but ignored by all storage engines. "],
+        ),
+        (
+            "CREATE TABLE a (id INT PRIMARY KEY)\n ENCRYPTION='Y' STATS_AUTO_RECALC=1 STATS_SAMPLE_PAGES=DEFAULT",
+            &["line 2 column 17 near \"STATS_AUTO_RECALC=1 STATS_SAMPLE_PAGES=DEFAULT\"The ENCRYPTION clause is parsed but ignored by all storage engines. ", "line 2 column 37 near \"STATS_SAMPLE_PAGES=DEFAULT\"The STATS_AUTO_RECALC is parsed but ignored by all storage engines. ", "line 2 column 63 near \"\"The STATS_SAMPLE_PAGES is parsed but ignored by all storage engines. "],
+        ),
+        (
+            "CREATE TABLE a (id INT PRIMARY KEY) SECONDARY_ENGINE=NULL STORAGE DISK UNION=(t1,t2) SEQUENCE=1 IETF_QUOTES=YES TRANSACTIONAL=1",
+            &["line 1 column 58 near \"STORAGE DISK UNION=(t1,t2) SEQUENCE=1 IETF_QUOTES=YES TRANSACTIONAL=1\"The SECONDARY_ENGINE clause is parsed but ignored by all storage engines. ", "line 1 column 71 near \"UNION=(t1,t2) SEQUENCE=1 IETF_QUOTES=YES TRANSACTIONAL=1\"The STORAGE clause is parsed but ignored by all storage engines. ", "line 1 column 85 near \"SEQUENCE=1 IETF_QUOTES=YES TRANSACTIONAL=1\"The UNION option is parsed but ignored by all storage engines. ", "line 1 column 96 near \"IETF_QUOTES=YES TRANSACTIONAL=1\"The SEQUENCE option is parsed but ignored by all storage engines. Use CREATE SEQUENCE instead. ", "line 1 column 112 near \"TRANSACTIONAL=1\"The IETF_QUOTES option is parsed but ignored by all storage engines. ", "line 1 column 127 near \"\"The TRANSACTIONAL option is parsed but ignored by all storage engines. "],
+        ),
+        (
+            "CREATE TABLE c (a INT, FOREIGN KEY (a) REFERENCES p(a) MATCH FULL ON DELETE SET DEFAULT)",
+            &["line 1 column 66 near \"ON DELETE SET DEFAULT)\"The MATCH clause is parsed but ignored by all storage engines. ", "line 1 column 87 near \")\"The SET DEFAULT clause is parsed but ignored by all storage engines. "],
+        ),
+        (
+            "CREATE TABLE d (a INT, FULLTEXT INDEX i (a) WITH PARSER ngram)",
+            &["line 1 column 61 near \")\"The WITH PARASER clause is parsed but ignored by all storage engines. "],
+        ),
+    ];
+    for (sql, expected) in cases {
         let output = parse_with_warnings(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
         assert_eq!(
             output
                 .warnings
                 .iter()
-                .map(|warning| warning.message.as_str())
+                .map(|warning| warning.message.clone())
                 .collect::<Vec<_>>(),
-            vec![expected],
+            expected
+                .iter()
+                .map(|warning| format!("{PREFIX}{warning}"))
+                .collect::<Vec<_>>(),
             "{sql}"
         );
     }

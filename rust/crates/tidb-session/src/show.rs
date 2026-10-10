@@ -697,6 +697,33 @@ impl Session {
             [db, name] => (db.clone(), name.clone()),
             _ => return Err(DriverError::unsupported("empty table name")),
         };
+        // Go `fetchShowColumns` asks for any column privilege once the table
+        // resolves, and refuses as a denied SELECT on the table as stored.
+        let stored_name = self
+            .lock_catalog()?
+            .table_in(&database, &table_name)
+            .map(|entry| match entry {
+                tidb_executor::TableEntry::Kv(table) if !table.name().is_empty() => {
+                    table.name().to_owned()
+                }
+                tidb_executor::TableEntry::View(view) => view.name.clone(),
+                _ => table_name.clone(),
+            });
+        if let (Some(stored_name), Some((_, user, host))) = (stored_name, self.privilege_context())
+        {
+            if !self.has_any_scoped_privilege(
+                &database,
+                &table_name,
+                crate::privilege::column_privs_mask(),
+            ) {
+                return Err(DriverError::TableAccessDenied {
+                    privilege: "SELECT",
+                    user: user.to_owned(),
+                    host: host.to_owned(),
+                    table: stored_name,
+                });
+            }
+        }
         let ctx = self.statement_context(false);
         let rows = self.with_catalog_mut(|catalog| {
             let Some(entry) = catalog.table_in(&database, &table_name) else {
@@ -746,6 +773,49 @@ impl Session {
                 .map(|name| ((*name).to_owned(), field_type.clone()))
                 .collect(),
             rows,
+        })
+    }
+
+    /// Go `buildShow` for SHOW CREATE TABLE/SEQUENCE/VIEW: a view needs SHOW
+    /// VIEW, anything else any privilege but CREATE TEMPORARY TABLES (a
+    /// local temporary table any at all), each refused as its own command
+    /// denied on the lower-cased name. A missing table is checked as a table.
+    fn require_show_create_privilege(
+        &self,
+        database: &str,
+        table_name: &str,
+    ) -> Result<(), DriverError> {
+        let Some((_, user, host)) = self.privilege_context() else {
+            return Ok(());
+        };
+        let is_view = self.lock_catalog()?.is_view_in(database, table_name);
+        let (granted, command) = if is_view {
+            (
+                self.has_scoped_privilege(
+                    database,
+                    table_name,
+                    crate::privilege::GlobalPriv::ShowView,
+                ),
+                "SHOW VIEW",
+            )
+        } else {
+            let mut mask = crate::privilege::any_priv_mask();
+            if !self.is_local_temporary_table(database, table_name) {
+                mask &= !crate::privilege::GlobalPriv::CreateTemporaryTables.bit();
+            }
+            (
+                self.has_any_scoped_privilege(database, table_name, mask),
+                "SHOW",
+            )
+        };
+        if granted {
+            return Ok(());
+        }
+        Err(DriverError::TableAccessDenied {
+            privilege: command,
+            user: user.to_owned(),
+            host: host.to_owned(),
+            table: tidb_util::stringutil::go_to_lower(table_name),
         })
     }
 
@@ -1799,6 +1869,7 @@ impl Session {
                     [database, table] => (database.clone(), table.clone()),
                     _ => return Err(DriverError::unsupported("empty table name")),
                 };
+                self.require_show_create_privilege(&database, &table_name)?;
                 let ctx = self.statement_context(false);
                 // A view answers either spelling with the same row, which
                 // is Go's own behaviour; only `SHOW CREATE VIEW` on a base

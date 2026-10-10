@@ -100,20 +100,28 @@ fn hand_index_parser_source_warnings_match_go() {
     for (sql, expected) in [
         (
             "create table t(a int, foreign key(a) references x match full)",
-            "The MATCH clause is parsed but ignored by all storage engines.",
+            "line 1 column 60 near \")\"The MATCH clause is parsed but ignored by all storage engines. ",
         ),
         (
             "create table t(a int, foreign key(a) references x on delete set default)",
-            "The SET DEFAULT clause is parsed but ignored by all storage engines.",
+            "line 1 column 71 near \")\"The SET DEFAULT clause is parsed but ignored by all storage engines. ",
         ),
         (
             "create index i on t(a) with parser p",
-            "The WITH PARASER clause is parsed but ignored by all storage engines.",
+            "line 1 column 36 near \"\"The WITH PARASER clause is parsed but ignored by all storage engines. ",
         ),
     ] {
         let output = parse_with_warnings(sql).unwrap_or_else(|error| panic!("{sql}: {error:?}"));
         assert_eq!(output.warnings.len(), 1, "source SQL: {sql}");
-        assert_eq!(output.warnings[0].message, expected, "source SQL: {sql}");
+        // Go `warnNear` at the next token; the session reports it as 1064.
+        assert_eq!(
+            output.warnings[0].message,
+            format!(
+                "[parser:1064]You have an error in your SQL syntax; check the manual that \
+                 corresponds to your TiDB version for the right syntax to use {expected}"
+            ),
+            "source SQL: {sql}"
+        );
     }
 }
 
