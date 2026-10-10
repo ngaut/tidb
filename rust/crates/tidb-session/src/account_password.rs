@@ -102,6 +102,37 @@ impl Session {
                 default_plugin.clone()
             }
         };
+        // Go runs the statement in one internal transaction: a missing
+        // account is collected and the loop continues, and a statement
+        // without IF EXISTS then fails with every collected account named
+        // (1396) and rolls back what the others changed -- so nothing is
+        // written when any account is missing.
+        if !alter.if_exists {
+            let mut missing = Vec::new();
+            for spec in specs {
+                let (user, host) = self.resolve_account(&spec.user)?;
+                if !registry.user_exists(&user, &host) {
+                    missing.push((user, host));
+                }
+            }
+            match missing.len() {
+                0 => {}
+                1 => {
+                    let (user, host) = missing.remove(0);
+                    return Err(DriverError::AlterUserMissing { user, host });
+                }
+                _ => {
+                    return Err(DriverError::AlterUserFailed(
+                        missing
+                            .iter()
+                            .map(|(user, host)| format!("'{user}'@'{host}'"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ));
+                }
+            }
+        }
+        let mut skipped = Vec::new();
         for spec in specs {
             // Go `dualPasswordOption`.
             let (spec_retain, spec_discard) = match spec.dual_password {
@@ -170,15 +201,22 @@ impl Session {
             }
             if !exists {
                 if alter.if_exists {
-                    // Go collects the miss into `failedUsers` and reports it
-                    // as a note under IF EXISTS; the skip is the observable
-                    // part.
+                    // Go collects the miss into `failedUsers` and, after the
+                    // loop, reports each as Note 3162 under IF EXISTS.
+                    skipped.push(format!("'{user}'@'{host}'"));
                     continue;
                 }
                 return Err(DriverError::AlterUserMissing { user, host });
             }
             if need_admin_check {
                 self.require_system_user_privilege_over(&user, &host)?;
+            }
+            // Go `executeAlterUser` refuses, while composing the account's
+            // UPDATE (before any write), to expire the anonymous account.
+            if user.is_empty()
+                && matches!(options.expire, Some(privilege::PasswordExpireSetting::Now))
+            {
+                return Err(DriverError::PasswordExpireAnonymousUser);
             }
             // Go's RETAIN CURRENT PASSWORD validation, in its order: plugin
             // capability, then "a new password must be set", then "same
@@ -393,6 +431,9 @@ impl Session {
                 self.run_user_table_write(&sql)?;
             }
             self.mirror_account_policy_and_history(&registry, &user, &host)?;
+        }
+        for account in skipped {
+            self.append_routed_note(3162, format!("User {account} does not exist."));
         }
         // A sandboxed session escapes by giving ITSELF a new password, which
         // is the only thing it was allowed in here to do (Go's

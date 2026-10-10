@@ -528,3 +528,57 @@ fn require_policies_are_stored_shown_and_invalid_forms_are_refused() {
         assert!(session.run("SHOW CREATE USER 'invalid'@'%'").is_err());
     }
 }
+
+/// Go `executeCreateUser`/`executeAlterUser`: the anonymous account's password
+/// cannot be expired (3016); ALTER USER is atomic -- a missing account fails
+/// the statement (1396) without changing the others -- and under IF EXISTS
+/// each missing account is Note 3162.
+#[test]
+fn alter_user_is_atomic_and_refuses_anonymous_expiry() {
+    let mut s = session_with_privileges();
+    let error = s
+        .run("CREATE USER ''@localhost IDENTIFIED BY 'pass' PASSWORD EXPIRE")
+        .unwrap_err()
+        .to_mysql_error();
+    assert_eq!(error.code, 3016, "{}", error.message);
+    s.run("CREATE USER ''@localhost IDENTIFIED BY 'pass'")
+        .unwrap();
+    let error = s
+        .run("ALTER USER ''@localhost PASSWORD EXPIRE")
+        .unwrap_err()
+        .to_mysql_error();
+    assert_eq!(error.code, 3016, "{}", error.message);
+
+    s.run("CREATE USER test1 IDENTIFIED WITH 'mysql_native_password' BY '1234'")
+        .unwrap();
+    let before = row_text(
+        s.run(r#"SELECT authentication_string FROM mysql.user WHERE User="test1" and Host="%""#),
+    );
+    let error = s
+        .run("ALTER USER 'test1' IDENTIFIED BY '222', 'test_not_exist'@'localhost' IDENTIFIED BY '111'")
+        .unwrap_err()
+        .to_mysql_error();
+    assert_eq!(
+        (error.code, error.message.as_str()),
+        (
+            1396,
+            "Operation ALTER USER failed for 'test_not_exist'@'localhost'"
+        )
+    );
+    assert_eq!(
+        row_text(s.run(
+            r#"SELECT authentication_string FROM mysql.user WHERE User="test1" and Host="%""#
+        )),
+        before
+    );
+    s.run("ALTER USER IF EXISTS 'test1' IDENTIFIED BY '222', 'test_not_exist'@'localhost' IDENTIFIED BY '111'")
+        .unwrap();
+    assert_eq!(
+        row_text(s.run("show warnings")),
+        vec![vec![
+            "Note",
+            "3162",
+            "User 'test_not_exist'@'localhost' does not exist."
+        ]]
+    );
+}

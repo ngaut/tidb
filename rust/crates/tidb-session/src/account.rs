@@ -644,6 +644,13 @@ impl Session {
             }
             let user = spec.user.user.as_str();
             let host = spec.user.host.as_str();
+            // Go `executeCreateUser` refuses to expire the anonymous account's
+            // password before it looks the account up.
+            if user.is_empty()
+                && matches!(options.expire, Some(privilege::PasswordExpireSetting::Now))
+            {
+                return Err(DriverError::PasswordExpireAnonymousUser);
+            }
             if registry.user_exists(user, host) {
                 if !if_not_exists {
                     return Err(DriverError::CreateUserAlreadyExists {

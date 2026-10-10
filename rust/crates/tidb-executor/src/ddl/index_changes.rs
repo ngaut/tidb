@@ -45,6 +45,7 @@ pub(super) fn is_index_change(action: &AlterTableAction) -> bool {
         action,
         AlterTableAction::AddIndexConstraint(_)
             | AlterTableAction::DropIndex { .. }
+            | AlterTableAction::DropPrimaryKey(_)
             | AlterTableAction::RenameIndex(_)
             | AlterTableAction::AlterIndexVisibility(_)
     )
@@ -57,11 +58,13 @@ pub(super) fn add_spec<'a>(
     indexes::IndexSpec {
         name,
         comment: definition.options.comment.as_deref().unwrap_or(""),
+        // Go builds a primary key's `IndexArg` with `Unique: true`.
         unique: matches!(
             definition.kind,
             tidb_ast::IndexConstraintKind::Unique
                 | tidb_ast::IndexConstraintKind::UniqueKey
                 | tidb_ast::IndexConstraintKind::UniqueIndex
+                | tidb_ast::IndexConstraintKind::PrimaryKey
         ),
         parts: &definition.parts,
         visible: indexes::is_visible(&definition.options),
@@ -100,6 +103,28 @@ pub(super) fn prepare<'a>(
         table: table_name.to_owned(),
     };
     match action {
+        AlterTableAction::AddIndexConstraint(definition)
+            if definition.kind == tidb_ast::IndexConstraintKind::PrimaryKey =>
+        {
+            let name = "PRIMARY".to_owned();
+            Ok(Some(
+                match indexes::prepare_add_primary_key(
+                    table,
+                    definition,
+                    add_spec(&name, definition),
+                    ctx,
+                    catalog.max_index_length(),
+                )? {
+                    indexes::IndexAdmission::Change(()) => {
+                        PreparedIndexChange::Add { name, definition }
+                    }
+                    indexes::IndexAdmission::Note(note) => {
+                        ctx.append_suppressed(&note);
+                        return Ok(None);
+                    }
+                },
+            ))
+        }
         AlterTableAction::AddIndexConstraint(definition) => {
             match definition.kind {
                 tidb_ast::IndexConstraintKind::Key
@@ -143,6 +168,20 @@ pub(super) fn prepare<'a>(
                 },
             ))
         }
+        // Go `CheckIsDropPrimaryKey`: `DROP PRIMARY KEY` is dropping the
+        // index named PRIMARY.
+        AlterTableAction::DropPrimaryKey(_) => Ok(Some(
+            match indexes::prepare_drop_index(catalog, database, table_name, "PRIMARY", false)? {
+                indexes::IndexAdmission::Change(id) => PreparedIndexChange::Drop {
+                    name: "PRIMARY".to_owned(),
+                    id,
+                },
+                indexes::IndexAdmission::Note(note) => {
+                    ctx.append_suppressed(&note);
+                    return Ok(None);
+                }
+            },
+        )),
         AlterTableAction::DropIndex { name, if_exists } => Ok(Some(
             match indexes::prepare_drop_index(catalog, database, table_name, name, *if_exists)? {
                 indexes::IndexAdmission::Change(id) => PreparedIndexChange::Drop {
@@ -217,6 +256,19 @@ impl PreparedIndexChange<'_> {
         ctx: &crate::StmtContext,
     ) -> Result<(), DriverError> {
         match self {
+            Self::Add { name, definition }
+                if definition.kind == tidb_ast::IndexConstraintKind::PrimaryKey =>
+            {
+                let max_index_length = catalog.max_index_length();
+                indexes::add_primary_key_to_table(
+                    catalog,
+                    database,
+                    table_name,
+                    add_spec(&name, definition),
+                    ctx,
+                    max_index_length,
+                )
+            }
             Self::Add { name, definition } => {
                 let max_index_length = catalog.max_index_length();
                 indexes::add_index_to_table(

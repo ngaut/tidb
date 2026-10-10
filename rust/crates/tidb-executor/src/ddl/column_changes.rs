@@ -360,6 +360,17 @@ impl PreparedColumnChange {
                 drop_auto_increment,
             } => {
                 let at = offset_of(table, column.id, &old_name)?;
+                // Go `validatePosition` runs in the job, after the
+                // multi-schema conflict check: "For cases like `modify column
+                // b after b`, it should report this error."
+                if matches!(&requested, ColumnPosition::After(relative)
+                    if relative.eq_ignore_ascii_case(&old_name))
+                {
+                    return Err(DriverError::UnknownColumnInTable {
+                        column: table.columns()[at].name.clone(),
+                        table: table_name.to_owned(),
+                    });
+                }
                 let destination = position(table, &requested, Some(at), table_name)?;
                 if let Some(spec) = &mut new_auto_random {
                     spec.offset = at;

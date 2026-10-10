@@ -871,6 +871,24 @@ impl PreparedAutoIdRebase {
         self.next
     }
 
+    /// Go `onRebaseAutoID`'s own `adjustNewBaseToNextGlobalID`, run when the
+    /// job executes rather than when the statement admitted it: without FORCE
+    /// the base rises to the CURRENT `NextGlobalAutoID`, which an earlier
+    /// sub-job of the same multi-schema change may have moved. Returns the
+    /// `(requested, used)` pair Go words its job warning with when it moved.
+    pub(crate) fn readjust_to_current_global(&mut self) -> Result<Option<(u64, u64)>, AutoIdError> {
+        if self.force {
+            return Ok(None);
+        }
+        let global = self.allocator.next_global().map_err(AutoIdError::Store)?;
+        if !exceeds(global, self.next, self.allocator.unsigned) {
+            return Ok(None);
+        }
+        let requested = self.next;
+        self.next = global;
+        Ok(Some((requested, global)))
+    }
+
     /// Go `onRebaseAutoID` then the schema reload: the shared counter moves
     /// (`Rebase(newBase-1, false)` or `ForceRebase`), and `filterAllocators`
     /// drops the table's allocator of that type, so the next draw starts a

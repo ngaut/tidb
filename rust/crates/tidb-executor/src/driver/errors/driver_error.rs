@@ -1233,6 +1233,10 @@ pub enum DriverError {
         /// The account host.
         host: String,
     },
+    /// Go `ErrCannotUser("ALTER USER", strings.Join(failedUsers, ","))`
+    /// (1396): every missing account of the statement, each quoted
+    /// `'user'@'host'`.
+    AlterUserFailed(String),
     /// Go `ErrWrongValue2` (1525): `PASSWORD EXPIRE INTERVAL n DAY` was
     /// written with a day count outside `1 ..= 65535`, which `loadOptions`
     /// rejects before any row is touched.
@@ -1261,6 +1265,9 @@ pub enum DriverError {
         /// identity already existing), which selects the reason clause.
         old_missing: bool,
     },
+    /// Go `ErrPasswordExpireAnonymousUser` (3016): `PASSWORD EXPIRE` on the
+    /// anonymous account.
+    PasswordExpireAnonymousUser,
     /// Go `ErrPasswordNoMatch` (1133): `SET PASSWORD FOR` named an account
     /// with no `mysql.user` row. `SET PASSWORD` does NOT reuse
     /// `ErrCannotUser` (captured).

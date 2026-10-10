@@ -385,3 +385,83 @@ fn an_ignored_table_option_warns_as_go_parser_does() {
         ]]
     );
 }
+
+/// Go `CreatePrimaryKey` / `onCreateIndex(isPK)` and `CheckIsDropPrimaryKey`:
+/// ALTER TABLE adds a NONCLUSTERED primary key (its nullable columns become
+/// NOT NULL and PRI, a NULL row is 1138, a second key 1068, CLUSTERED 8200)
+/// and drops it, refusing a clustered one (8200).
+#[test]
+fn alter_table_adds_and_drops_a_nonclustered_primary_key() {
+    let mut s = Session::new();
+    s.run("create table t (a int)").unwrap();
+    s.run("insert into t values (123)").unwrap();
+    s.run("alter table t add index i(a), add primary key (a)")
+        .unwrap();
+    let ddl = row_text(s.run("show create table t"))[0][1].clone();
+    assert!(ddl.contains("`a` int NOT NULL"), "{ddl}");
+    assert!(
+        ddl.contains("PRIMARY KEY (`a`) /*T![clustered_index] NONCLUSTERED */"),
+        "{ddl}"
+    );
+    assert_eq!(row_text(s.run("desc t"))[0][3], "PRI");
+    assert_eq!(code(&mut s, "alter table t add primary key (a)").0, 1068);
+    s.run("alter table t drop primary key").unwrap();
+    assert_eq!(code(&mut s, "select * from t use index(primary)").0, 1176);
+    assert_eq!(row_text(s.run("desc t"))[0][3], "MUL");
+
+    s.run("create table n (a int, b int)").unwrap();
+    s.run("insert into n values (null, 1)").unwrap();
+    assert_eq!(code(&mut s, "alter table n add primary key (a)").0, 1138);
+    assert_eq!(
+        code(&mut s, "alter table n add primary key (b) clustered"),
+        (
+            8200,
+            "Adding clustered primary key is not supported. Please consider adding NONCLUSTERED primary key instead".to_owned()
+        )
+    );
+    s.run("create table c (a int primary key)").unwrap();
+    assert_eq!(
+        code(&mut s, "alter table c drop primary key"),
+        (
+            8200,
+            "Unsupported drop primary key when the table is using clustered index".to_owned()
+        )
+    );
+}
+
+/// Go `checkOperateSameColAndIdx` registers position columns before modify
+/// columns, so `MODIFY a ... AFTER a` passes the multi-schema check and fails
+/// in the job (`validatePosition`, 1054); a sibling index on `a` conflicts
+/// first (8200). Sub-job rebase adjustments are Notes.
+#[test]
+fn multi_schema_position_and_rebase_follow_go() {
+    let mut s = Session::new();
+    s.run("create table t(a int, b int)").unwrap();
+    assert_eq!(
+        code(
+            &mut s,
+            "alter table t add index i(b), modify column a int null default 1 after a"
+        ),
+        (1054, "Unknown column 'a' in 't'".to_owned())
+    );
+    assert_eq!(
+        code(
+            &mut s,
+            "alter table t add index i(a), modify column a int null default 1 after a"
+        )
+        .0,
+        8200
+    );
+    s.run("create table ai (a int auto_increment primary key, b int)")
+        .unwrap();
+    s.run("alter table ai auto_increment = 110, auto_increment = 90")
+        .unwrap();
+    assert_eq!(
+        warnings(&mut s),
+        vec![vec![
+            "Note",
+            "1105",
+            "Can't reset AUTO_INCREMENT to 90 without FORCE option, using 110 instead"
+        ]]
+    );
+}

@@ -2265,6 +2265,22 @@ impl KvTable {
     /// DDL rewrites need this identity: a partitioned table can contain the
     /// same local handle in more than one physical partition, and rewriting
     /// either row under the logical table id would collapse the partitions.
+    /// Go `checkForNullValue` as `modifyColsFromNull2NotNull` runs it before
+    /// a primary key makes its columns NOT NULL: whether any row holds NULL
+    /// in one of `offsets`.
+    pub(crate) fn any_null_in_columns(
+        &mut self,
+        offsets: &[usize],
+        context: &RowDecodeContext,
+    ) -> Result<bool, KvTableError> {
+        let rows = self.scan_physical_rows_with_handles_with_context(context)?;
+        Ok(rows.iter().any(|(_, _, row)| {
+            offsets
+                .iter()
+                .any(|&offset| row.get(offset).is_some_and(Datum::is_null))
+        }))
+    }
+
     pub(crate) fn scan_physical_rows_with_handles_with_context(
         &mut self,
         context: &RowDecodeContext,

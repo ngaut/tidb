@@ -897,11 +897,26 @@ pub(super) fn prepare_drop_index(
             format!("{database}.{table_name}"),
         )));
     };
-    let Some(index) = table
+    let found = table
         .indexes()
         .iter()
-        .find(|index| index.name.eq_ignore_ascii_case(index_name))
-    else {
+        .find(|index| index.name.eq_ignore_ascii_case(index_name));
+    // Go `CheckIsDropPrimaryKey`: dropping PRIMARY is dropping the primary
+    // key -- 1091 naming PRIMARY when the table has none, and refused while
+    // the table is clustered on it, whatever IF EXISTS says.
+    if index_name.eq_ignore_ascii_case("primary") {
+        let clustered = table.pk_handle_offset().is_some()
+            || found.is_some_and(|index| index.clustered_primary);
+        if found.is_none() && !clustered {
+            return Err(DriverError::UnknownIndex("PRIMARY".to_owned()));
+        }
+        if clustered {
+            return Err(unsupported_modify_primary_key(
+                "Unsupported drop primary key when the table is using clustered index",
+            ));
+        }
+    }
+    let Some(index) = found else {
         let missing = DriverError::UnknownIndex(index_name.to_owned());
         if !if_exists {
             return Err(missing);
@@ -965,12 +980,184 @@ pub(super) fn drop_prepared_index(
             offsets
         })
         .unwrap_or_default();
+    // Go `DropIndexColumnFlag`: the primary key's columns lose PRI (their
+    // NOT NULL stays).
+    let primary_columns: Vec<usize> = if index_name.eq_ignore_ascii_case("primary") {
+        table
+            .indexes()
+            .iter()
+            .find(|index| index.name.eq_ignore_ascii_case(&index_name))
+            .map(|index| index.column_offsets.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let dropped = table
         .drop_index(&index_name)
         .map_err(|e| DriverError::Parse(format!("index drop failed: {e:?}")))?;
     debug_assert!(dropped, "prepared index identity was resolved above");
+    for offset in primary_columns {
+        if let Some(column) = table.columns_mut().get_mut(offset) {
+            column
+                .field_type
+                .del_flags(tidb_datatype::FieldTypeFlags::PRI_KEY);
+        }
+    }
     for offset in hidden {
         table.drop_column(offset);
+    }
+    Ok(())
+}
+
+/// Go `dbterror.ErrUnsupportedModifyPrimaryKey` raised `GenWithStack`, which
+/// replaces the template with `message` (8200).
+fn unsupported_modify_primary_key(message: &str) -> DriverError {
+    DriverError::DdlCoded {
+        errno: 8200,
+        message: message.to_owned(),
+    }
+}
+
+/// Go `CreatePrimaryKey` (`ddl/executor.go`): `ALTER TABLE ... ADD PRIMARY
+/// KEY` admits only a NONCLUSTERED key named PRIMARY on a table that has no
+/// primary key, over plain or stored columns.
+pub(super) fn prepare_add_primary_key(
+    table: &crate::KvTable,
+    definition: &tidb_ast::IndexConstraintDefinition,
+    index: IndexSpec<'_>,
+    ctx: &crate::StmtContext,
+    max_index_length: i64,
+) -> Result<IndexAdmission<()>, DriverError> {
+    if matches!(
+        definition.options.primary_key_storage,
+        Some(tidb_ast::PrimaryKeyStorage::Clustered)
+    ) {
+        return Err(unsupported_modify_primary_key(
+            "Adding clustered primary key is not supported. Please consider adding NONCLUSTERED primary key instead",
+        ));
+    }
+    if definition
+        .name
+        .as_ref()
+        .is_some_and(|name| name.chars().count() > 64)
+    {
+        return Err(DriverError::TooLongIdent("PRIMARY".to_owned()));
+    }
+    // "If the table's PKIsHandle is true, it also means that this table has a
+    // primary key."
+    if table.pk_handle_offset().is_some()
+        || table
+            .indexes()
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case("primary"))
+    {
+        return Err(DriverError::MultiplePrimaryKey);
+    }
+    // Primary keys cannot include expression index parts, which are virtual
+    // generated columns.
+    if definition
+        .parts
+        .iter()
+        .any(|part| matches!(part, tidb_ast::IndexPart::Expr { .. }))
+    {
+        return Err(DriverError::DdlCoded {
+            errno: tidb_error::tidb::errcode::ErrFunctionalIndexPrimaryKey,
+            message: "The primary key cannot be an expression index".to_owned(),
+        });
+    }
+    // Go `CheckPKOnGeneratedColumn`.
+    for part in &definition.parts {
+        let tidb_ast::IndexPart::Column { name, .. } = part else {
+            continue;
+        };
+        let Some(offset) = table
+            .columns()
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+            .filter(|offset| !table.is_hidden(*offset))
+        else {
+            // Go `ErrKeyColumnDoesNotExits` (1072), the variant foreign keys
+            // raise too.
+            return Err(DriverError::ForeignKeyChildColumnMissing(name.clone()));
+        };
+        if table.columns()[offset]
+            .generated
+            .as_ref()
+            .is_some_and(|generated| !generated.stored)
+        {
+            return Err(DriverError::DdlCoded {
+                errno: 3106,
+                message: "'Defining a virtual generated column as primary key' is not supported for generated columns.".to_owned(),
+            });
+        }
+    }
+    prepare_add_index(table, index, ctx, max_index_length)
+}
+
+/// Go `onCreateIndex` with `isPK`: `checkPrimaryKeyNotNull` makes the key's
+/// nullable columns NOT NULL -- after `modifyColsFromNull2NotNull` proves no
+/// row holds NULL there (1138) -- the index is built, and `AddIndexColumnFlag`
+/// marks every key column PRI.
+pub(super) fn add_primary_key_to_table(
+    catalog: &mut Catalog,
+    database: &str,
+    table_name: &str,
+    index: IndexSpec<'_>,
+    ctx: &crate::StmtContext,
+    max_index_length: i64,
+) -> Result<(), DriverError> {
+    let Some(crate::TableEntry::Kv(table)) = catalog.table_mut_in(database, table_name) else {
+        return Err(DriverError::Schema(crate::SchemaErrorKind::UnknownTable(
+            format!("{database}.{table_name}"),
+        )));
+    };
+    let table = std::sync::Arc::make_mut(table);
+    let offsets: Vec<usize> = index
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            tidb_ast::IndexPart::Column { name, .. } => table
+                .columns()
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(name)),
+            tidb_ast::IndexPart::Expr { .. } => None,
+        })
+        .collect();
+    let nullable: Vec<usize> = offsets
+        .iter()
+        .copied()
+        .filter(|&offset| {
+            !table.columns()[offset]
+                .field_type
+                .has_flag(tidb_datatype::FieldTypeFlags::NOT_NULL)
+        })
+        .collect();
+    if !nullable.is_empty()
+        && table
+            .any_null_in_columns(&nullable, &crate::kv_table::RowDecodeContext::for_ddl(ctx))
+            .map_err(index_backfill_error)?
+    {
+        return Err(DriverError::InvalidUseOfNull);
+    }
+    add_index_to_table(
+        catalog,
+        database,
+        table_name,
+        index,
+        ctx,
+        max_index_length,
+        None,
+    )?;
+    let Some(crate::TableEntry::Kv(table)) = catalog.table_mut_in(database, table_name) else {
+        unreachable!("the table was resolved above");
+    };
+    let table = std::sync::Arc::make_mut(table);
+    for offset in offsets {
+        if let Some(column) = table.columns_mut().get_mut(offset) {
+            column.field_type.add_flags(
+                tidb_datatype::FieldTypeFlags::NOT_NULL | tidb_datatype::FieldTypeFlags::PRI_KEY,
+            );
+        }
     }
     Ok(())
 }

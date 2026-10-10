@@ -915,6 +915,10 @@ impl DriverError {
             format!("Data truncated for column '{column}', value is '{value}'"),
         ),
         // Go: "Invalid use of NULL value".
+        DriverError::PasswordExpireAnonymousUser => MysqlError::new(
+            3016,
+            "The password for anonymous user cannot be expired.".to_owned(),
+        ),
         DriverError::InvalidUseOfNull => {
             MysqlError::new(1138, "Invalid use of NULL value".to_owned())
         }
@@ -1164,6 +1168,9 @@ impl DriverError {
             1396,
             format!("Operation ALTER USER failed for '{user}'@'{host}'"),
         ),
+        DriverError::AlterUserFailed(accounts) => {
+            MysqlError::new(1396, format!("Operation ALTER USER failed for {accounts}"))
+        }
         // Go `types.ErrWrongValue2` (1525) with the `DAY` unit name, the
         // error `loadOptions` raises for a zero or > 65535 interval.
         DriverError::PasswordExpireIntervalOutOfRange { days } => MysqlError::new(

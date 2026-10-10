@@ -59,13 +59,31 @@ enum PreparedAllocatorRebase {
 }
 
 impl PreparedAllocatorChanges {
-    fn execute(self) -> Result<(), DriverError> {
+    /// `multi_schema`: the rebases are sub-jobs of one multi-schema change,
+    /// each executed against the counter the previous one left; Go's
+    /// `appendMultiChangeWarningsToOwnerCtx` reports a sub-job's adjustment
+    /// as a Note (a single job's was already warned at admission).
+    fn execute(self, ctx: &crate::StmtContext, multi_schema: bool) -> Result<(), DriverError> {
         for layout in self.layouts {
             layout.execute().map_err(super::auto_random::rebase_error)?;
         }
         for rebase in self.rebases {
             match rebase {
-                PreparedAllocatorRebase::Increment(rebase) => {
+                PreparedAllocatorRebase::Increment(mut rebase) => {
+                    if multi_schema {
+                        if let Some((requested, used)) = rebase
+                            .readjust_to_current_global()
+                            .map_err(auto_increment_rebase_error)?
+                        {
+                            ctx.append_note_parts(
+                                1105,
+                                &format!(
+                                    "Can't reset AUTO_INCREMENT to {} without FORCE option, using {} instead",
+                                    requested as i64, used as i64
+                                ),
+                            );
+                        }
+                    }
                     rebase.execute().map_err(auto_increment_rebase_error)?;
                 }
                 PreparedAllocatorRebase::Random(rebase) => {
@@ -149,7 +167,7 @@ pub fn run_alter_table_in(
         catalog.retain_foreign_key_ids_from(&staged);
         return Err(error);
     }
-    allocators.execute()?;
+    allocators.execute(ctx, alter.actions.len() > 1)?;
     *catalog = staged;
     Ok(())
 }
@@ -185,7 +203,6 @@ impl PreparedAlterAction<'_> {
 /// exactly as Go does so the first conflicting name and its 8200 diagnostic
 /// are stable.
 fn reject_multi_schema_same_column_or_index(
-    actions: &[tidb_ast::AlterTableAction],
     changes: &[PreparedAlterAction<'_>],
 ) -> Result<(), DriverError> {
     let mut add_columns = Vec::new();
@@ -197,7 +214,7 @@ fn reject_multi_schema_same_column_or_index(
     let mut drop_indexes = Vec::new();
     let mut alter_indexes = Vec::new();
 
-    for (action, prepared) in actions.iter().zip(changes) {
+    for prepared in changes {
         match prepared.change.as_ref() {
             Some(PreparedAlterChange::Index(change)) => match change {
                 PreparedIndexChange::Add { name, definition } => {
@@ -271,9 +288,6 @@ fn reject_multi_schema_same_column_or_index(
                 }
             }
             Some(PreparedAlterChange::Metadata(_)) | None => {}
-        }
-        if matches!(action, tidb_ast::AlterTableAction::DropPrimaryKey(_)) {
-            drop_indexes.push("PRIMARY".to_owned());
         }
     }
 
@@ -583,7 +597,7 @@ fn run_alter_table_in_inner(
         prepared.publish_warnings(ctx);
     }
     if actions.len() > 1 {
-        reject_multi_schema_same_column_or_index(&actions, &changes)?;
+        reject_multi_schema_same_column_or_index(&changes)?;
         check_prepared_column_count(&changes, catalog, &database, &name)?;
     }
     reject_drop_index_used_by_added_foreign_key(catalog, &database, &name, &actions)?;
