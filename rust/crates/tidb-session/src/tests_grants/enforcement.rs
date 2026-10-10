@@ -297,7 +297,9 @@ fn reading_another_accounts_credentials_and_grants_is_privileged() {
     let (privs, mut boot) = provisioned();
     boot.run("ALTER USER 'victim'@'%' IDENTIFIED BY 'secret'")
         .unwrap();
-    let mut bob = authenticated_session(&privs, "bob", "%");
+    // Go reads the account row from `mysql.user`, so every connection
+    // shares the boot session's store.
+    let mut bob = session_as(&privs, boot.catalog.clone(), "bob", "%");
 
     assert_eq!(
         denied(&mut bob, "SHOW CREATE USER 'victim'@'%'"),
@@ -318,7 +320,7 @@ fn reading_another_accounts_credentials_and_grants_is_privileged() {
     assert!(bob.run("SHOW GRANTS").is_ok());
     assert!(bob.run("SHOW GRANTS FOR CURRENT_USER()").is_ok());
 
-    let mut admin = authenticated_session(&privs, "admin", "%");
+    let mut admin = session_as(&privs, boot.catalog.clone(), "admin", "%");
     let shown = row_text(admin.run("SHOW CREATE USER 'victim'@'%'"));
     assert!(
         shown[0][0].contains(&privilege::encode_password("secret")),

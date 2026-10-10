@@ -1887,7 +1887,6 @@ pub(crate) fn effective_fix_52592(
 
 fn dml_hints(dml: &DmlStmt) -> Option<&[Hint]> {
     match dml {
-        DmlStmt::With { statement, .. } => dml_hints(statement),
         DmlStmt::Insert(insert) => Some(&insert.hints),
         DmlStmt::Update(update) => Some(&update.hints),
         DmlStmt::Delete(delete) => Some(&delete.hints),

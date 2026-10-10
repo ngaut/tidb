@@ -43,7 +43,6 @@ fn may_have_sql_binding(stmt: &Stmt) -> bool {
 
 fn may_have_dml_binding(dml: &tidb_ast::DmlStmt) -> bool {
     match dml {
-        tidb_ast::DmlStmt::With { statement, .. } => may_have_dml_binding(statement),
         tidb_ast::DmlStmt::Insert(insert) => insert.source.is_some(),
         _ => true,
     }

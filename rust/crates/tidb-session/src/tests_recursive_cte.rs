@@ -526,3 +526,77 @@ fn cte_classes_are_optimized_from_derive_stats_like_go() {
         ["1|10|2|20"]
     );
 }
+
+/// Go `UpdateStmt.With` / `DeleteStmt.With` (expression/misc
+/// TestCTEWithDML): the statement's CTEs resolve in its WHERE subqueries and
+/// FROM, and a CTE named as the write target is 1288, even when a table of
+/// that name exists.
+#[test]
+fn with_clause_scopes_the_whole_update_and_delete() {
+    let mut session = Session::new();
+    session.run("create table t1(a int)").unwrap();
+    session.run("insert into t1 values(2),(3)").unwrap();
+    session
+        .run("insert into t1 with t1 as (select 36 as col from t1) select * from t1")
+        .unwrap();
+    session
+        .run("with cte1(a) as (select 36) update t1 set a = 1 where a in (select a from cte1)")
+        .unwrap();
+    assert_eq!(
+        column(session.run("select * from t1 order by a")),
+        vec!["1", "1", "2", "3"]
+    );
+    session
+        .run(
+            "with recursive cte(a) as (select 1 union select a + 1 from cte where a < 10) \
+             update cte, t1 set t1.a=1",
+        )
+        .unwrap();
+    assert_eq!(
+        column(session.run("select * from t1")),
+        vec!["1", "1", "1", "1"]
+    );
+    for (sql, statement) in [
+        (
+            "with recursive cte(a) as (select 1 union select a + 1 from cte where a < 10) \
+             update cte set a=1",
+            "UPDATE",
+        ),
+        (
+            "with recursive cte(a) as (select 1 union select a + 1 from cte where a < 10) \
+             delete from cte",
+            "DELETE",
+        ),
+        (
+            "with cte(a) as (select a from t1) delete from cte",
+            "DELETE",
+        ),
+        (
+            "with cte(a) as (select a from t1) update cte set a=1",
+            "UPDATE",
+        ),
+    ] {
+        assert_eq!(
+            wire_error(&mut session, sql),
+            (
+                1288,
+                format!("The target table cte of the {statement} is not updatable")
+            ),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        wire_error(
+            &mut session,
+            "with t1 as (select 5 as a) update t1 set a = 2"
+        ),
+        (
+            1288,
+            "The target table t1 of the UPDATE is not updatable".to_owned()
+        )
+    );
+    session
+        .run("with c(a) as (select 1) delete from t1 where a in (select a from c) limit 3")
+        .unwrap();
+    assert_eq!(column(session.run("select * from t1")), vec!["1"]);
+}

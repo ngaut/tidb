@@ -96,29 +96,23 @@ fn sem_stmt_kind(stmt: &Stmt) -> tidb_util::sem_v2::StmtKind {
             },
             tidb_ast::QueryStmt::SetOpr(_) => StmtKind::Other,
         },
-        Stmt::Dml(dml) => {
-            let mut dml = dml.as_ref();
-            while let tidb_ast::DmlStmt::With { statement, .. } = dml {
-                dml = statement;
-            }
-            match dml {
-                tidb_ast::DmlStmt::ImportInto(import) => match &import.source {
-                    tidb_ast::ImportSource::File { path, .. } => StmtKind::ImportInto {
-                        from_select: false,
-                        path: path.clone(),
-                    },
-                    tidb_ast::ImportSource::Select { .. } => StmtKind::ImportInto {
-                        from_select: true,
-                        path: String::new(),
-                    },
+        Stmt::Dml(dml) => match dml.as_ref() {
+            tidb_ast::DmlStmt::ImportInto(import) => match &import.source {
+                tidb_ast::ImportSource::File { path, .. } => StmtKind::ImportInto {
+                    from_select: false,
+                    path: path.clone(),
                 },
-                tidb_ast::DmlStmt::LoadData(load) => StmtKind::LoadData {
-                    file_loc_client: load.local,
-                    path: load.path.clone(),
+                tidb_ast::ImportSource::Select { .. } => StmtKind::ImportInto {
+                    from_select: true,
+                    path: String::new(),
                 },
-                _ => StmtKind::Other,
-            }
-        }
+            },
+            tidb_ast::DmlStmt::LoadData(load) => StmtKind::LoadData {
+                file_loc_client: load.local,
+                path: load.path.clone(),
+            },
+            _ => StmtKind::Other,
+        },
         Stmt::Ddl(ddl) => match ddl.as_ref() {
             tidb_ast::DdlStmt::CreateTable(create) => StmtKind::CreateTable {
                 options: create.table_options.iter().map(sem_table_option).collect(),

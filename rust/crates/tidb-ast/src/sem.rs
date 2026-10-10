@@ -46,7 +46,6 @@ impl QueryStmt {
 impl DmlStmt {
     fn sem_command(&self) -> &'static str {
         match self {
-            Self::With { statement, .. } => statement.sem_command(),
             Self::Insert(insert) if insert.replace => "REPLACE",
             Self::Insert(_) => "INSERT",
             Self::Update(_) => "UPDATE",

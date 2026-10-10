@@ -261,6 +261,11 @@ impl Walk<'_> {
     /// values and ON DUPLICATE values are parameterized, ORDER BY and LIMIT
     /// literals stay verbatim.
     fn update(&mut self, update: &mut tidb_ast::UpdateStmt) -> Result<(), Refusal> {
+        // Go's visitor enters `UpdateStmt.With` first, a node its checker
+        // does not list.
+        if update.with.is_some() {
+            return Err(Refusal::walk("query has some unsupported Node"));
+        }
         for assignment in &mut update.assignments {
             self.check_expr(&assignment.value)?;
         }
@@ -319,6 +324,10 @@ impl Walk<'_> {
 
     /// Go's checker walk over `*ast.DeleteStmt` plus the replacer pass.
     fn delete(&mut self, delete: &mut tidb_ast::DeleteStmt) -> Result<(), Refusal> {
+        // As for UPDATE: `DeleteStmt.With` is an unlisted node.
+        if delete.with.is_some() {
+            return Err(Refusal::walk("query has some unsupported Node"));
+        }
         if let Some(where_clause) = delete.where_clause.as_ref() {
             self.check_inside_filter(|walk| walk.check_expr(where_clause))?;
         }

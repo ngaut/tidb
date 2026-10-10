@@ -48,9 +48,9 @@ fn create_global_binding_with_dml_is_typed_and_bindable() {
         let Stmt::Dml(dml) = target.as_ref() else {
             panic!("expected CTE-prefixed DML target");
         };
-        let tidb_ast::DmlStmt::With { statement, .. } = dml.as_ref() else {
-            panic!("expected DmlStmt::With target");
+        let tidb_ast::DmlStmt::Update(update) = dml.as_ref() else {
+            panic!("expected UPDATE target");
         };
-        assert!(matches!(statement.as_ref(), tidb_ast::DmlStmt::Update(_)));
+        assert!(update.with.is_some());
     }
 }

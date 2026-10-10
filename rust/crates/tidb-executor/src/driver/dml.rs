@@ -2142,6 +2142,17 @@ pub(crate) fn run_update_stmt_with_physical_and_stats(
     physical_plan: Option<&mut tidb_planner::physical::PhysicalPlan>,
     runtime: Option<&mut super::physical_builder::PhysicalRuntimeStats>,
 ) -> Result<u64, DriverError> {
+    // Go `buildUpdateLists` resolves a CTE target's assignment columns and
+    // then refuses it (1288); `update_target_columns` takes the same steps.
+    if let tidb_ast::UpdateKind::Single(table) = &update.kind {
+        if super::planner_bridge::is_cte(update.with.as_ref(), table) {
+            super::planner_bridge::update_target_columns(update, catalog, current_db, ctx)?;
+            return Err(DriverError::NonUpdatableTable {
+                table: table.name.join("."),
+                statement: "UPDATE",
+            });
+        }
+    }
     let source = update_source_query(update);
     let mut fresh = physical_plan
         .is_none()
@@ -2217,6 +2228,7 @@ pub(crate) fn update_source_query(update: &tidb_ast::UpdateStmt) -> Option<tidb_
         tidb_ast::UpdateKind::Multi { .. } => None,
     }
     .map(|mut select| {
+        select.with.clone_from(&update.with);
         select.hints.clone_from(&update.hints);
         tidb_ast::QueryStmt::Select(Box::new(select))
     })
@@ -3380,6 +3392,13 @@ pub(crate) fn run_delete_stmt_with_physical_and_stats(
     // Keep this preflight limited to known read-only objects; ordinary table
     // and missing-table ordering remains owned by the existing planner path.
     if let tidb_ast::DeleteKind::Single(table_ref) = &delete.kind {
+        // `isCTE(tblW)` comes first: a CTE shadows any table of its name.
+        if super::planner_bridge::is_cte(delete.with.as_ref(), table_ref) {
+            return Err(DriverError::NonUpdatableTable {
+                table: table_ref.name.join("."),
+                statement: "DELETE",
+            });
+        }
         let (database, name) = single_table_name(table_ref, current_db)?;
         match catalog.get_in(&database, &name) {
             Some(TableEntry::View(_)) => {
@@ -3441,6 +3460,7 @@ pub(crate) fn delete_source_query(delete: &tidb_ast::DeleteStmt) -> Option<tidb_
         tidb_ast::DeleteKind::Multi { .. } => None,
     }
     .map(|mut select| {
+        select.with.clone_from(&delete.with);
         select.hints.clone_from(&delete.hints);
         tidb_ast::QueryStmt::Select(Box::new(select))
     })

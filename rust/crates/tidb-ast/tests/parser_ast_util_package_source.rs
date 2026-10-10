@@ -100,6 +100,7 @@ fn insert_stmt() -> Stmt {
 
 fn delete_stmt() -> Stmt {
     Stmt::Dml(NodeBox::new(DmlStmt::Delete(Box::new(DeleteStmt {
+        with: None,
         hints: Vec::new(),
         priority: StatementPriority::None,
         quick: false,
@@ -114,6 +115,7 @@ fn delete_stmt() -> Stmt {
 
 fn update_stmt() -> Stmt {
     Stmt::Dml(NodeBox::new(DmlStmt::Update(Box::new(UpdateStmt {
+        with: None,
         hints: Vec::new(),
         priority: StatementPriority::None,
         ignore: false,

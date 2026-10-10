@@ -17,7 +17,7 @@ use crate::select::restore_partition_clause;
 use crate::util::{back_quote, escape_string_literal, push_name_path, redact_url};
 use crate::{
     ColumnOrUserVar, Expr, Hint, Join, Limit, LoadDataOption, OrderItem, QueryStmt, RestoreContext,
-    SelectField, TableRef,
+    SelectField, TableRef, WithClause,
 };
 
 /// MySQL statement priority shared by SELECT, INSERT/REPLACE, UPDATE, and
@@ -370,6 +370,9 @@ impl ImportIntoStmt {
 /// [`UpdateKind`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStmt {
+    /// The leading `WITH` clause (Go `UpdateStmt.With`): CTEs visible to the
+    /// whole statement.
+    pub with: Option<WithClause>,
     /// Optimizer hints immediately after `UPDATE`.
     pub hints: Vec<Hint>,
     /// Optional MySQL priority modifier.
@@ -421,6 +424,15 @@ impl UpdateStmt {
     }
 
     pub(crate) fn restore_into_with_context(&self, out: &mut String, context: &RestoreContext) {
+        let scoped;
+        let context = match &self.with {
+            Some(with) => {
+                scoped = with.restore_into_with_context(out, context);
+                out.push(' ');
+                &scoped
+            }
+            None => context,
+        };
         out.push_str("UPDATE ");
         restore_dml_hints(out, &self.hints);
         self.priority.restore_into(out);
@@ -450,6 +462,9 @@ impl UpdateStmt {
 /// A `DELETE` statement — single-table or multi-table (see [`DeleteKind`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStmt {
+    /// The leading `WITH` clause (Go `DeleteStmt.With`): CTEs visible to the
+    /// whole statement.
+    pub with: Option<WithClause>,
     /// Optimizer hints immediately after `DELETE`.
     pub hints: Vec<Hint>,
     /// Optional MySQL priority modifier.
@@ -504,6 +519,15 @@ impl DeleteStmt {
     }
 
     pub(crate) fn restore_into_with_context(&self, out: &mut String, context: &RestoreContext) {
+        let scoped;
+        let context = match &self.with {
+            Some(with) => {
+                scoped = with.restore_into_with_context(out, context);
+                out.push(' ');
+                &scoped
+            }
+            None => context,
+        };
         out.push_str("DELETE ");
         restore_dml_hints(out, &self.hints);
         self.priority.restore_into(out);
@@ -858,6 +882,7 @@ impl crate::Visitable for UpdateStmt {
             return visitor.leave(self);
         }
         let Self {
+            with,
             hints,
             priority,
             ignore,
@@ -868,6 +893,11 @@ impl crate::Visitable for UpdateStmt {
             limit,
             returning,
         } = self;
+        if let Some(value) = with.as_mut() {
+            if !crate::Visitable::accept(value, visitor) {
+                return false;
+            }
+        }
         for value in hints.iter_mut() {
             if !crate::Visitable::accept(value, visitor) {
                 return false;
@@ -904,6 +934,7 @@ impl crate::Visitable for UpdateStmt {
                 return false;
             }
         }
+        let _ = with;
         let _ = hints;
         let _ = priority;
         let _ = ignore;
@@ -947,6 +978,7 @@ impl crate::Visitable for DeleteStmt {
             return visitor.leave(self);
         }
         let Self {
+            with,
             hints,
             priority,
             quick,
@@ -957,6 +989,11 @@ impl crate::Visitable for DeleteStmt {
             limit,
             returning,
         } = self;
+        if let Some(value) = with.as_mut() {
+            if !crate::Visitable::accept(value, visitor) {
+                return false;
+            }
+        }
         for value in hints.iter_mut() {
             if !crate::Visitable::accept(value, visitor) {
                 return false;
@@ -988,6 +1025,7 @@ impl crate::Visitable for DeleteStmt {
                 return false;
             }
         }
+        let _ = with;
         let _ = hints;
         let _ = priority;
         let _ = quick;

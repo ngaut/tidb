@@ -87,7 +87,6 @@ pub(crate) fn stmt_cacheable(
 
 fn cacheable_dml_kind(dml: &tidb_ast::DmlStmt) -> bool {
     match dml {
-        tidb_ast::DmlStmt::With { statement, .. } => cacheable_dml_kind(statement),
         tidb_ast::DmlStmt::Insert(_)
         | tidb_ast::DmlStmt::Update(_)
         | tidb_ast::DmlStmt::Delete(_) => true,
@@ -265,9 +264,18 @@ impl Visitor for CacheableChecker<'_> {
                 self.enter_with_scope(with);
             }
         }
-        if let Some(tidb_ast::DmlStmt::With { with, .. }) = node.downcast_ref::<tidb_ast::DmlStmt>()
-        {
-            self.enter_with_scope(with);
+        // Go opens no WITH scope for UPDATE/DELETE; a recursive CTE still
+        // exposes its name before its own query is walked.
+        let dml_with = node
+            .downcast_ref::<tidb_ast::UpdateStmt>()
+            .and_then(|update| update.with.as_ref())
+            .or_else(|| {
+                node.downcast_ref::<tidb_ast::DeleteStmt>()
+                    .and_then(|delete| delete.with.as_ref())
+            });
+        if let Some(with) = dml_with.filter(|with| with.recursive) {
+            self.cte_can_use
+                .extend(with.ctes.iter().map(|cte| cte.name.to_ascii_lowercase()));
         }
         if let Some(insert) = node.downcast_ref::<tidb_ast::InsertStmt>() {
             if insert.source.is_none() {
@@ -378,10 +386,6 @@ impl Visitor for CacheableChecker<'_> {
             || node
                 .downcast_ref::<tidb_ast::SetOprStmt>()
                 .is_some_and(|set_opr| set_opr.with.is_some())
-            || matches!(
-                node.downcast_ref::<tidb_ast::DmlStmt>(),
-                Some(tidb_ast::DmlStmt::With { .. })
-            )
         {
             self.leave_with_scope();
         }

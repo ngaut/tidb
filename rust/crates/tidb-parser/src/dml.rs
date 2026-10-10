@@ -700,6 +700,7 @@ impl Parser {
         }
         let returning = self.parse_returning_fields()?;
         Ok(UpdateStmt {
+            with: None,
             hints,
             priority,
             ignore,
@@ -794,6 +795,7 @@ impl Parser {
             self.parse_returning_fields()?
         };
         Ok(DeleteStmt {
+            with: None,
             hints,
             priority,
             quick,

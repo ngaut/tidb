@@ -220,12 +220,14 @@ impl MultiLayout {
 /// resolution, but execute only when the retained physical child is opened.
 fn build_multi_layout(
     join: &tidb_ast::Join,
+    with: Option<&tidb_ast::WithClause>,
     catalog: &Catalog,
     current_db: &str,
     ctx: &crate::StmtContext,
 ) -> Result<MultiLayout, DriverError> {
-    let logical = super::planner_bridge::logical_from_plan(join, catalog, current_db, ctx, true)
-        .map_err(super::planner_error_to_driver)?;
+    let logical =
+        super::planner_bridge::logical_from_plan(join, with, catalog, current_db, ctx, true)
+            .map_err(super::planner_error_to_driver)?;
     let schema = logical
         .schema()
         .ok_or_else(|| DriverError::unsupported("DML source has no schema"))?;
@@ -238,6 +240,7 @@ fn build_multi_layout(
 
     fn node_layout(
         node: &tidb_ast::JoinNode,
+        with: Option<&tidb_ast::WithClause>,
         catalog: &Catalog,
         current_db: &str,
         ctx: &crate::StmtContext,
@@ -245,7 +248,13 @@ fn build_multi_layout(
     ) -> Result<MultiLayout, DriverError> {
         let (visible, qualifiable_db, origin, mut columns, default_meta) = match node {
             tidb_ast::JoinNode::Join(join) => {
-                return join_layout(join, catalog, current_db, ctx, columns_for_alias)
+                return join_layout(join, with, catalog, current_db, ctx, columns_for_alias)
+            }
+            // Go `isCTE`: a CTE is a read source only, like a derived table.
+            tidb_ast::JoinNode::Table(table) if super::planner_bridge::is_cte(with, table) => {
+                let visible = table.alias.clone().unwrap_or_else(|| table.name.join("."));
+                let columns = columns_for_alias(&visible)?;
+                (visible, None, SourceOrigin::Derived, columns, Vec::new())
             }
             tidb_ast::JoinNode::Table(table) => {
                 let (database, name) = split_table_path(&table.name, current_db)?;
@@ -338,16 +347,24 @@ fn build_multi_layout(
 
     fn join_layout(
         join: &tidb_ast::Join,
+        with: Option<&tidb_ast::WithClause>,
         catalog: &Catalog,
         current_db: &str,
         ctx: &crate::StmtContext,
         columns_for_alias: &impl Fn(&str) -> Result<Vec<(String, FieldType)>, DriverError>,
     ) -> Result<MultiLayout, DriverError> {
-        let left = node_layout(&join.left, catalog, current_db, ctx, columns_for_alias)?;
+        let left = node_layout(
+            &join.left,
+            with,
+            catalog,
+            current_db,
+            ctx,
+            columns_for_alias,
+        )?;
         match &join.right {
             Some(right) => merge_source_layout(
                 left,
-                node_layout(right, catalog, current_db, ctx, columns_for_alias)?,
+                node_layout(right, with, catalog, current_db, ctx, columns_for_alias)?,
                 join,
                 ctx,
             ),
@@ -371,7 +388,7 @@ fn build_multi_layout(
             })
             .collect::<Result<Vec<_>, DriverError>>()
     };
-    join_layout(join, catalog, current_db, ctx, &columns_for_alias)
+    join_layout(join, with, catalog, current_db, ctx, &columns_for_alias)
 }
 
 /// DELETE permissions use the same resolved outer targets as execution and
@@ -387,10 +404,17 @@ pub fn delete_privilege_tables(
         let tidb_ast::DeleteKind::Single(table) = &delete.kind else {
             unreachable!()
         };
+        // Go `buildDelete`'s single-table arm: `if isCTE(tblW)` is 1288.
+        if super::planner_bridge::is_cte(delete.with.as_ref(), table) {
+            return Err(DriverError::NonUpdatableTable {
+                table: table.name.join("."),
+                statement: "DELETE",
+            });
+        }
         let (database, name) = split_table_path(&table.name, current_db)?;
         return Ok(vec![(database.to_owned(), name.to_owned())]);
     };
-    let source = build_multi_layout(from, catalog, current_db, ctx)?;
+    let source = build_multi_layout(from, delete.with.as_ref(), catalog, current_db, ctx)?;
     let mut resolved = Vec::new();
     for slot in resolve_delete_targets(targets, &source)? {
         let SourceOrigin::Base { database, name } = &source.tables[slot].origin else {
@@ -502,7 +526,7 @@ pub(crate) fn run_multi_update(
     fk_triggers: &[tidb_planner::physical::FkTriggerNode],
     runtime: Option<&mut super::physical_builder::PhysicalRuntimeStats>,
 ) -> Result<u64, DriverError> {
-    let source = build_multi_layout(from, catalog, current_db, ctx)?;
+    let source = build_multi_layout(from, update.with.as_ref(), catalog, current_db, ctx)?;
     let scope = source.scope();
     let assignments = resolve_assignments(&update.assignments, &source, &scope, ctx)?;
     check_update_list(&assignments, &source, catalog)?;
@@ -934,7 +958,7 @@ pub(crate) fn run_multi_delete(
     fk_triggers: &[tidb_planner::physical::FkTriggerNode],
     runtime: Option<&mut super::physical_builder::PhysicalRuntimeStats>,
 ) -> Result<u64, DriverError> {
-    let source = build_multi_layout(from, catalog, current_db, ctx)?;
+    let source = build_multi_layout(from, delete.with.as_ref(), catalog, current_db, ctx)?;
     let target_slots = resolve_delete_targets(targets, &source)?;
     let rows = {
         let plan = physical_plan
@@ -1032,8 +1056,10 @@ fn resolve_delete_targets(
 
 /// Go `buildUpdate`/`buildDelete`'s read: the `FROM` join with the `WHERE`,
 /// `ORDER BY` and `LIMIT` above it, as one SELECT for the planner, carrying
-/// the statement's hints (`pushTableHints(stmt.TableHints, 0)`).
+/// the statement's `WITH` clause and hints (`pushTableHints(stmt.TableHints,
+/// 0)`).
 pub(crate) fn multi_dml_select(
+    with: Option<&tidb_ast::WithClause>,
     hints: &[tidb_ast::Hint],
     from: &tidb_ast::Join,
     where_clause: Option<&tidb_ast::Expr>,
@@ -1045,7 +1071,7 @@ pub(crate) fn multi_dml_select(
     tidb_ast::QueryStmt::Select(Box::new(tidb_ast::SelectStmt {
         kind: Default::default(),
         is_in_braces: false,
-        with: None,
+        with: with.cloned(),
         hints: hints.to_vec(),
         priority: Default::default(),
         sql_small_result: false,
@@ -1118,6 +1144,7 @@ pub(crate) fn multi_dml_physical_plan(
             (
                 "Update",
                 multi_dml_select(
+                    update.with.as_ref(),
                     &update.hints,
                     from,
                     update.where_clause.as_ref(),
@@ -1137,7 +1164,14 @@ pub(crate) fn multi_dml_physical_plan(
             }
             (
                 "Delete",
-                multi_dml_select(&delete.hints, from, delete.where_clause.as_ref(), &[], None),
+                multi_dml_select(
+                    delete.with.as_ref(),
+                    &delete.hints,
+                    from,
+                    delete.where_clause.as_ref(),
+                    &[],
+                    None,
+                ),
             )
         }
     };

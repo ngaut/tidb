@@ -167,6 +167,7 @@ fn dml_visitor_cover() {
 
     // {&DeleteStmt{TableRefs(ON=ce), Tables, Where: ce, Limit{ce, ce}}} → 4.
     let delete = DeleteStmt {
+        with: None,
         hints: Vec::new(),
         priority: Default::default(),
         quick: false,
@@ -382,6 +383,7 @@ fn dml_visitor_cover() {
 
     // {&UpdateStmt{TableRefs}} with the embedded ON=ce reachable.
     let update = UpdateStmt {
+        with: None,
         hints: Vec::new(),
         priority: Default::default(),
         ignore: false,

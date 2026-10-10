@@ -16,20 +16,12 @@
 use crate::util::push_name_path;
 use crate::{
     DeleteStmt, DistributeTableStmt, Expr, ImportIntoStmt, InsertStmt, LoadDataStmt,
-    RestoreContext, UpdateStmt, WithClause,
+    RestoreContext, UpdateStmt,
 };
 
 /// A statement that mutates table rows.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DmlStmt {
-    /// A top-level `WITH ... <DML>` statement. The CTE prefix belongs to the
-    /// mutation statement, not to a synthetic SELECT.
-    With {
-        /// The source-ordered CTE definitions.
-        with: WithClause,
-        /// The DML statement governed by those CTE definitions.
-        statement: Box<DmlStmt>,
-    },
     /// An `INSERT` or `REPLACE` statement.
     Insert(Box<InsertStmt>),
     /// An `UPDATE` statement.
@@ -56,11 +48,6 @@ impl DmlStmt {
 
     pub(crate) fn restore_into_with_context(&self, out: &mut String, context: &RestoreContext) {
         match self {
-            Self::With { with, statement } => {
-                let scoped = with.restore_into_with_context(out, context);
-                out.push(' ');
-                statement.restore_into_with_context(out, &scoped);
-            }
             Self::Insert(insert) => insert.restore_into_with_context(out, context),
             Self::Update(update) => update.restore_into_with_context(out, context),
             Self::Delete(delete) => delete.restore_into_with_context(out, context),
@@ -182,16 +169,6 @@ impl crate::Visitable for DmlStmt {
             return visitor.leave(self);
         }
         match self {
-            Self::With { with, statement } => {
-                if !crate::Visitable::accept(with, visitor) {
-                    return false;
-                }
-                if !crate::Visitable::accept(statement.as_mut(), visitor) {
-                    return false;
-                }
-                let _ = with;
-                let _ = statement;
-            }
             Self::Insert(field_0) => {
                 if !crate::Visitable::accept(field_0.as_mut(), visitor) {
                     return false;

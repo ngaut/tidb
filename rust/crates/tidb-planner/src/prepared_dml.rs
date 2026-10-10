@@ -981,7 +981,6 @@ fn lower_write(
         DmlStmt::Delete(delete) => {
             lower_delete(delete, catalog, mode).map(ConfiguredPreparedWriteTemplate::Delete)
         }
-        DmlStmt::With { .. } => Err(unsupported(UnsupportedPreparedWrite::CommonTableExpression)),
         DmlStmt::ImportInto(_)
         | DmlStmt::LoadData(_)
         | DmlStmt::Batch(_)
@@ -1165,6 +1164,9 @@ fn lower_update(
     catalog: &ConfiguredCatalog,
     mode: ValueMode,
 ) -> Result<ConfiguredPreparedUpdateTemplate, PreparedWritePlanError> {
+    if statement.with.is_some() {
+        return Err(unsupported(UnsupportedPreparedWrite::CommonTableExpression));
+    }
     if statement.ignore {
         return Err(unsupported(UnsupportedPreparedWrite::Ignore));
     }
@@ -1265,6 +1267,9 @@ fn lower_delete(
     catalog: &ConfiguredCatalog,
     mode: ValueMode,
 ) -> Result<ConfiguredPreparedDeleteTemplate, PreparedWritePlanError> {
+    if statement.with.is_some() {
+        return Err(unsupported(UnsupportedPreparedWrite::CommonTableExpression));
+    }
     if statement.ignore {
         return Err(unsupported(UnsupportedPreparedWrite::Ignore));
     }

@@ -117,15 +117,14 @@ pub(crate) enum StatementKind {
     Other,
 }
 
-/// Classifies a parsed statement for `ROW_COUNT()`, unwrapping a `WITH`
-/// prefix the way Go does -- the CTE belongs to the mutation, so
-/// `WITH x AS (...) DELETE ...` still sets `InDeleteStmt` -- and an EXPLAIN,
+/// Classifies a parsed statement for `ROW_COUNT()` -- a `WITH` prefix belongs
+/// to the mutation, so `WITH x AS (...) DELETE ...` still sets
+/// `InDeleteStmt` -- unwrapping an EXPLAIN,
 /// which `ResetContextOfStmt` replaces by its target before setting the bits
 /// (`EXPLAIN SELECT` leaves `ROW_COUNT()` at -1).
 pub(crate) fn statement_kind_of(stmt: &Stmt) -> StatementKind {
     fn dml_kind(dml: &DmlStmt) -> StatementKind {
         match dml {
-            DmlStmt::With { statement, .. } => dml_kind(statement),
             DmlStmt::Insert(_) | DmlStmt::Update(_) | DmlStmt::Delete(_) => StatementKind::Dml,
             _ => StatementKind::Other,
         }
@@ -152,7 +151,6 @@ pub(crate) fn statement_kind_of(stmt: &Stmt) -> StatementKind {
 pub(crate) fn statement_priority_of(stmt: &Stmt) -> StatementPriority {
     fn dml_priority(dml: &DmlStmt) -> StatementPriority {
         match dml {
-            DmlStmt::With { statement, .. } => dml_priority(statement),
             DmlStmt::Insert(insert) => insert.priority,
             DmlStmt::Update(update) => update.priority,
             DmlStmt::Delete(delete) => delete.priority,

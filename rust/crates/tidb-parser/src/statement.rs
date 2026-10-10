@@ -755,16 +755,20 @@ impl Parser {
             )))
         } else if self.is_kw("WITH") {
             let with = self.parse_with_clause()?;
+            // Go `UpdateStmt.With` / `DeleteStmt.With`: the CTEs belong to
+            // the statement itself.
             if self.is_kw("UPDATE") {
-                Ok(Stmt::Dml(tidb_ast::NodeBox::new(DmlStmt::With {
-                    with,
-                    statement: Box::new(DmlStmt::Update(Box::new(self.parse_update()?))),
-                })))
+                let mut update = self.parse_update()?;
+                update.with = Some(with);
+                Ok(Stmt::Dml(tidb_ast::NodeBox::new(DmlStmt::Update(
+                    Box::new(update),
+                ))))
             } else if self.is_kw("DELETE") {
-                Ok(Stmt::Dml(tidb_ast::NodeBox::new(DmlStmt::With {
-                    with,
-                    statement: Box::new(DmlStmt::Delete(Box::new(self.parse_delete()?))),
-                })))
+                let mut delete = self.parse_delete()?;
+                delete.with = Some(with);
+                Ok(Stmt::Dml(tidb_ast::NodeBox::new(DmlStmt::Delete(
+                    Box::new(delete),
+                ))))
             } else {
                 Ok(Stmt::Query(tidb_ast::NodeBox::new(
                     self.attach_with_to_query(with)?,

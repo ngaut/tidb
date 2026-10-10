@@ -192,17 +192,11 @@ pub fn generate_binding_sql(stmt: &Stmt, plan_hint: &str, default_db: &str) -> S
         return String::new();
     }
 
-    // Go's `switch` is over the statement node itself. A `WITH ... <DML>` is
-    // one wrapper node in this AST and a `With` field on the DML node in Go,
-    // so unwrapping it lands on the same case Go takes.
-    let mut node: &DmlStmt;
+    // Go's `switch` is over the statement node itself; a `WITH ... <DML>` is
+    // the DML node carrying its `With` field.
     match &stmt {
         Stmt::Dml(dml) => {
-            node = dml;
-            while let DmlStmt::With { statement, .. } = node {
-                node = statement;
-            }
-            match node {
+            match dml.as_ref() {
                 DmlStmt::Delete(_) => splice_after_keyword(&bind_sql, "DELETE", plan_hint),
                 DmlStmt::Update(_) => splice_after_keyword(&bind_sql, "UPDATE", plan_hint),
                 // Go slices from `REPLACE`/`INSERT` to drop a possible
@@ -216,7 +210,6 @@ pub fn generate_binding_sql(stmt: &Stmt, plan_hint: &str, default_db: &str) -> S
                     };
                     replace_first(&bind_sql[start..], "SELECT", &hinted("SELECT", plan_hint))
                 }
-                DmlStmt::With { .. } => unreachable!("the loop above unwraps every With node"),
                 _ => String::new(),
             }
         }

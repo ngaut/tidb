@@ -45,7 +45,6 @@ impl QueryStmt {
 impl DmlStmt {
     fn label(&self) -> &'static str {
         match self {
-            Self::With { statement, .. } => statement.label(),
             Self::Insert(insert) if insert.replace => "Replace",
             Self::Insert(_) => "Insert",
             Self::Update(_) => "Update",

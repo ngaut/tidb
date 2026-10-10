@@ -502,73 +502,106 @@ impl Session {
                 "SHOW CREATE USER requires a server front end with a privilege registry",
             ));
         };
-        if !registry.user_exists(&user, &host) {
+        let row = if self.user_table_present() {
+            self.show_create_user_row(&user, &host)?
+        } else {
+            // A bare catalog has no `mysql.user`; the registry holds the
+            // same account columns.
+            registry.user_exists(&user, &host).then(|| {
+                let expiry = registry.password_expiry(&user, &host).unwrap_or_default();
+                let locking = registry.password_locking(&user, &host);
+                let (history, reuse_days) = registry.password_reuse_policy(&user, &host);
+                ShowCreateUserRow {
+                    plugin: registry.plugin(&user, &host).unwrap_or_default(),
+                    account_locked: registry.is_role(&user, &host),
+                    metadata: String::new(),
+                    token_issuer: String::new(),
+                    password_reuse_history: history.map(|n| n.to_string()),
+                    password_reuse_time: reuse_days.map(|n| n.to_string()),
+                    password_expired: expiry.expired,
+                    password_lifetime: expiry.lifetime.map_or(-1, i64::from),
+                    failed_login_attempts: locking
+                        .as_ref()
+                        .map(|locking| locking.failed_login_attempts.to_string())
+                        .unwrap_or_default(),
+                    password_lock_time_days: locking
+                        .map(|locking| locking.password_lock_time_days.to_string())
+                        .unwrap_or_default(),
+                    auth_data: registry.auth_string(&user, &host).unwrap_or_default(),
+                    max_user_connections: 0,
+                }
+            })
+        };
+        let Some(row) = row else {
             return Err(DriverError::CannotUserRole {
                 operation: "SHOW CREATE USER",
                 target: format!("'{user}'@'{host}'"),
             });
-        }
-        let plugin = registry
-            .plugin(&user, &host)
-            .unwrap_or_else(|| tidb_mysql::consts::AuthNativePassword.to_owned());
-        let auth_string = registry.auth_string(&user, &host).unwrap_or_default();
+        };
+        // Go starts from the global `default_authentication_plugin` and takes
+        // the row's plugin only when it is non-empty.
+        let plugin = if row.plugin.is_empty() {
+            self.vars
+                .get_global("default_authentication_plugin")
+                .map_err(crate::variables::var_error)?
+        } else {
+            row.plugin
+        };
+        let account_clause = if row.account_locked { "LOCK" } else { "UNLOCK" };
+        let attribute_clause = if row.metadata.is_empty() {
+            String::new()
+        } else {
+            format!(" ATTRIBUTE '{}'", row.metadata)
+        };
+        let token_issuer = if row.token_issuer.is_empty() {
+            String::new()
+        } else {
+            format!(" token_issuer {}", row.token_issuer)
+        };
+        let history = row
+            .password_reuse_history
+            .unwrap_or_else(|| "DEFAULT".to_owned());
+        let reuse_interval = row
+            .password_reuse_time
+            .map_or_else(|| "DEFAULT".to_owned(), |days| format!("{days} DAY"));
+        let expire_clause = if row.password_expired {
+            "PASSWORD EXPIRE".to_owned()
+        } else if row.password_lifetime == 0 {
+            "PASSWORD EXPIRE NEVER".to_owned()
+        } else if row.password_lifetime > 0 {
+            format!("PASSWORD EXPIRE INTERVAL {} DAY", row.password_lifetime)
+        } else {
+            "PASSWORD EXPIRE DEFAULT".to_owned()
+        };
+        let failed_login_attempts = if row.failed_login_attempts.is_empty() {
+            String::new()
+        } else {
+            format!(" FAILED_LOGIN_ATTEMPTS {}", row.failed_login_attempts)
+        };
+        let password_lock_time = match row.password_lock_time_days.as_str() {
+            "" => String::new(),
+            "-1" => " PASSWORD_LOCK_TIME UNBOUNDED".to_owned(),
+            days => format!(" PASSWORD_LOCK_TIME {days}"),
+        };
+        let max_user_connections = if row.max_user_connections > 0 {
+            format!(" WITH MAX_USER_CONNECTIONS {}", row.max_user_connections)
+        } else {
+            String::new()
+        };
         // Go: `authStr` is empty ONLY for `auth_socket` with no stored data;
         // every other plugin (including a native/sha2/sm3 account with an
         // empty, passwordless hash) still prints ` AS '<possibly empty>'`.
-        let auth_clause = if plugin == tidb_mysql::consts::AuthSocket && auth_string.is_empty() {
+        let auth_clause = if plugin == tidb_mysql::consts::AuthSocket && row.auth_data.is_empty() {
             String::new()
         } else {
-            format!(" AS '{auth_string}'")
+            format!(" AS '{}'", row.auth_data)
         };
-        let account_clause = if registry.is_role(&user, &host) {
-            "LOCK"
-        } else {
-            "UNLOCK"
-        };
-        // Go picks ONE expiry clause from the two columns, in this order
-        // (all four captured): `Password_expired='Y'` prints a bare
-        // `PASSWORD EXPIRE` whatever the lifetime is, then a zero lifetime
-        // prints `NEVER`, then a positive one prints `INTERVAL n DAY`, and a
-        // NULL lifetime prints `DEFAULT`.
-        let expiry = registry.password_expiry(&user, &host).unwrap_or_default();
-        let expire_clause = if expiry.expired {
-            "PASSWORD EXPIRE".to_owned()
-        } else {
-            match expiry.lifetime {
-                Some(0) => "PASSWORD EXPIRE NEVER".to_owned(),
-                Some(days) if days > 0 => format!("PASSWORD EXPIRE INTERVAL {days} DAY"),
-                _ => "PASSWORD EXPIRE DEFAULT".to_owned(),
-            }
-        };
-        // Both suffixes appear together or not at all, because Go reads them
-        // from one `Password_locking` object that exists only when at least
-        // one of the two options is nonzero (captured:
-        // `FAILED_LOGIN_ATTEMPTS 3 PASSWORD_LOCK_TIME 3` prints both, a plain
-        // account prints neither, and `PASSWORD_LOCK_TIME 6` alone still
-        // prints ` FAILED_LOGIN_ATTEMPTS 0 PASSWORD_LOCK_TIME 6`).
-        let locking_clause = registry
-            .password_locking(&user, &host)
-            .map(|locking| {
-                let lock_time = if locking.password_lock_time_days == -1 {
-                    "UNBOUNDED".to_owned()
-                } else {
-                    locking.password_lock_time_days.to_string()
-                };
-                format!(
-                    " FAILED_LOGIN_ATTEMPTS {} PASSWORD_LOCK_TIME {lock_time}",
-                    locking.failed_login_attempts
-                )
-            })
-            .unwrap_or_default();
         // Go's `fetchShowCreateUser` reads the `mysql.global_priv` PRIV
         // JSON's `ssl_type` for this clause (captured: `REQUIRE SSL` for an
         // account created with it, `REQUIRE NONE` for one without).
         let require_clause = registry.tls_require_clause(&user, &host);
-        let (history, reuse_days) = registry.password_reuse_policy(&user, &host);
-        let history = history.map_or_else(|| "DEFAULT".to_owned(), |n| n.to_string());
-        let reuse_days = reuse_days.map_or_else(|| "DEFAULT".to_owned(), |n| format!("{n} DAY"));
         let show_str = format!(
-            "CREATE USER '{user}'@'{host}' IDENTIFIED WITH '{plugin}'{auth_clause} REQUIRE {require_clause} {expire_clause} ACCOUNT {account_clause} PASSWORD HISTORY {history} PASSWORD REUSE INTERVAL {reuse_days}{locking_clause}"
+            "CREATE USER '{user}'@'{host}' IDENTIFIED WITH '{plugin}'{auth_clause} REQUIRE {require_clause}{token_issuer}{max_user_connections} {expire_clause} ACCOUNT {account_clause} PASSWORD HISTORY {history} PASSWORD REUSE INTERVAL {reuse_interval}{failed_login_attempts}{password_lock_time}{attribute_clause}"
         );
         // Go: `fmt.Sprintf("CREATE USER for %s", s.User)` -- `s.User.String()`
         // is unquoted `user@host` (same shape `SHOW GRANTS`'s header uses).
@@ -576,6 +609,55 @@ impl Session {
             &format!("CREATE USER for {user}@{host}"),
             vec![show_str],
         ))
+    }
+
+    /// Go `fetchShowCreateUser`'s `ExecRestrictedSQL` over `mysql.user`,
+    /// column for column; `None` when the account has no row.
+    fn show_create_user_row(
+        &mut self,
+        user: &str,
+        host: &str,
+    ) -> Result<Option<ShowCreateUserRow>, DriverError> {
+        let sql = format!(
+            "SELECT plugin, Account_locked, user_attributes->>'$.metadata', Token_issuer, \
+             Password_reuse_history, Password_reuse_time, Password_expired, Password_lifetime, \
+             user_attributes->>'$.Password_locking.failed_login_attempts', \
+             user_attributes->>'$.Password_locking.password_lock_time_days', \
+             authentication_string, Max_user_connections \
+             FROM mysql.user WHERE User={} AND Host={}",
+            crate::user_table::sql_str(user),
+            crate::user_table::sql_str(&host.to_lowercase()),
+        );
+        let ctx = self.statement_context(false);
+        let (_, rows) = self.with_catalog_mut(|catalog| {
+            tidb_executor::run_select_meta_in(&sql, catalog, tidb_mysql::consts::SystemDB, &ctx)
+        })?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        // Go `Row.GetString`: a NULL cell reads as "".
+        let text = |index: usize| -> String {
+            row.get(index)
+                .filter(|value| !value.is_null())
+                .and_then(|value| value.to_bytes().ok())
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        };
+        let nullable = |index: usize| row.get(index).is_some_and(|value| !value.is_null());
+        Ok(Some(ShowCreateUserRow {
+            plugin: text(0),
+            account_locked: !text(1).ends_with('N'),
+            metadata: text(2),
+            token_issuer: text(3),
+            password_reuse_history: nullable(4).then(|| text(4)),
+            password_reuse_time: nullable(5).then(|| text(5)),
+            password_expired: text(6) == "Y",
+            password_lifetime: if nullable(7) { row[7].get_int64() } else { -1 },
+            failed_login_attempts: text(8),
+            password_lock_time_days: text(9),
+            auth_data: text(10),
+            max_user_connections: row.get(11).map_or(0, Datum::get_int64),
+        }))
     }
 
     /// `SET PASSWORD [FOR <account>] = '<password>'`: the same
@@ -712,4 +794,22 @@ impl Session {
         self.sandbox_mode = false;
         Ok(StmtOutput::Affected(0))
     }
+}
+
+/// The `mysql.user` columns Go `fetchShowCreateUser` reads, in its order.
+struct ShowCreateUserRow {
+    plugin: String,
+    account_locked: bool,
+    /// `user_attributes->>'$.metadata'`.
+    metadata: String,
+    token_issuer: String,
+    password_reuse_history: Option<String>,
+    password_reuse_time: Option<String>,
+    password_expired: bool,
+    /// `-1` for NULL.
+    password_lifetime: i64,
+    failed_login_attempts: String,
+    password_lock_time_days: String,
+    auth_data: String,
+    max_user_connections: i64,
 }

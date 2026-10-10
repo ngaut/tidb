@@ -215,7 +215,6 @@ fn extract_dml_hints(
     mut warnings: Option<&mut Vec<HintWarning>>,
 ) -> Vec<Hint> {
     match statement {
-        DmlStmt::With { statement, .. } => extract_dml_hints(statement, warnings),
         DmlStmt::Update(update) => update.hints.clone(),
         DmlStmt::Delete(delete) => delete.hints.clone(),
         DmlStmt::Insert(insert) => {
@@ -298,7 +297,7 @@ pub fn restore_index_hint(hint: &IndexHint) -> String {
 pub fn node_type_for_stmt(statement: &Stmt) -> NodeType {
     match statement {
         Stmt::Query(_) => NodeType::Select,
-        Stmt::Dml(dml) => match unwrap_dml(dml) {
+        Stmt::Dml(dml) => match dml.as_ref() {
             DmlStmt::Insert(_) => NodeType::Select,
             DmlStmt::Update(_) => NodeType::Update,
             DmlStmt::Delete(_) => NodeType::Delete,
@@ -464,16 +463,6 @@ fn fill_table_database(table: &mut HintTable, database: &str) {
     if table.db_name.as_deref().is_none_or(str::is_empty) {
         table.db_name = Some(database.to_owned());
     }
-}
-
-fn unwrap_dml(mut statement: &DmlStmt) -> &DmlStmt {
-    while let DmlStmt::With {
-        statement: inner, ..
-    } = statement
-    {
-        statement = inner;
-    }
-    statement
 }
 
 /// Go `CheckBindingFromHistoryComplete`.

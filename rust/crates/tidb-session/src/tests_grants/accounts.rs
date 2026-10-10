@@ -582,3 +582,48 @@ fn alter_user_is_atomic_and_refuses_anonymous_expiry() {
         ]]
     );
 }
+
+/// Go `fetchShowCreateUser` reads the account from `mysql.user`, not the
+/// privilege cache: an emptied `plugin` shows the global
+/// `default_authentication_plugin`, and the metadata and locking columns
+/// render as Go renders them (oracle-captured).
+#[test]
+fn show_create_user_renders_the_mysql_user_row() {
+    let privs = privilege::PrivilegeRegistry::default();
+    let mut boot = bootstrap_session(&privs);
+    boot.run("CREATE USER 'u1'@'%' IDENTIFIED WITH 'mysql_native_password'")
+        .unwrap();
+    boot.run("SET GLOBAL default_authentication_plugin = 'caching_sha2_password'")
+        .unwrap();
+    boot.run("UPDATE mysql.user SET plugin = '' WHERE user = 'u1'")
+        .unwrap();
+    boot.run(
+        "CREATE USER 'u2'@'%' FAILED_LOGIN_ATTEMPTS 3 PASSWORD_LOCK_TIME UNBOUNDED \
+         COMMENT 'hello'",
+    )
+    .unwrap();
+    boot.run("CREATE USER 'u3'@'%' ATTRIBUTE '{\"age\": 20}'")
+        .unwrap();
+    let show = |session: &mut Session, account: &str| {
+        row_text(session.run(&format!("SHOW CREATE USER {account}")))[0][0].clone()
+    };
+    assert_eq!(
+        show(&mut boot, "'u1'@'%'"),
+        "CREATE USER 'u1'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '' REQUIRE NONE \
+         PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK PASSWORD HISTORY DEFAULT PASSWORD REUSE \
+         INTERVAL DEFAULT"
+    );
+    assert_eq!(
+        show(&mut boot, "'u2'@'%'"),
+        "CREATE USER 'u2'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '' REQUIRE NONE \
+         PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK PASSWORD HISTORY DEFAULT PASSWORD REUSE \
+         INTERVAL DEFAULT FAILED_LOGIN_ATTEMPTS 3 PASSWORD_LOCK_TIME UNBOUNDED \
+         ATTRIBUTE '{\"comment\": \"hello\"}'"
+    );
+    assert_eq!(
+        show(&mut boot, "'u3'@'%'"),
+        "CREATE USER 'u3'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '' REQUIRE NONE \
+         PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK PASSWORD HISTORY DEFAULT PASSWORD REUSE \
+         INTERVAL DEFAULT ATTRIBUTE '{\"age\": 20}'"
+    );
+}

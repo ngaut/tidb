@@ -316,12 +316,13 @@ fn render_rows(
     output_names: &[tidb_datatype::FieldNameMetadata],
     rows: &[Vec<Datum>],
 ) -> Vec<Vec<u8>> {
+    // The recorder reads names off the wire, where Go `column.Info.Dump` cuts
+    // each one to `maxColumnNameSize` bytes.
     let mut out = vec![columns
         .iter()
-        .map(|(name, _)| name.clone())
+        .map(|(name, _)| &name.as_bytes()[..name.len().min(tidb_protocol::MAX_COLUMN_NAME_SIZE)])
         .collect::<Vec<_>>()
-        .join("\t")
-        .into_bytes()];
+        .join(&b'\t')];
     out.extend(rows.iter().map(|row| {
         let mut line = Vec::new();
         for (index, value) in row.iter().enumerate() {

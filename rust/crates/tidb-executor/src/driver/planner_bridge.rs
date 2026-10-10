@@ -845,8 +845,23 @@ impl tidb_planner::find_best_task::dispatch::MppWarningSink for crate::StmtConte
     }
 }
 
+/// Go `isCTE(tblW)` for a write statement's table ref: `buildDataSource`
+/// resolves an unqualified name to a CTE of the statement's `WITH` before any
+/// table of that name.
+pub(super) fn is_cte(with: Option<&tidb_ast::WithClause>, table: &tidb_ast::TableRef) -> bool {
+    let [name] = table.name.as_slice() else {
+        return false;
+    };
+    with.is_some_and(|with| {
+        with.ctes
+            .iter()
+            .any(|cte| cte.name.to_lowercase() == name.to_lowercase())
+    })
+}
+
 pub(super) fn logical_from_plan(
     join: &tidb_ast::Join,
+    with: Option<&tidb_ast::WithClause>,
     catalog: &Catalog,
     current_database: &str,
     ctx: &crate::StmtContext,
@@ -872,6 +887,15 @@ pub(super) fn logical_from_plan(
     builder.index_lookup_push_down_session = ctx.index_lookup_push_down_session();
     builder.is_for_update_read = in_dml;
     builder.in_update_or_delete_stmt = in_dml;
+    // Go `buildUpdate`/`buildDelete` build the statement's `WITH` before its
+    // table refs, so a CTE name in the FROM resolves to the CTE.
+    if let Some(with) = with {
+        let counts = tidb_planner::plan_builder::cte::cte_consumer_counts(
+            &super::multi_dml::multi_dml_select(Some(with), &[], join, None, &[], None),
+            with,
+        );
+        builder.build_with(with, &counts)?;
+    }
     builder.build_join(join)
 }
 
@@ -905,8 +929,23 @@ pub(super) fn update_target_columns(
     use tidb_ast::{JoinNode, UpdateKind};
     use tidb_datatype::QualifiedColumnName;
 
-    // A fast single-table update has only one possible write owner.
+    // A fast single-table update has only one possible write owner; a CTE
+    // target resolves its columns like any source before Go refuses it.
+    let cte_target;
     let from = match &update.kind {
+        UpdateKind::Single(table) if is_cte(update.with.as_ref(), table) => {
+            cte_target = tidb_ast::Join {
+                left: JoinNode::Table(table.clone()),
+                right: None,
+                tp: tidb_ast::JoinType::Cross,
+                straight: false,
+                on: None,
+                using: Vec::new(),
+                natural: false,
+                explicit_parens: false,
+            };
+            &cte_target
+        }
         UpdateKind::Single(table) => {
             let (database, name) = split_table_path(&table.name, current_db)?;
             return Ok(update
@@ -918,7 +957,7 @@ pub(super) fn update_target_columns(
         }
         UpdateKind::Multi { from, .. } => from,
     };
-    let plan = logical_from_plan(from, catalog, current_db, ctx, true)
+    let plan = logical_from_plan(from, update.with.as_ref(), catalog, current_db, ctx, true)
         .map_err(super::planner_error_to_driver)?;
 
     // Go's updatableTableListResolver visits only the outer table sources;
@@ -967,6 +1006,14 @@ pub(super) fn update_target_columns(
         for table in &tables {
             let (database, original) = split_table_path(&table.name, current_db)?;
             let visible = table.alias.as_deref().unwrap_or(original);
+            // Go `buildUpdateLists`: `if isCTE(tlW) || IsView() ||
+            // IsSequence()` is 1288.
+            if is_cte(update.with.as_ref(), table) {
+                if visible.eq_ignore_ascii_case(&name.table.original) {
+                    break;
+                }
+                continue;
+            }
             if !visible.eq_ignore_ascii_case(&name.table.original)
                 || !database.eq_ignore_ascii_case(&name.database.original)
             {
@@ -1004,7 +1051,7 @@ pub(crate) fn logical_from_scope(
     current_database: &str,
     ctx: &crate::StmtContext,
 ) -> Result<FromScope, tidb_planner::plan_base::PlanError> {
-    let plan = logical_from_plan(join, catalog, current_database, ctx, false)?;
+    let plan = logical_from_plan(join, None, catalog, current_database, ctx, false)?;
     let schema = plan.schema().ok_or_else(|| {
         tidb_planner::plan_base::PlanError::internal("FROM logical plan has no schema")
     })?;

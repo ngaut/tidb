@@ -4246,8 +4246,35 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
         wrap_lock: bool,
     ) -> Result<(LogicalPlan, u64), PlanError> {
         self.with_dml_hints(select, |builder| {
-            builder.build_dml_source_in_block(select, wrap_lock)
+            builder.with_dml_ctes(select, |builder| {
+                builder.build_dml_source_in_block(select, wrap_lock)
+            })
         })
+    }
+
+    /// Go `buildUpdate`/`buildDelete`'s `if stmt.With != nil {
+    /// b.buildWith(ctx, stmt.With) }`, right after the hints are pushed. The
+    /// CTEs stay visible through the whole statement build, SET lists
+    /// included, until the deferred `b.outerCTEs = b.outerCTEs[:l]`; the
+    /// built list is discarded, so a write builds no `Sequence`.
+    fn with_dml_ctes<T>(
+        &mut self,
+        select: &SelectStmt,
+        build: impl FnOnce(&mut Self) -> Result<T, PlanError>,
+    ) -> Result<T, PlanError> {
+        let outer_cte_depth = self.outer_ctes.len();
+        let result = match &select.with {
+            Some(with) => {
+                let counts = cte::cte_consumer_counts(
+                    &tidb_ast::QueryStmt::Select(Box::new(select.clone())),
+                    with,
+                );
+                self.build_with(with, &counts).and_then(|_| build(self))
+            }
+            None => build(self),
+        };
+        self.outer_ctes.truncate(outer_cte_depth);
+        result
     }
 
     /// Go `buildUpdate`/`buildDelete`'s `pushSelectOffset(0)` and
@@ -4359,29 +4386,32 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
         wrap_lock: bool,
     ) -> Result<(LogicalPlan, Vec<Option<Expression>>, u64), PlanError> {
         self.with_dml_hints(select, |builder| {
-            let (mut plan, _) = builder.build_dml_source_in_block(select, wrap_lock)?;
-            builder.cur_clause = ClauseCode::FieldList;
-            let mut expressions = Vec::with_capacity(assignment_values.len());
-            for value in assignment_values {
-                let Some(value) = value else {
-                    expressions.push(None);
-                    continue;
-                };
-                let mut scratch = Self::clause_scratch(value);
-                let (next_plan, lowered) = builder.lower_scalar_subqueries(plan, &mut scratch)?;
-                plan = next_plan;
-                if !lowered {
-                    expressions.push(None);
-                    continue;
+            builder.with_dml_ctes(select, |builder| {
+                let (mut plan, _) = builder.build_dml_source_in_block(select, wrap_lock)?;
+                builder.cur_clause = ClauseCode::FieldList;
+                let mut expressions = Vec::with_capacity(assignment_values.len());
+                for value in assignment_values {
+                    let Some(value) = value else {
+                        expressions.push(None);
+                        continue;
+                    };
+                    let mut scratch = Self::clause_scratch(value);
+                    let (next_plan, lowered) =
+                        builder.lower_scalar_subqueries(plan, &mut scratch)?;
+                    plan = next_plan;
+                    if !lowered {
+                        expressions.push(None);
+                        continue;
+                    }
+                    let (schema, names) = snapshot_schema_and_names(&plan);
+                    let mut markers = BTreeMap::new();
+                    markers.insert(MarkerKind::Column, schema.columns.clone());
+                    expressions.push(Some(
+                        builder.rewrite_scalar(&scratch, &schema, &names, &markers)?,
+                    ));
                 }
-                let (schema, names) = snapshot_schema_and_names(&plan);
-                let mut markers = BTreeMap::new();
-                markers.insert(MarkerKind::Column, schema.columns.clone());
-                expressions.push(Some(
-                    builder.rewrite_scalar(&scratch, &schema, &names, &markers)?,
-                ));
-            }
-            Ok((plan, expressions, builder.get_opt_flag()))
+                Ok((plan, expressions, builder.get_opt_flag()))
+            })
         })
     }
 
