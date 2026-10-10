@@ -3488,7 +3488,7 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
         items: &[tidb_ast::OrderItem],
         fields: &mut Vec<ProjectionField>,
         source_names: &[FieldName],
-    ) -> Vec<Expr> {
+    ) -> Result<Vec<Expr>, PlanError> {
         let old_len = fields.len();
         let mut resolved = Vec::with_capacity(items.len());
         for item in items {
@@ -3505,8 +3505,13 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
             // Aggregate case of resolveHavingAndOrderBy (:2789) appends its
             // own hidden auxiliary field, and that widening is what fires the
             // :4620 trim (q42's `Column#77->Column#81`).
-            if !aggregation::is_aggregate_call(&expr) {
-                if let Some(index) = Self::find_in_select_fields(&expr, &fields[..old_len]) {
+            // Go's `resolveFieldsFirst` for a top-level ORDER BY name:
+            // `resolveFromSelectFields`, where a non-column alias wins at
+            // once and two different columns sharing the name are ambiguous.
+            if let Expr::Column(path) = &expr {
+                if let Some(index) =
+                    aggregation::resolve_from_select_fields(path, &fields[..old_len], false)?
+                {
                     marker::substitute(&mut expr, PlanMarker::new(MarkerKind::Column, index));
                     resolved.push(expr);
                     continue;
@@ -3606,40 +3611,7 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
             });
             resolved.push(expr);
         }
-        resolved
-    }
-
-    /// Go `resolveFromSelectFields` over `SelectField.Match`
-    /// (`pkg/parser/ast/dml.go:847`), skipping auxiliary fields: a
-    /// table-qualified column never matches a select field -- it resolves from
-    /// the table source directly; an unqualified one matches a field's alias
-    /// when the field has one, otherwise a column field of that name, or a
-    /// function field whose text is that name (Go issue 7331).
-    fn find_in_select_fields(expr: &Expr, fields: &[ProjectionField]) -> Option<usize> {
-        let Expr::Column(path) = expr else {
-            return None;
-        };
-        let [name] = path.as_slice() else {
-            return None;
-        };
-        fields.iter().position(|field| {
-            if field.hidden {
-                return false;
-            }
-            match field.alias.as_deref() {
-                Some(alias) => alias.eq_ignore_ascii_case(name),
-                None => match &field.expr {
-                    Expr::Column(column) => column
-                        .last()
-                        .is_some_and(|column| column.eq_ignore_ascii_case(name)),
-                    Expr::Func { .. } => field
-                        .text
-                        .as_deref()
-                        .is_some_and(|text| text.eq_ignore_ascii_case(name)),
-                    _ => false,
-                },
-            }
-        })
+        Ok(resolved)
     }
 
     /// Go `resolveFromPlan`'s select-field reuse: a field whose expression is
@@ -4520,7 +4492,7 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
         // select list. Go resolves them with `orderByResolver`, so record the
         // slice they occupy and build it with the OrderBy clause.
         let order_by_from = fields.len();
-        let order_by = Self::resolve_order_by(&order_items, &mut fields, &source_names);
+        let order_by = Self::resolve_order_by(&order_items, &mut fields, &source_names)?;
         let order_by_to = fields.len();
         // `:4397` `resolveWindowFunction`'s column half, which appends one
         // auxiliary field per column a window specification names; see

@@ -392,10 +392,10 @@ pub(super) fn planner_error_to_driver(error: tidb_planner::plan_base::PlanError)
                 clause: clause.clone(),
             }
         }
-        tidb_planner::plan_base::PlanErrorKind::AmbiguousColumnInClause { column } => {
+        tidb_planner::plan_base::PlanErrorKind::AmbiguousColumnInClause { column, clause } => {
             DriverError::AmbiguousColumnInClause {
                 column: column.clone(),
-                clause: "field list".to_owned(),
+                clause: clause.clone(),
             }
         }
         tidb_planner::plan_base::PlanErrorKind::WrongNumberOfColumnsInSelect => {

@@ -162,8 +162,10 @@ impl GroupKeyBuffer {
                 for row in 0..rows {
                     self.values.push(expr.eval(ctx, chunk.get_row(row))?);
                 }
+                let key_type = group_key_type(field_type);
                 for (value, key) in self.values.iter().zip(&mut self.encoded[..rows]) {
-                    append_hash_agg_group_key_part(&timezone, expr, value, key)?;
+                    tidb_codec::append_hash_group_key_in_timezone(&timezone, value, &key_type, key)
+                        .map_err(|error| ExecError::internal(error.to_string()))?;
                 }
                 if retain_values {
                     std::mem::swap(&mut self.values, &mut self.output_values[group_index]);
@@ -195,5 +197,28 @@ impl GroupKeyBuffer {
             + datum_bytes(&self.values)
             + self.output_values.capacity() * std::mem::size_of::<Vec<Datum>>()
             + self.output_values.iter().map(datum_bytes).sum::<usize>()
+    }
+}
+
+/// Go `aggregate.GetGroupKey`'s key type for one group item: an ENUM keys by
+/// its value rather than its name (`EnumSetAsIntFlag`, issue #26885 -- the
+/// invalid value 0 has the name '' a user-defined member may share), and a
+/// DECIMAL by its own precision (`SetFlen(0)`, so `EncodeDecimal` never
+/// fails on a value wider than the declared type).
+fn group_key_type(
+    field_type: &tidb_datatype::FieldType,
+) -> std::borrow::Cow<'_, tidb_datatype::FieldType> {
+    match field_type.code() {
+        tidb_datatype::FieldTypeCode::Enum => {
+            let mut key_type = field_type.clone();
+            key_type.add_flags(tidb_datatype::FieldTypeFlags::ENUM_SET_AS_INT);
+            std::borrow::Cow::Owned(key_type)
+        }
+        tidb_datatype::FieldTypeCode::NewDecimal => {
+            let mut key_type = field_type.clone();
+            key_type.set_flen(0);
+            std::borrow::Cow::Owned(key_type)
+        }
+        _ => std::borrow::Cow::Borrowed(field_type),
     }
 }

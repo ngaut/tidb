@@ -2932,6 +2932,8 @@ mod tests_multi_valued_index;
 #[cfg(test)]
 mod tests_index_merge_union;
 #[cfg(test)]
+mod tests_group_by_resolution;
+#[cfg(test)]
 mod tests_insert_go;
 #[cfg(test)]
 mod tests_max_keys_read;

@@ -400,6 +400,9 @@ pub enum PlanErrorKind {
     AmbiguousColumnInClause {
         /// The name as written, including any qualifier.
         column: String,
+        /// Go's `clauseMsg` spelling: `field list`, or `group statement`
+        /// where `gbyResolver` rewrites the error.
+        clause: String,
     },
     /// Go `plannererrors.ErrWrongNumberOfColumnsInSelect` (1222).
     WrongNumberOfColumnsInSelect,
@@ -704,10 +707,19 @@ impl PlanError {
     /// multi non-redundant match; its clause is hardcoded `field list` there.
     #[must_use]
     pub fn ambiguous_column(column: impl Into<String>) -> Self {
+        Self::ambiguous_column_in(column, "field list")
+    }
+
+    /// Go `plannererrors.ErrAmbiguous.GenWithStackByArgs(column, clause)`.
+    #[must_use]
+    pub fn ambiguous_column_in(column: impl Into<String>, clause: &str) -> Self {
         let column = column.into();
         Self {
-            message: format!("Column '{column}' in field list is ambiguous"),
-            kind: PlanErrorKind::AmbiguousColumnInClause { column },
+            message: format!("Column '{column}' in {clause} is ambiguous"),
+            kind: PlanErrorKind::AmbiguousColumnInClause {
+                column,
+                clause: clause.to_owned(),
+            },
         }
     }
 

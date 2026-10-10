@@ -719,6 +719,7 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
             // Go's flag for "this column is nested inside a larger
             // expression", which suppresses the select-list fallback.
             let mut error = None;
+            let top_level = matches!(expr, Expr::Column(_));
             visit_exprs(&mut expr, &mut |node| {
                 let Expr::Column(path) = node else {
                     // Go sets `inExpr` on any node that is not a value, a
@@ -726,10 +727,29 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
                     // node is resolved against the source only.
                     return false;
                 };
-                if find_field_name(names, path).is_some() {
+                let in_source = find_field_name(names, path).is_some();
+                if in_source && !top_level {
                     return true;
                 }
-                let Some(index) = resolve_from_select_fields(path, fields, false) else {
+                // Go consults the select list for a top-level name even when
+                // the source has it, and reports an ambiguous list as the
+                // GROUP BY name in 'group statement'.
+                let index = match resolve_from_select_fields(path, fields, false) {
+                    Ok(index) => index,
+                    Err(_) => {
+                        error = Some(PlanError::ambiguous_column_in(
+                            path.last()
+                                .map(|name| name.to_lowercase())
+                                .unwrap_or_default(),
+                            "group statement",
+                        ));
+                        return true;
+                    }
+                };
+                if in_source {
+                    return true;
+                }
+                let Some(index) = index else {
                     return true;
                 };
                 let field = &fields[index];
@@ -807,23 +827,32 @@ pub fn resolve_from_select_fields(
     path: &[String],
     fields: &[ProjectionField],
     ignore_as_name: bool,
-) -> Option<usize> {
+) -> Result<Option<usize>, PlanError> {
     let [name] = path else {
-        return None;
+        return Ok(None);
     };
     let mut matched: Option<usize> = None;
     for (index, field) in fields.iter().enumerate() {
         if field.hidden {
             continue;
         }
+        // Go `matchField`: an alias decides unless ignored; a column field
+        // matches its name, and a function call its written text (issue
+        // 7331, `group by `concat(k1,k2)``).
+        let by_expression = |field: &ProjectionField| match &field.expr {
+            Expr::Column(p) => p.last().is_some_and(|last| last.eq_ignore_ascii_case(name)),
+            Expr::Func { .. } => field
+                .text
+                .as_deref()
+                .is_some_and(|text| text.eq_ignore_ascii_case(name)),
+            _ => false,
+        };
         let matches = if ignore_as_name {
-            matches!(&field.expr, Expr::Column(p)
-                if p.last().is_some_and(|last| last.eq_ignore_ascii_case(name)))
+            by_expression(field)
         } else {
             match &field.alias {
                 Some(alias) => alias.eq_ignore_ascii_case(name),
-                None => matches!(&field.expr, Expr::Column(p)
-                    if p.last().is_some_and(|last| last.eq_ignore_ascii_case(name))),
+                None => by_expression(field),
             }
         };
         if !matches {
@@ -832,7 +861,7 @@ pub fn resolve_from_select_fields(
         // A field that is NOT a column resolves immediately; Go returns `i`
         // without the ambiguity bookkeeping.
         let Expr::Column(current) = &field.expr else {
-            return Some(index);
+            return Ok(Some(index));
         };
         match matched {
             None => matched = Some(index),
@@ -841,14 +870,19 @@ pub fn resolve_from_select_fields(
                     continue;
                 };
                 // Go: ambiguous unless one name is a PREFIX-qualified form of
-                // the other (`Name.Match`).
+                // the other (`Name.Match`), naming the later column.
                 if !column_paths_match(earlier, current) {
-                    return None;
+                    return Err(PlanError::ambiguous_column(
+                        current
+                            .last()
+                            .map(|name| name.to_lowercase())
+                            .unwrap_or_default(),
+                    ));
                 }
             }
         }
     }
-    matched
+    Ok(matched)
 }
 
 /// Go `ast.ColumnName.Match`: two written names denote the same column when
@@ -937,8 +971,10 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
                 if find_field_name(names, path).is_some() {
                     return true;
                 }
-                if let Some(index) = resolve_from_select_fields(path, fields, false) {
-                    *inner = fields[index].expr.clone();
+                match resolve_from_select_fields(path, fields, false) {
+                    Ok(Some(index)) => *inner = fields[index].expr.clone(),
+                    Ok(None) => {}
+                    Err(ambiguous) => error = Some(ambiguous),
                 }
                 true
             });
@@ -1008,9 +1044,16 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
                 }
             }
             // `resolveFieldsFirst`: HAVING resolves the select list first.
-            if let Some(index) = resolve_from_select_fields(&path, &fields[..old_len], false) {
-                marker::substitute(node, PlanMarker::new(MarkerKind::Column, index));
-                return true;
+            match resolve_from_select_fields(&path, &fields[..old_len], false) {
+                Ok(Some(index)) => {
+                    marker::substitute(node, PlanMarker::new(MarkerKind::Column, index));
+                    return true;
+                }
+                Ok(None) => {}
+                Err(ambiguous) => {
+                    error = Some(ambiguous);
+                    return true;
+                }
             }
             // `:2841` "For SQLs like: select a from t b having b.a" — a
             // QUALIFIED name the select list does not name may still resolve
@@ -1170,14 +1213,37 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
             // `:294` the aggregate's own ORDER BY (`GROUP_CONCAT`), whose
             // positional items index the call's OWN argument list.
             for item in order_by {
-                let resolved = match &item.expr {
-                    Expr::Int(digits) => digits
-                        .parse::<usize>()
-                        .ok()
-                        .and_then(|position| args.get(position.wrapping_sub(1)))
+                // Go `aggOrderByResolver`: an integer literal, or an EXECUTE
+                // parameter holding an integer (`canParamMarkerBePositionExpr`),
+                // is a 1-based position into the call's arguments, and one
+                // out of range is 1054 naming the literal or `?`.
+                let position = match &item.expr {
+                    Expr::Int(digits) => Some((
+                        digits.parse::<usize>().unwrap_or(usize::MAX),
+                        digits.clone(),
+                    )),
+                    Expr::ParamMarker {
+                        value: Some(tidb_datatype::Datum::Int(value)),
+                        ..
+                    } if *value >= 0 => Some((
+                        usize::try_from(*value).unwrap_or(usize::MAX),
+                        "?".to_owned(),
+                    )),
+                    Expr::ParamMarker {
+                        value: Some(tidb_datatype::Datum::UInt(value)),
+                        ..
+                    } => Some((
+                        usize::try_from(*value).unwrap_or(usize::MAX),
+                        "?".to_owned(),
+                    )),
+                    _ => None,
+                };
+                let resolved = match position {
+                    Some((position, text)) => args
+                        .get(position.wrapping_sub(1))
                         .cloned()
-                        .unwrap_or_else(|| item.expr.clone()),
-                    other => other.clone(),
+                        .ok_or_else(|| PlanError::unknown_column_in_clause(text, "order clause"))?,
+                    None => item.expr.clone(),
                 };
                 let built = self.rewrite_scalar(&resolved, &schema, &names, markers)?;
                 descriptor

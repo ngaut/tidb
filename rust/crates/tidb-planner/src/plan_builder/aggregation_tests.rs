@@ -962,22 +962,23 @@ fn test_resolve_from_select_fields_precedence() {
     ];
     // 1. an alias wins.
     assert_eq!(
-        super::aggregation::resolve_from_select_fields(&["x".to_owned()], &fields, false),
+        super::aggregation::resolve_from_select_fields(&["x".to_owned()], &fields, false).unwrap(),
         Some(0)
     );
     // 2. a field that IS that column.
     assert_eq!(
-        super::aggregation::resolve_from_select_fields(&["c".to_owned()], &fields, false),
+        super::aggregation::resolve_from_select_fields(&["c".to_owned()], &fields, false).unwrap(),
         Some(1)
     );
     // 3. an AUXILIARY field is never matched (Go's `field.Auxiliary` skip).
     assert_eq!(
-        super::aggregation::resolve_from_select_fields(&["hidden".to_owned()], &fields, false),
+        super::aggregation::resolve_from_select_fields(&["hidden".to_owned()], &fields, false)
+            .unwrap(),
         None
     );
     // `ignoreAsName` looks past the alias at the underlying column.
     assert_eq!(
-        super::aggregation::resolve_from_select_fields(&["b".to_owned()], &fields, true),
+        super::aggregation::resolve_from_select_fields(&["b".to_owned()], &fields, true).unwrap(),
         Some(0)
     );
 }
@@ -1119,7 +1120,8 @@ fn test_an_aggregate_order_by_term_is_appended_as_a_hidden_field() {
         &select.order_by,
         &mut fields,
         &names,
-    );
+    )
+    .expect("ORDER BY resolves");
     assert_eq!(
         fields.len(),
         3,

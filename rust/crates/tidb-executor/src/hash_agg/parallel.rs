@@ -3208,8 +3208,14 @@ mod tests {
                     let row = chunk.get_row(logical);
                     let mut expected = Vec::new();
                     for (index, field) in fields.iter().enumerate() {
+                        // Go `GetGroupKey` encodes a DECIMAL item with flen 0,
+                        // each value at its own precision.
+                        let mut key_field = field.clone();
+                        if key_field.code() == FieldTypeCode::NewDecimal {
+                            key_field.set_flen(0);
+                        }
                         expected.extend(
-                            tidb_codec::hash_group_key(&[row.get_datum(index, field)], field)
+                            tidb_codec::hash_group_key(&[row.get_datum(index, field)], &key_field)
                                 .unwrap()
                                 .pop()
                                 .unwrap(),
