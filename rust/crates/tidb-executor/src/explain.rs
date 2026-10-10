@@ -221,10 +221,11 @@ fn used_stats_suffix_for_scan(
                 )
             })
             .unwrap_or_default();
+        // Go prints the used-stats text alone once a record exists -- nothing
+        // when every statistic it used is fully loaded -- and falls back to
+        // the plan's pseudo version only without one.
         let formatted = used_stats.format_for_explain(&column_names, &index_names);
-        if !formatted.is_empty() {
-            return Some(formatted);
-        }
+        return (!formatted.is_empty()).then_some(formatted);
     }
     scan_uses_pseudo_statistics(base).then(|| "stats:pseudo".to_owned())
 }

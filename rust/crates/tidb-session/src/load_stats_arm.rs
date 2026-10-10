@@ -111,7 +111,14 @@ fn load_stats_from_json(
     for (physical_id, target) in targets {
         let stats = statistics_table_from_json(&table, physical_id, target)
             .map_err(|error| DriverError::unsupported(error.to_string()))?;
-        let loaded = table_statistics_from_table(&stats, &table);
+        let mut loaded = table_statistics_from_table(&stats, &table);
+        // Go `SaveColOrIdxStatsToStorage` writes the session's start TS as
+        // both the `stats_meta` version and `last_stats_histograms_version`,
+        // and the reload reads them back: loaded statistics are a real,
+        // analyzed version, never the dump's own (often 0, pseudo).
+        let version = tidb_executor::analyze::kv::now_tso_shaped();
+        loaded.version = version;
+        loaded.last_analyze_version = version;
         let merged = match catalog.table_statistics(physical_id) {
             Some(existing) => merge_loaded_statistics(&existing, loaded),
             None => loaded,
@@ -133,6 +140,8 @@ fn merge_loaded_statistics(
     merged.cache_pseudo = loaded.cache_pseudo && existing.cache_pseudo;
     merged.row_count = loaded.row_count;
     merged.modify_count = loaded.modify_count;
+    merged.version = loaded.version;
+    merged.last_analyze_version = loaded.last_analyze_version;
     if loaded.stats_ver != 0 {
         merged.stats_ver = loaded.stats_ver;
     }

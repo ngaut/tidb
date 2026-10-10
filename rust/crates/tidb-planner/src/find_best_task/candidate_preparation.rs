@@ -156,19 +156,20 @@ pub(super) fn prepare_ordinary_paths<'a>(
         };
         candidates.push((path, metrics, heuristic));
     }
-    if prop.is_sort_item_empty() && prop.task_tp == TaskType::Root {
-        if let Some(heuristics) = candidates
-            .iter()
-            .map(|candidate| candidate.2.clone())
-            .collect::<Option<Vec<_>>>()
-        {
-            if let Some(selected) = super::candidate::choose_heuristic_path(&heuristics) {
-                return Some(PreparedOrdinaryPaths {
-                    paths: vec![candidates[selected].0],
-                    idx_missing_stats: false,
-                    heuristic_selected: true,
-                });
-            }
+    // Go `derivePathStatsAndTryHeuristics` prunes `PossibleAccessPaths` in
+    // `DataSource.DeriveStats`, before any physical property exists, so the
+    // heuristic path serves an ordered or coprocessor request too.
+    if let Some(heuristics) = candidates
+        .iter()
+        .map(|candidate| candidate.2.clone())
+        .collect::<Option<Vec<_>>>()
+    {
+        if let Some(selected) = super::candidate::choose_heuristic_path(&heuristics) {
+            return Some(PreparedOrdinaryPaths {
+                paths: vec![candidates[selected].0],
+                idx_missing_stats: false,
+                heuristic_selected: true,
+            });
         }
     }
     let mut skyline = Vec::new();

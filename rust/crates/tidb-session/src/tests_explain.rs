@@ -5648,3 +5648,32 @@ fn timestamp_cardinality_uses_the_statement_timezone() {
         }
     }
 }
+
+/// `explain_easy_stats.test`: Go's `derivePathStatsAndTryHeuristics` prunes
+/// `PossibleAccessPaths` in `DataSource.DeriveStats`, before any physical
+/// property, so the unique point path also answers a pushed-down LIMIT and
+/// the order a GROUP BY asks for.
+#[test]
+fn the_heuristic_unique_point_path_serves_every_property() {
+    let mut session = Session::new();
+    session
+        .run("set tidb_enable_clustered_index = 'INT_ONLY'")
+        .unwrap();
+    session
+        .run(
+            "create table index_prune(a bigint(20) NOT NULL, b bigint(20) NOT NULL, \
+             c tinyint(4) NOT NULL, primary key(a, b), index idx_b_c_a(b, c, a))",
+        )
+        .unwrap();
+    for suffix in ["LIMIT 1, 1", "GROUP BY b", ""] {
+        let plan = row_text(session.run(&format!(
+            "explain format='brief' select * from index_prune \
+             WHERE a = 1010010404050976781 AND b = 26467085526790 {suffix}"
+        )));
+        assert!(
+            plan.iter()
+                .any(|row| row[0].trim_start_matches(['└', '─', ' ']) == "Point_Get"),
+            "{suffix}: {plan:?}"
+        );
+    }
+}

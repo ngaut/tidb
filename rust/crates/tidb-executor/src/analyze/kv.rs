@@ -242,7 +242,8 @@ pub fn analyze_kv_table_independent_index(
 /// The current wall clock as a Go TSO: milliseconds since the epoch shifted
 /// into the physical half (Go `oracle.GetTimeFromTS` reads those same bits
 /// back), with the 18-bit logical counter left zero.
-fn now_tso_shaped() -> u64 {
+#[must_use]
+pub fn now_tso_shaped() -> u64 {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis() as u64)
