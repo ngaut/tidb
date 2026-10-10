@@ -792,6 +792,10 @@ pub struct Session {
     /// Go `StmtCtx.useChunkAlloc` for the running statement: its result was
     /// produced through a valid reusable chunk allocator.
     pub(crate) use_chunk_alloc: bool,
+    /// The parser warnings of the statement now running, with where they
+    /// start in [`Self::warnings`]; see
+    /// [`Self::move_parse_warnings_behind_execution`].
+    pub(crate) parse_warnings: Option<(usize, Vec<SqlWarning>)>,
     /// Go `ExecStmt.OutputNames` of the statement's materialized query
     /// result, one per column; empty for any other result. With
     /// `last_result_current_db` they give Go `recordSet.Fields()`, which the
@@ -1045,6 +1049,7 @@ impl Session {
             found_in_plan_cache: false,
             prev_found_in_plan_cache: false,
             use_chunk_alloc: false,
+            parse_warnings: None,
             last_result_output_names: Vec::new(),
             last_result_current_db: String::new(),
             pre_use_chunk_alloc: tidb_vardef::defaults::DEF_TIDB_USE_ALLOC,
@@ -2643,6 +2648,7 @@ impl Session {
     }
 
     fn finish_statement_state(&mut self, result: &Result<StatementCompletion, DriverError>) {
+        self.move_parse_warnings_behind_execution(result.is_ok());
         // Go ExecStmt.FinishExecuteStmt clears MPPQueryInfo only at completion.
         // Retained readers are detached from the next statement's counters;
         // ordinary completion reuses the allocation. Retries never reset it.

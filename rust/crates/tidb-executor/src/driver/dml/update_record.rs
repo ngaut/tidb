@@ -124,12 +124,17 @@ impl<'a> UpdateRecords<'a> {
                 ctx,
             )
             .and_then(|()| {
+                // Go `updateRecord` under IGNORE hands every FK check the NEW
+                // row (`checkFKIgnoreErr(ctx, sctx, fkChecks, newData)`) and
+                // skips `updateRowNeedToCheck`, so a referred-side check asks
+                // whether a child references the new key, as a deletion of
+                // that key would.
                 crate::foreign_key::check_parent_changes(
                     catalog,
                     self.triggers,
                     database,
                     name,
-                    &[crate::foreign_key::ParentChange::Update { old, new }],
+                    &[crate::foreign_key::ParentChange::Delete(new)],
                     ctx,
                 )
             });

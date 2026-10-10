@@ -470,3 +470,117 @@ fn an_optimistic_lazy_insert_reports_its_duplicate_at_commit() {
     session.run("commit").unwrap();
     assert_eq!(row_text(session.run("select * from t2")), [["1", "5"]]);
 }
+
+/// Go `updateRecord` under IGNORE checks every foreign key against the NEW
+/// row (`checkFKIgnoreErr(newData)`) and defers nothing, so moving a parent's
+/// referenced key away from a child passes when no child references the new
+/// key (TestInsertIgnoreOnDupWithFK, captured from Go TiDB); a child row
+/// pointing at a missing parent still warns 1452 and is skipped.
+#[test]
+fn insert_ignore_on_duplicate_checks_foreign_keys_against_the_new_row() {
+    let mut session = Session::new();
+    session
+        .run("create table parent (id int primary key, ref int, key(ref))")
+        .unwrap();
+    session
+        .run(
+            "create table child (id int primary key, ref int, \
+             foreign key (ref) references parent(ref))",
+        )
+        .unwrap();
+    session
+        .run("insert into parent values (1, 1), (2, 2)")
+        .unwrap();
+    session.run("insert into child values (1, 2)").unwrap();
+    session
+        .run("insert ignore into child values (1, 3) on duplicate key update ref = 3")
+        .unwrap();
+    assert_eq!(warnings_of(&session)[0].0, 1452);
+    assert_eq!(
+        error_of(
+            &mut session,
+            "insert into parent values (2, 3) on duplicate key update ref = 3"
+        )
+        .contains("foreign key constraint fails"),
+        true
+    );
+    session
+        .run("insert ignore into parent values (2, 3) on duplicate key update ref = 3")
+        .unwrap();
+    assert_eq!(warnings_of(&session), Vec::new());
+    assert_eq!(
+        row_text(session.run("select * from parent order by id")),
+        vec![vec!["1", "1"], vec!["2", "3"]]
+    );
+}
+
+/// Go `InsertValues.getRow`: an INSERT ... SELECT row's cast warnings stay as
+/// `CastValue` raised them, while `evalRow` completes a VALUES row's into the
+/// column form. Captured from Go TiDB under `sql_mode = ''`.
+#[test]
+fn insert_select_keeps_raw_cast_warnings() {
+    let mut session = Session::new();
+    session
+        .run("create table tu (a bigint unsigned, d int)")
+        .unwrap();
+    session.run("set sql_mode = ''").unwrap();
+    session.run("insert into tu (a) select -1").unwrap();
+    assert_eq!(
+        warnings_of(&session),
+        [(1690, "constant -1 overflows bigint".to_owned())]
+    );
+    session.run("insert into tu (a) values (-1)").unwrap();
+    assert_eq!(
+        warnings_of(&session),
+        [(
+            1264,
+            "Out of range value for column 'a' at row 1".to_owned()
+        )]
+    );
+    session.run("set sql_mode = default").unwrap();
+    assert!(error_of(&mut session, "insert into tu (a) select -1")
+        .contains("Out of range value for column 'a' at row 1"));
+}
+
+/// Go lexer `toDecimal`: a numeric literal whose integer part overflows
+/// `MyDecimal` warns 1292 with what `FromString` parsed and becomes
+/// `mysql.DefaultDecimal`; the connection appends the parser's warnings after
+/// the statement's own (`handleStmt`). TestIssue17745, captured from Go TiDB.
+#[test]
+fn overflowing_decimal_literal_warns_after_the_statement() {
+    let mut session = Session::new();
+    session.run("create table tt1 (c1 decimal(64))").unwrap();
+    session
+        .run(
+            "insert ignore into tt1 values(891234567890123456789012345678901234567890\
+             12345678901234567890123456789012345678900000000)",
+        )
+        .unwrap();
+    assert_eq!(
+        warnings_of(&session),
+        [
+            (
+                1264,
+                "Out of range value for column 'c1' at row 1".to_owned()
+            ),
+            (
+                1292,
+                "Truncated incorrect DECIMAL value: '78901234567890123456789012345678901234\
+                 5678901234567890123456789012345678900000000'"
+                    .to_owned()
+            ),
+        ]
+    );
+    let nines = "9".repeat(65);
+    assert_eq!(
+        row_text(session.run(&format!("select {}", "8".repeat(84)))),
+        vec![vec![nines]]
+    );
+    assert_eq!(
+        warnings_of(&session),
+        [(
+            1292,
+            format!("Truncated incorrect DECIMAL value: '{}'", "8".repeat(81))
+        )]
+    );
+}

@@ -537,6 +537,12 @@ fn warning_difference(session: &mut Session, want: Option<&[Vec<u8>]>) -> Option
             .collect::<Vec<Vec<u8>>>(),
         _ => return Some("  rust: SHOW WARNINGS answered with no result set".to_owned()),
     };
+    // mysql-tester sorts the block it appends under `--enable_warnings`
+    // (every recorded multi-warning block is in byte order, while an explicit
+    // `SHOW WARNINGS` result keeps the server's order), so the server's order
+    // is compared the same way.
+    let mut ours = ours;
+    ours.sort();
     let want = want.unwrap_or(&[]);
     if ours == want {
         return None;

@@ -282,7 +282,7 @@ impl Session {
         let previous = std::mem::take(&mut self.warnings);
         self.pending_observation_parse = None;
         let parse_started = std::time::Instant::now();
-        let (stmt, parse_warnings) =
+        let (mut stmt, parse_warnings) =
             match tidb_parser::parse_with_sql_mode_and_warnings(sql, self.scanner_sql_mode()) {
                 Ok(output) => (output.statement, output.warnings),
                 Err(error) => {
@@ -306,6 +306,7 @@ impl Session {
         // context reset: the `[parser:8061]`-prefixed hint refusals decode
         // into their class code with the remainder as the message (oracle:
         // `SELECT /*+ WRONG_HINT_SYNTAX(xyz) */ ...` warns 8061).
+        let parse_warnings_start = self.warnings.len();
         for diagnostic in parse_warnings {
             let message = diagnostic.message;
             let decoded = message
@@ -325,7 +326,29 @@ impl Session {
                 }
             }
         }
+        for message in decimal_literal_warnings(sql, &mut stmt) {
+            self.append_warning(crate::WarningLevel::Warning, 1292, message);
+        }
+        // Go's connection appends the parser's warnings after the statement
+        // has run (`handleStmt`); they are recorded here and moved behind the
+        // execution's own warnings when the statement completes.
+        let parsed = self.warnings[parse_warnings_start.min(self.warnings.len())..].to_vec();
+        self.parse_warnings = (!parsed.is_empty()).then_some((parse_warnings_start, parsed));
         Ok(stmt)
+    }
+
+    /// Go `clientConn.handleStmt`: the parser's warnings follow the warnings
+    /// the statement itself raised, once it has succeeded. A statement that
+    /// failed, or a buffer the statement rebuilt, keeps them where they are.
+    pub(crate) fn move_parse_warnings_behind_execution(&mut self, succeeded: bool) {
+        let Some((start, parsed)) = self.parse_warnings.take() else {
+            return;
+        };
+        let end = start + parsed.len();
+        if succeeded && self.warnings.get(start..end) == Some(parsed.as_slice()) {
+            self.warnings.drain(start..end);
+            self.warnings.extend(parsed);
+        }
     }
 
     /// [`Self::parse_at_statement_boundary`]'s boundary for a text statement
@@ -499,4 +522,42 @@ impl Session {
         // cannot lose a count that was actually retained.
         u16::try_from(self.warnings.len()).unwrap_or(u16::MAX)
     }
+}
+
+/// Go lexer `toDecimal` (`lexer_helpers.go`): a decimal literal whose
+/// integer part overflows `MyDecimal`'s word buffer warns 1292 with what
+/// `FromString` parsed and is replaced by `mysql.DefaultDecimal`, which the
+/// expression rewriter substitutes. An integer literal beyond uint64 already
+/// lexes as a decimal (`toInt` -> `toDecimal`). Only a literal with more than
+/// 81 integer digits can overflow, so text without such a run is not walked.
+fn decimal_literal_warnings(sql: &str, stmt: &mut Stmt) -> Vec<String> {
+    const MAX_INTEGER_DIGITS: usize = 81;
+    let mut run = 0usize;
+    let has_long_run = sql.bytes().any(|byte| {
+        run = if byte.is_ascii_digit() { run + 1 } else { 0 };
+        run > MAX_INTEGER_DIGITS
+    });
+    if !has_long_run {
+        return Vec::new();
+    }
+    struct Collector(Vec<String>);
+    impl tidb_ast::Visitor for Collector {
+        fn enter(&mut self, node: &mut dyn std::any::Any) -> bool {
+            if let Some(tidb_ast::Expr::Decimal(text)) = node.downcast_ref::<tidb_ast::Expr>() {
+                let (value, error) = tidb_datatype::Decimal::parse_mysql(text);
+                if matches!(error, Some(tidb_datatype::DecimalParseError::Overflow)) {
+                    self.0
+                        .push(format!("Truncated incorrect DECIMAL value: '{value}'"));
+                }
+            }
+            false
+        }
+
+        fn leave(&mut self, _node: &mut dyn std::any::Any) -> bool {
+            true
+        }
+    }
+    let mut collector = Collector(Vec::new());
+    tidb_ast::Visitable::accept(stmt, &mut collector);
+    collector.0
 }

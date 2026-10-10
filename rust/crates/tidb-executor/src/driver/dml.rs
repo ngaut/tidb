@@ -1151,7 +1151,14 @@ fn run_insert_with_physical(
                     }
                 },
             };
-            let value = cast_value_for_column(
+            // Go `evalRow` re-completes a VALUES row's cast warnings;
+            // `getRow` leaves a selected row's as `CastValue` raised them.
+            let cast = if source_rows.is_some() {
+                crate::driver::write_cast::cast_selected_value_for_column
+            } else {
+                cast_value_for_column
+            };
+            let value = cast(
                 value,
                 &column_meta[offset].field_type,
                 column_meta[offset].name.as_str(),

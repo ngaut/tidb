@@ -1087,9 +1087,13 @@ fn forced_range_planning_warning_precedes_dml_execution_warning() {
                 .any(|s| s.contains("force plan-cache: may use risky cached plan"))
         })
         .expect("planning warning");
+    // Go `InsertValues.getRow` keeps a selected row's cast warning raw.
     let execution = warnings
         .iter()
-        .position(|row| row.iter().any(|s| s.contains("Out of range")))
+        .position(|row| {
+            row.iter()
+                .any(|s| s.contains("constant 300 overflows tinyint"))
+        })
         .expect("execution warning");
     assert!(planning < execution, "{warnings:?}");
     assert_eq!(

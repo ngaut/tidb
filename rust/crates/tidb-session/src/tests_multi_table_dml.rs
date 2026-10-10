@@ -1438,8 +1438,12 @@ fn shared_update_record_cascades_joined_parent_changes() {
     assert_eq!(column(&mut session, "SELECT pid FROM child_c"), ["2"]);
 }
 
+/// Go `updateRecord` under IGNORE checks the referred side against the NEW
+/// row (`checkFKIgnoreErr(newData)`) and defers no old-key check, so moving a
+/// referenced parent key to one no child references is applied. Captured from
+/// Go TiDB: the update affects one row and the parent reads 2.
 #[test]
-fn shared_update_record_restricts_joined_parent_with_ignore() {
+fn shared_update_record_checks_joined_parent_new_key_with_ignore() {
     let mut session = Session::new();
     session
         .run("CREATE TABLE parent_r (id INT PRIMARY KEY)")
@@ -1452,9 +1456,9 @@ fn shared_update_record_restricts_joined_parent_with_ignore() {
             &mut session,
             "UPDATE IGNORE parent_r p JOIN child_r c ON p.id=c.pid SET p.id=2"
         ),
-        0
+        1
     );
-    assert_eq!(column(&mut session, "SELECT id FROM parent_r"), ["1"]);
+    assert_eq!(column(&mut session, "SELECT id FROM parent_r"), ["2"]);
 }
 
 #[test]

@@ -31,7 +31,17 @@ fn hint_updatable_registry_preserves_source_membership() {
     assert!(is_hint_updatable_verified("tidb_max_keys_read"));
     assert!(is_hint_updatable_verified("sql_mode"));
     assert!(is_hint_updatable_verified("group_concat_max_len"));
-    assert_eq!(SYSVAR_DECLARED_HINT_UPDATABLE_VARIABLES, ["group_concat_max_len"]);
+    // Every `IsHintUpdatableVerified: true` declared on a SysVar literal in
+    // pkg/sessionctx/variable/sysvar.go.
+    assert_eq!(SYSVAR_DECLARED_HINT_UPDATABLE_VARIABLES.len(), 15);
+    for name in [
+        "tidb_index_lookup_pushdown_policy",
+        "time_zone",
+        "tidb_dml_type",
+        "windowing_use_high_precision",
+    ] {
+        assert!(is_hint_updatable_verified(name), "{name}");
+    }
     assert!(!is_hint_updatable_verified("tidb_read_staleness"));
 }
 

@@ -225,6 +225,27 @@ pub(crate) fn conversion_event_is_silent(event: &tidb_datatype::ScalarConversion
 /// converted (clamped or truncated) value is stored and the same message is a
 /// warning, which is what `sql_mode = ''` produces in TiDB.
 ///
+/// [`cast_value_for_column`] for a row an INSERT ... SELECT produced (Go
+/// `InsertValues.getRow`), whose cast warnings stay as `CastValue` raised them.
+pub(crate) fn cast_selected_value_for_column(
+    value: Datum,
+    field_type: &FieldType,
+    column: &str,
+    row_index: usize,
+    ctx: &crate::StmtContext,
+    force_ignore_truncate: bool,
+) -> Result<Datum, DriverError> {
+    cast_value_shaped(
+        value,
+        field_type,
+        column,
+        row_index,
+        ctx,
+        CastShape::InsertSelectRow,
+        force_ignore_truncate,
+    )
+}
+
 pub(crate) fn cast_value_for_column(
     value: Datum,
     field_type: &FieldType,
@@ -348,6 +369,11 @@ pub(crate) enum CastShape {
     /// `completeInsertErr`: the column and the row are appended, and the code
     /// becomes 1366 / 1265 / 1406 / 1264 accordingly.
     InsertRow,
+    /// `InsertValues.getRow` for INSERT ... SELECT: the error `CastValue`
+    /// returns is completed as [`Self::InsertRow`] completes it, but the
+    /// warnings it appended stay raw (`constant -1 overflows bigint`), since
+    /// only `evalRow` re-completes them.
+    InsertSelectRow,
     /// `handleUpdateError`: `table.CastValue`'s own error, except for
     /// `ErrDataTooLong` and `ErrOverflow`, which keep the decorated form.
     UpdateAssignment,
@@ -471,8 +497,14 @@ fn cast_contextual_value(
     };
     let warning_shape = match shape {
         CastShape::OnDuplicateAssignment | CastShape::GeneratedOnDuplicate => CastShape::InsertRow,
-        CastShape::UpdateAssignment => CastShape::RawTable,
+        CastShape::UpdateAssignment | CastShape::InsertSelectRow => CastShape::RawTable,
         other => other,
+    };
+    // Every later decision is the one an INSERT's returned error takes.
+    let shape = if shape == CastShape::InsertSelectRow {
+        CastShape::InsertRow
+    } else {
+        shape
     };
     // Conversion stages may emit several warnings before the final error.
     // Preserve their order and let only the INSERT caller complete their text.
@@ -800,7 +832,7 @@ impl CastShape {
             Self::RawTable | Self::OnDuplicateAssignment | Self::GeneratedOnDuplicate => {
                 raw_assignment_error(error, source, field_type)
             }
-            Self::InsertRow => error,
+            Self::InsertRow | Self::InsertSelectRow => error,
             Self::UpdateAssignment => match error {
                 // Go's `handleUpdateError` re-titles exactly these two.
                 DriverError::DataTooLong { .. } | DriverError::DataOutOfRange { .. } => error,

@@ -155,11 +155,27 @@ pub const HINT_UPDATABLE_VARIABLES: [&str; 128] = [
 /// Variables whose `IsHintUpdatableVerified` flag is declared directly on a
 /// Go `SysVar`, rather than in `setvar_affect.go`'s source registry.
 ///
-/// `group_concat_max_len` is the currently supported direct declaration
-/// (`pkg/sessionctx/variable/sysvar.go:2142-2147`). Keep this separate from
+/// These are every `SysVar` literal in `pkg/sessionctx/variable/sysvar.go`
+/// that sets `IsHintUpdatableVerified: true`. Keep this separate from
 /// [`HINT_UPDATABLE_VARIABLES`] so the source-backed registry remains an
 /// exact port while the runtime predicate matches Go's effective flag.
-pub const SYSVAR_DECLARED_HINT_UPDATABLE_VARIABLES: [&str; 1] = ["group_concat_max_len"];
+pub const SYSVAR_DECLARED_HINT_UPDATABLE_VARIABLES: [&str; 15] = [
+    "group_concat_max_len",
+    "max_execution_time",
+    "sql_mode",
+    "tidb_dml_type",
+    "tidb_index_lookup_pushdown_policy",
+    "tidb_max_keys_read",
+    "tidb_mem_arbitrator_query_reserved",
+    "tidb_opt_enable_fuzzy_binding",
+    "tidb_opt_fix_control",
+    "tidb_opt_partial_ordered_index_for_topn",
+    "tidb_opt_prefer_range_scan",
+    "tidb_pipelined_dml_resource_policy",
+    "tikv_client_read_timeout",
+    "time_zone",
+    "windowing_use_high_precision",
+];
 
 /// Returns whether Go's effective `SysVar` flag allows `name` in SET_VAR.
 #[must_use]
