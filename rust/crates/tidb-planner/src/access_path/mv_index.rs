@@ -423,6 +423,7 @@ fn build_partial_path_for_mv_index(
                 rows, rows, rows,
             )),
             is_single_scan: Some(false),
+            is_uk_shard_index_path: false,
         },
     }))
 }

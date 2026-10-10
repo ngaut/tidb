@@ -70,6 +70,18 @@ pub(crate) fn physical_expression_text_with_columns(
             ))
         }
         Expression::Column(column) => {
+            // Go `Column.string`: a hidden virtual column (an expression
+            // index's) prints its expression, without parameter values.
+            if column.is_hidden {
+                if let Some(virtual_expr) = column.virtual_expr.as_deref() {
+                    return physical_expression_text_with_columns(
+                        ctx,
+                        virtual_expr,
+                        column_names,
+                        ExpressionTextStyle::StringWithCtx,
+                    );
+                }
+            }
             // Go `Column.StringWithCtx` renders `OrigName` (the
             // table-qualified physical name) when non-empty, falling back to
             // `Column#<UniqueID>` — the output names (aliases) are not part

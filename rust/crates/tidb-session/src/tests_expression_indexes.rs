@@ -1330,3 +1330,43 @@ fn dml_identity_batch_explicit_handle_survives_generated_tail() {
     );
     admin_check(&mut s, "t", "explicit handle conflict consumers");
 }
+
+/// Go `addPrefix4ShardIndexes`: `a = 100` over `uk(tidb_shard(a), a)` gains
+/// `tidb_shard(a) = 8` during predicate pushdown, so the unique key answers
+/// with a point read; an OR keeps the rewritten pairs, and the hidden column
+/// prints as its expression.
+#[test]
+fn a_shard_unique_key_gains_its_tidb_shard_prefix() {
+    let mut s = Session::new();
+    s.run("CREATE TABLE t (id INT PRIMARY KEY CLUSTERED, a INT, b INT, UNIQUE KEY uk((tidb_shard(a)), a))")
+        .unwrap();
+    s.run("INSERT INTO t VALUES (1, 100, 100), (3, 200, 300), (5, 300, 300)")
+        .unwrap();
+    let plan = |s: &mut Session, sql: &str| {
+        rows(s, &format!("EXPLAIN FORMAT='brief' {sql}"))
+            .into_iter()
+            .map(|row| row.join(" | "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let point = plan(&mut s, "SELECT * FROM t WHERE a = 100");
+    assert!(point.contains("Point_Get"), "{point}");
+    let batch = plan(&mut s, "SELECT * FROM t WHERE a IN (100, 300)");
+    assert!(batch.contains("Batch_Point_Get"), "{batch}");
+    let kept = plan(&mut s, "SELECT * FROM t WHERE a = 100 OR b = 200");
+    assert!(
+        kept.contains("or(and(eq(tidb_shard(test.t.a), 8), eq(test.t.a, 100)), eq(test.t.b, 200))"),
+        "{kept}"
+    );
+    assert_eq!(
+        rows(&mut s, "SELECT * FROM t WHERE a = 100"),
+        vec![vec!["1", "100", "100"]]
+    );
+    assert_eq!(
+        rows(
+            &mut s,
+            "SELECT id FROM t WHERE a IN (100, 200, 300) ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["3"], vec!["5"]]
+    );
+}

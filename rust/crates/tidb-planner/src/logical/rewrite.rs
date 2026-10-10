@@ -824,6 +824,8 @@ impl OwnedRewrite for PredicatePushDown<'_, '_> {
             // statistics are derived for any datasource candidate.
             LogicalPlan::DataSource(op) => {
                 let predicates = apply_predicate_simplification(self.ctx, predicates, true, None);
+                // Go adds the `tidb_shard()` prefix for shard indexes here.
+                let predicates = op.add_prefix4_shard_indexes(predicates);
                 if let Some(dual) = conds_to_table_dual(
                     self.ctx,
                     &predicates,

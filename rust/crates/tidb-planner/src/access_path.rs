@@ -113,6 +113,9 @@ pub struct IndexPathState {
     /// logical statistics derivation, before final column pruning.
     /// None means the covering decision has not been derived yet.
     pub is_single_scan: Option<bool>,
+    /// Go `IsUkShardIndexPath`: a unique secondary index of more than one
+    /// column led by a `tidb_shard()` generated column.
+    pub is_uk_shard_index_path: bool,
 }
 
 impl IndexPathState {

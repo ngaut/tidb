@@ -362,11 +362,79 @@ impl DataSource {
                 continue;
             };
             let columns = self.declared_index_columns(index);
-            self.derived_index_paths
-                .entry(index.id)
-                .or_default()
-                .declared_columns = Some(columns);
+            // Go `buildDataSource` (`logical_plan_builder.go:5316`): only a
+            // unique secondary index of more than one column whose first
+            // column is a `tidb_shard()` generated column.
+            let is_uk_shard_index_path =
+                matches!(path, crate::access_path::PossiblePath::Index { .. })
+                    && columns
+                        .first()
+                        .and_then(Option::as_ref)
+                        .is_some_and(|(column, _)| is_shard_column(column))
+                    && index.columns.len() > 1
+                    && index.unique;
+            self.contain_expr_prefix_uk |= is_uk_shard_index_path;
+            let state = self.derived_index_paths.entry(index.id).or_default();
+            state.declared_columns = Some(columns);
+            state.is_uk_shard_index_path = is_uk_shard_index_path;
         }
+    }
+
+    /// Go `addPrefix4ShardIndexes` (`rule_predicate_push_down.go:62`): for
+    /// every shard index path, in path order, `WHERE a = 10` gains
+    /// `tidb_shard(a) = tidb_shard(10)` and `a IN (10, 20)` becomes the
+    /// OR of such pairs. A failed rewrite keeps the original conditions.
+    #[must_use]
+    pub fn add_prefix4_shard_indexes(&self, conds: Vec<Expression>) -> Vec<Expression> {
+        if !self.contain_expr_prefix_uk {
+            return conds;
+        }
+        let mut new_conds = conds.clone();
+        for path in &self.enumerated_paths {
+            let crate::access_path::PossiblePath::Index { index } = path else {
+                continue;
+            };
+            let Some(index) = self.indexes.get(*index) else {
+                continue;
+            };
+            if !self
+                .derived_index_paths
+                .get(&index.id)
+                .is_some_and(|state| state.is_uk_shard_index_path)
+            {
+                continue;
+            }
+            match self.add_expr_prefix_cond(index, new_conds) {
+                Ok(rewritten) => new_conds = rewritten,
+                Err(_) => return conds,
+            }
+        }
+        new_conds
+    }
+
+    /// Go `addExprPrefixCond`: the index's prefix columns
+    /// (`IndexInfo2PrefixCols`) drive `exprPrefixAdder.addExprPrefix4ShardIndex`.
+    fn add_expr_prefix_cond(
+        &self,
+        index: &crate::plan_builder::catalog::SourceIndex,
+        conds: Vec<Expression>,
+    ) -> Result<Vec<Expression>, crate::ranger::points::PointBuilderError> {
+        let idx_cols: Vec<Column> = self
+            .declared_index_columns(index)
+            .into_iter()
+            .map_while(|column| column.map(|(column, _)| column))
+            .collect();
+        if idx_cols.is_empty() {
+            return Ok(conds);
+        }
+        // Go `addExprPrefix4ShardIndex`: a lone OR condition is rewritten
+        // per DNF item, anything else as one CNF list.
+        if let [Expression::ScalarFunction(function)] = conds.as_slice() {
+            if function.func_name.lowercase() == "or" {
+                return Ok(add_expr_prefix4_dnf_cond(function, &idx_cols));
+            }
+        }
+        crate::ranger::detacher::add_expr4_eq_and_in_condition(&conds, &idx_cols)
     }
 
     /// Go `deriveStatsByFilter(ds, conds, ds.AllPossibleAccessPaths)`'s
@@ -918,6 +986,42 @@ pub fn is_shard_column(column: &Column) -> bool {
         column.virtual_expr.as_deref(),
         Some(Expression::ScalarFunction(function)) if function.func_name.lowercase() == "tidb_shard"
     )
+}
+
+/// Go `exprPrefixAdder.addExprPrefix4DNFCond`: an AND item is rewritten as
+/// its CNF list, an EQ or IN item alone, and any other item kept; an error
+/// in any item keeps the whole condition.
+fn add_expr_prefix4_dnf_cond(
+    condition: &tidb_expr::scalar_function::ScalarFunction,
+    idx_cols: &[Column],
+) -> Vec<Expression> {
+    let original = || vec![Expression::ScalarFunction(condition.clone())];
+    let mut new_access_items = Vec::new();
+    for item in tidb_expr::expr_util::normal_form::flatten_dnf_conditions(condition) {
+        let accesses = match &item {
+            Expression::ScalarFunction(function) if function.func_name.lowercase() == "and" => {
+                tidb_expr::expr_util::normal_form::flatten_cnf_conditions(function)
+            }
+            Expression::ScalarFunction(function)
+                if matches!(function.func_name.lowercase(), "eq" | "in") =>
+            {
+                vec![item.clone()]
+            }
+            _ => {
+                new_access_items.push(item);
+                continue;
+            }
+        };
+        match crate::ranger::detacher::add_expr4_eq_and_in_condition(&accesses, idx_cols) {
+            Ok(accesses) => {
+                new_access_items.extend(tidb_expr::simple_expr::compose_cnf_condition(accesses));
+            }
+            Err(_) => return original(),
+        }
+    }
+    tidb_expr::simple_expr::compose_dnf_condition(new_access_items)
+        .into_iter()
+        .collect()
 }
 
 impl DataSource {
