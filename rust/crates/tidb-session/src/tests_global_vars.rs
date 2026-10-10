@@ -2131,10 +2131,12 @@ fn global_noop_gate_cannot_be_disabled_while_read_only_is_on() {
         .unwrap();
 }
 
-/// Go `SysVar.SkipInit` includes `IsNoop` variables: a fresh session keeps the
-/// compatibility default even when the shared GLOBAL no-op row is ON.
+/// Go `SysVar.SkipInit` includes `IsNoop` variables, so a fresh session holds
+/// no copy of them, and `GetSessionOrGlobalSystemVar` answers its first read
+/// from the GLOBAL value (captured from Go: a new session after
+/// `SET GLOBAL tx_read_only = ON` reads `@@tx_read_only` as 1).
 #[test]
-fn noop_globals_are_not_copied_into_new_sessions() {
+fn noop_globals_are_read_through_by_new_sessions() {
     let (mut session, _peer, globals) = two_sessions_sharing_globals();
     session
         .run("SET GLOBAL tidb_enable_noop_functions = ON")
@@ -2142,7 +2144,7 @@ fn noop_globals_are_not_copied_into_new_sessions() {
     session.run("SET GLOBAL tx_read_only = ON").unwrap();
     let mut fresh = SessionVars::new();
     fresh.seed_from_globals(globals).unwrap();
-    assert_eq!(fresh.system_value("tx_read_only").unwrap(), "OFF");
+    assert_eq!(fresh.system_value("tx_read_only").unwrap(), "ON");
     assert_eq!(
         fresh.system_value("tidb_enable_noop_functions").unwrap(),
         "ON"
@@ -2882,4 +2884,49 @@ fn collection_batch_sql_publication_preserves_fractional_wait_and_scratch_isolat
     peer.run("SET GLOBAL tidb_tso_client_batch_max_wait_time=DEFAULT")
         .unwrap();
     assert_eq!(policy.0.load(Ordering::SeqCst), 0);
+}
+
+/// Go `getVarValue`: `SET x = DEFAULT` at SESSION scope takes the GLOBAL
+/// value. With `tidb_enable_noop_variables` OFF, a noop variable warns when
+/// read (8145) or set (8144) and leaves SHOW VARIABLES; a noop variable is
+/// not copied into a session, so it reads the global value.
+#[test]
+fn session_default_and_noop_variables_follow_go() {
+    let mut s = Session::new();
+    s.run("set global default_storage_engine = 'somethingweird'")
+        .unwrap();
+    s.run("set default_storage_engine = 'MyISAM'").unwrap();
+    s.run("set default_storage_engine = default").unwrap();
+    assert_eq!(
+        row_text(s.run("select @@default_storage_engine")),
+        vec![vec!["somethingweird"]]
+    );
+    s.run("set global tidb_enable_noop_variables = off")
+        .unwrap();
+    s.run("select @@innodb_buffer_pool_size").unwrap();
+    assert_eq!(
+        row_text(s.run("show warnings")),
+        vec![vec![
+            "Warning",
+            "8145",
+            "variable innodb_buffer_pool_size has no effect in TiDB"
+        ]]
+    );
+    assert!(row_text(s.run("show variables like 'innodb_buffer_pool_size'")).is_empty());
+    s.run("set global innodb_buffer_pool_size = 805306368")
+        .unwrap();
+    assert_eq!(
+        row_text(s.run("show warnings")),
+        vec![vec![
+            "Warning",
+            "8144",
+            "setting innodb_buffer_pool_size has no effect in TiDB"
+        ]]
+    );
+    assert_eq!(
+        row_text(s.run("select @@innodb_buffer_pool_size")),
+        vec![vec!["805306368"]]
+    );
+    s.run("set global tidb_enable_noop_variables = on").unwrap();
+    assert!(row_text(s.run("show global variables like 'tidb_snapshot'")).is_empty());
 }

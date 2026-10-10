@@ -1321,6 +1321,7 @@ impl Session {
             connection_charset,
             connection_collation,
             default_collation_for_utf8mb4,
+            sequence_privilege: self.sequence_privilege_check(),
             ddl_sql_mode: sql_mode.0,
         };
         if !is_dml {

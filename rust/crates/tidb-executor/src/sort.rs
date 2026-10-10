@@ -115,11 +115,18 @@ pub fn less_by_items(
             // ordering and must not be evaluated (deferred constants included).
             continue;
         }
-        let mut cmp = tidb_expr::compare_datums_with_collation(
-            &a[i],
-            &b[i],
-            tidb_expr::collation_derive::collation_of_node(&item.expr),
-        )?;
+        // Go's key comparator comes from the by-item's type
+        // (`chunk.GetCompareFunc`): an ENUM or SET orders by its ordinal
+        // (`cmpNameValue`), not by its name.
+        let mut cmp = match (&a[i], &b[i]) {
+            (Datum::Enum(left, _), Datum::Enum(right, _)) => left.value().cmp(&right.value()),
+            (Datum::Set(left, _), Datum::Set(right, _)) => left.value().cmp(&right.value()),
+            (left, right) => tidb_expr::compare_datums_with_collation(
+                left,
+                right,
+                tidb_expr::collation_derive::collation_of_node(&item.expr),
+            )?,
+        };
         if item.desc {
             cmp = cmp.reverse();
         }

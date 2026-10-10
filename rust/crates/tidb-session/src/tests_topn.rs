@@ -398,3 +398,32 @@ fn a_cte_seed_limit_sunk_into_an_index_lookup_keeps_its_schema() {
     );
     assert_eq!(flat(row_text(session.run(sql))), vec!["1,5"]);
 }
+
+/// Go's TopN and Sort compare an ENUM or SET key by its ordinal
+/// (`chunk.GetCompareFunc` -> `cmpNameValue`), and the coprocessor's TopN heap
+/// does the same for an ENUM (`topNHeap.Less`): `enum('e','d','c','b','a')`
+/// ordered ascending starts at 'e'.
+#[test]
+fn enum_and_set_order_by_ordinal_through_topn() {
+    let mut s = Session::new();
+    s.run("create table t(e enum('e','d','c','b','a'))")
+        .unwrap();
+    s.run("insert into t values ('e'),('d'),('c'),('b'),('a')")
+        .unwrap();
+    assert_eq!(
+        flat(row_text(s.run("select * from t order by e limit 1"))),
+        vec!["e"]
+    );
+    assert_eq!(
+        flat(row_text(s.run("select * from t order by e limit 3"))),
+        vec!["e", "d", "c"]
+    );
+    s.run("create table st(s set('e','d','c','b','a'))")
+        .unwrap();
+    s.run("insert into st values ('e'),('d'),('c'),('b'),('a')")
+        .unwrap();
+    assert_eq!(
+        flat(row_text(s.run("select * from st order by s limit 1"))),
+        vec!["e"]
+    );
+}

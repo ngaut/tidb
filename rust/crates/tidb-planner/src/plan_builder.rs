@@ -3209,6 +3209,33 @@ impl<S: TableSource, C: Columns> PlanBuilder<'_, S, C> {
         if kept.is_empty() {
             return Ok(plan);
         }
+        // Go `buildSelection` "check expr field types": a string-typed
+        // conjunct whose IF/CASE/ELT returns an ENUM/SET branch is rebuilt
+        // over DOUBLE-cast branches, so `WHERE elt(1, e)` tests the ENUM's
+        // ordinal rather than its name.
+        let connection = self.ctx.connection_charset_info();
+        let kept = kept
+            .into_iter()
+            .map(|item| {
+                let Some(item_type) = item
+                    .static_type()
+                    .filter(|ft| ft.eval_type() == tidb_datatype::EvalType::String)
+                else {
+                    return item;
+                };
+                let mut target = FieldType::new(FieldTypeCode::Double);
+                target.add_flags(item_type.flags());
+                target.set_flen(23); // Go `mysql.MaxRealWidth`
+                target.set_decimal(tidb_datatype::UNSPECIFIED_LENGTH);
+                // Go `types.SetBinChsClnFlag`.
+                target.set_charset_name("binary");
+                target.set_collation_name("binary");
+                target.add_flags(tidb_datatype::FieldTypeFlags::BINARY);
+                tidb_expr::simple_expr::try_push_cast_into_control_function_for_hybrid_type(
+                    item, &target, connection,
+                )
+            })
+            .collect::<Vec<_>>();
         let mut selection = LogicalSelection::new(selection_base, kept);
         selection.base.set_children(vec![plan]);
         Ok(LogicalPlan::Selection(selection))

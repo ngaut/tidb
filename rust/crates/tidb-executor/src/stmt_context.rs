@@ -429,6 +429,9 @@ pub struct StmtContextSessionState {
     pub connection_collation: String,
     /// Captured `@@default_collation_for_utf8mb4`.
     pub default_collation_for_utf8mb4: String,
+    /// The session's privilege answer for the sequence builtins; `None` is an
+    /// unrestricted session.
+    pub sequence_privilege: Option<SequencePrivilegeCheck>,
     /// Complete typed SQL mode used by DDL.
     pub ddl_sql_mode: i64,
 }
@@ -456,11 +459,17 @@ impl Default for StmtContextSessionState {
             connection_charset: "utf8mb4".to_owned(),
             connection_collation: "utf8mb4_bin".to_owned(),
             default_collation_for_utf8mb4: "utf8mb4_bin".to_owned(),
+            sequence_privilege: None,
             ddl_sql_mode: tidb_mysql::get_sql_mode(tidb_mysql::DefaultSQLMode)
                 .map_or(0, |mode| mode.0),
         }
     }
 }
+
+/// Go `PrivilegeChecker.RequestVerification` as the sequence builtins ask it
+/// while evaluating: `(schema, sequence, insert)` answers whether the session
+/// holds INSERT (`insert`) or SELECT on the sequence.
+pub type SequencePrivilegeCheck = Arc<dyn Fn(&str, &str, bool) -> bool + Send + Sync>;
 
 /// Private configuration payload exposed only as the context's dereference
 /// target. Access and mutation remain on [`StmtContext`].
@@ -614,6 +623,8 @@ pub struct StmtContextData {
     /// Go `SessionVars.DefaultCollationForUTF8MB4`: the collation a
     /// `_utf8mb4'...'` literal takes (`adjustUTF8MB4Collation`).
     default_collation_for_utf8mb4: String,
+    /// See [`StmtContextSessionState::sequence_privilege`].
+    sequence_privilege: Option<SequencePrivilegeCheck>,
     /// Go expression BuildContext.NewCollationEnabled, captured for this task.
     new_collation_enabled: bool,
     /// Go `SessionVars.Rng`: the SESSION-scoped generator unseeded `RAND()`
@@ -2161,6 +2172,7 @@ impl StmtContext {
             connection_charset: session.connection_charset,
             connection_collation: session.connection_collation,
             default_collation_for_utf8mb4: session.default_collation_for_utf8mb4,
+            sequence_privilege: session.sequence_privilege,
             new_collation_enabled: tidb_datatype::new_collation_enabled(),
             rand_session: None,
             user_vars: None,
@@ -3063,6 +3075,34 @@ impl StmtContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
+    }
+
+    /// Go's sequence builtins ask `RequestVerification` after resolving the
+    /// sequence (`builtin_info.go:1551/1624/1691`): INSERT for `NEXTVAL` and
+    /// `SETVAL`, SELECT for `LASTVAL`.
+    fn check_sequence_privilege(
+        &self,
+        path: &[String],
+        insert: bool,
+    ) -> Result<(), tidb_expr::EvalError> {
+        let Some(check) = &self.sequence_privilege else {
+            return Ok(());
+        };
+        let Some((database, sequence)) = self.sequences.schema_and_name(path) else {
+            return Ok(());
+        };
+        if check(database, sequence, insert) {
+            return Ok(());
+        }
+        let (user, host) = self.authenticated_identity().unwrap_or(("", ""));
+        Err(tidb_expr::EvalError::Sequence(
+            tidb_expr::SequenceEvalError::AccessDenied {
+                privilege: if insert { "INSERT" } else { "SELECT" },
+                user: user.to_owned(),
+                host: host.to_owned(),
+                sequence: sequence.to_owned(),
+            },
+        ))
     }
 
     /// The connection charset/collation used while building expressions.
@@ -4984,6 +5024,7 @@ impl Columns for StmtContext {
 
     fn sequence_nextval(&self, path: &[String]) -> Result<Datum, tidb_expr::EvalError> {
         let sequence = self.sequences.resolve(path)?;
+        self.check_sequence_privilege(path, true)?;
         let value = sequence.allocator.next_val().map_err(|_| {
             tidb_expr::EvalError::Sequence(tidb_expr::SequenceEvalError::RunOut(
                 self.sequences.key(path),
@@ -5001,6 +5042,7 @@ impl Columns for StmtContext {
 
     fn sequence_lastval(&self, path: &[String]) -> Result<Datum, tidb_expr::EvalError> {
         let sequence = self.sequences.resolve(path)?;
+        self.check_sequence_privilege(path, false)?;
         Ok(self
             .sequences
             .last_values
@@ -5013,6 +5055,7 @@ impl Columns for StmtContext {
 
     fn sequence_setval(&self, path: &[String], value: i64) -> Result<Datum, tidb_expr::EvalError> {
         let sequence = self.sequences.resolve(path)?;
+        self.check_sequence_privilege(path, true)?;
         // Go `SetSequenceVal`: the reported value is NULL when the stored
         // counter was already at or past `value` (`alreadySatisfied`).
         let reported = sequence.allocator.set_val(value).map_err(|_| {

@@ -179,6 +179,16 @@ fn filter_physical_rows<C: Columns>(
             Some(true) => 1,
         })
     };
+    // Go `toBool` decides by the filter's type: see `vec_truthy_of`.
+    let typed_truth_code = |value: &Datum, filter: &Expression| -> Result<i8, EvalError> {
+        Ok(
+            match crate::coerce::vec_truthy_of(value, filter.static_type())? {
+                None => -1,
+                Some(false) => 0,
+                Some(true) => 1,
+            },
+        )
+    };
     for filter in filters {
         if sel.is_empty() {
             break;
@@ -212,8 +222,9 @@ fn filter_physical_rows<C: Columns>(
             // other shape, over the live rows only.
             is_zero.clear();
             for &physical in &sel {
-                is_zero.push(truth_code(
+                is_zero.push(typed_truth_code(
                     &filter.eval(ctx, input.physical_row(physical))?,
+                    filter,
                 )?);
             }
         }

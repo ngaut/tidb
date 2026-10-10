@@ -124,6 +124,44 @@ pub fn truthy_of(value: &Datum) -> Result<Option<bool>, EvalError> {
     }
 }
 
+/// Go `toBool` (`expression.go:503`): the truth `VecEvalBool` gives a value
+/// by the condition's TYPE. Only its hybrid arm differs from [`truthy_of`]: a
+/// string-typed ENUM or SET is true when its NAME is non-empty, and an empty
+/// name is true when '' is one of the column's members (the empty-string
+/// error value of such a column), whatever its ordinal.
+///
+/// # Errors
+///
+/// As [`truthy_of`].
+pub fn vec_truthy_of(
+    value: &Datum,
+    field_type: Option<&tidb_datatype::FieldType>,
+) -> Result<Option<bool>, EvalError> {
+    let hybrid = field_type.filter(|ft| {
+        matches!(
+            ft.code(),
+            tidb_datatype::FieldTypeCode::Enum | tidb_datatype::FieldTypeCode::Set
+        ) && ft.eval_type() == tidb_datatype::EvalType::String
+    });
+    if let Some(field_type) = hybrid {
+        let name = match value {
+            Datum::Enum(value, _) => Some(value.name_bytes()),
+            Datum::Set(value, _) => Some(value.name_bytes()),
+            _ => None,
+        };
+        if let Some(name) = name {
+            return Ok(Some(
+                !name.is_empty()
+                    || field_type
+                        .elems_snapshot()
+                        .iter()
+                        .any(|elem| elem.as_bytes().is_empty()),
+            ));
+        }
+    }
+    truthy_of(value)
+}
+
 /// Go `Datum.ToBool(typeCtx)` under the statement context, which
 /// `expression.EvalBool` applies to a folded condition: a string's numeric
 /// prefix decides it, and its truncation is the context's to warn about or

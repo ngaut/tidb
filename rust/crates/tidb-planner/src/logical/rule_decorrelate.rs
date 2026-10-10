@@ -86,10 +86,75 @@ impl DecorrelateSolver {
             }
         }
 
+        let mut plan = plan;
+        if let Some(pruned) = Self::prune_redundant_apply(ctx, &mut plan, group_by_column) {
+            return Ok(pruned);
+        }
         match plan {
             LogicalPlan::Apply(apply) => Self::optimize_apply(ctx, apply, group_by_column),
             plan => Self::optimize_children(ctx, plan, group_by_column),
         }
+    }
+
+    /// Go `pruneRedundantApply` (`rule_decorrelate.go:143`): a Selection
+    /// whose conditions simplify to TRUE over a LEFT OUTER (SEMI) Apply needs
+    /// neither -- `WHERE 1 = 1 OR EXISTS(...)` reads only the outer side. The
+    /// Selection and the whole chain of directly stacked Applies give way to
+    /// the bottom outer child, unless an enclosing GROUP BY reads a column the
+    /// Applies produced. It runs before the NO_DECORRELATE check, as in Go.
+    fn prune_redundant_apply(
+        ctx: &RuleContext<'_>,
+        plan: &mut LogicalPlan,
+        group_by_column: &BTreeSet<i64>,
+    ) -> Option<LogicalPlan> {
+        let LogicalPlan::Selection(selection) = &*plan else {
+            return None;
+        };
+        let Some(LogicalPlan::Apply(apply)) = plan.children().first() else {
+            return None;
+        };
+        if !matches!(
+            apply.join.join_type,
+            LogicalJoinType::LeftOuter | LogicalJoinType::LeftOuterSemi
+        ) || apply.is_lateral
+        {
+            return None;
+        }
+        let simplified = super::rule::apply_predicate_simplification(
+            ctx,
+            selection.conditions.clone(),
+            true,
+            None,
+        );
+        let true_selection = match simplified.as_slice() {
+            [] => true,
+            [only] => super::rule_predicate_simplification::is_true_predicate(ctx, only),
+            _ => false,
+        };
+        if !true_selection {
+            return None;
+        }
+        let top_apply = &plan.children()[0];
+        let mut bottom = top_apply;
+        while let LogicalPlan::Apply(_) = bottom {
+            bottom = &bottom.children()[0];
+        }
+        if let (Some(apply_schema), Some(child_schema)) = (top_apply.schema(), bottom.schema()) {
+            let contains = |schema: &Schema, id: i64| {
+                schema.columns.iter().any(|column| column.unique_id == id)
+            };
+            if group_by_column
+                .iter()
+                .any(|&id| contains(apply_schema, id) && !contains(child_schema, id))
+            {
+                return None;
+            }
+        }
+        let mut node = plan.base_mut().take_children().swap_remove(0);
+        while let LogicalPlan::Apply(_) = node {
+            node = node.base_mut().take_children().swap_remove(0);
+        }
+        Some(node)
     }
 
     /// Rewrites one Apply node.

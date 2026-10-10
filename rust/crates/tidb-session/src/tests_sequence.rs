@@ -508,3 +508,55 @@ fn sequence_metadata_uses_any_table_privilege_and_active_roles() {
     reader.run("SET ROLE NONE").unwrap();
     assert!(query_text(&mut reader, sql).1.is_empty());
 }
+
+/// Go's sequence builtins check the sequence privilege while evaluating
+/// (`builtin_info.go`): INSERT for NEXTVAL/SETVAL, SELECT for LASTVAL, and
+/// a column DEFAULT NEXTVAL is no exception (1142).
+#[test]
+fn sequence_functions_check_the_sequence_privilege() {
+    let registry = privilege::PrivilegeRegistry::default();
+    let catalog: SharedCatalog = std::sync::Arc::new(std::sync::Mutex::new(Catalog::default()));
+    let mut root = session_as(&registry, catalog.clone(), "root", "%");
+    root.run("create sequence seq").unwrap();
+    root.run("create table t (a int default next value for seq)")
+        .unwrap();
+    root.run("create user myuser@localhost").unwrap();
+    root.run("grant insert on test.t to 'myuser'@'localhost'")
+        .unwrap();
+    let mut user = session_as(&registry, catalog, "myuser", "localhost");
+    for (sql, message) in [
+        (
+            "select nextval(seq)",
+            "INSERT command denied to user 'myuser'@'localhost' for table 'seq'",
+        ),
+        (
+            "insert into t values ()",
+            "INSERT command denied to user 'myuser'@'localhost' for table 'seq'",
+        ),
+        (
+            "select lastval(seq)",
+            "SELECT command denied to user 'myuser'@'localhost' for table 'seq'",
+        ),
+        (
+            "select setval(seq, 10)",
+            "INSERT command denied to user 'myuser'@'localhost' for table 'seq'",
+        ),
+    ] {
+        let error = user.run(sql).unwrap_err().to_mysql_error();
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (1142, message),
+            "{sql}"
+        );
+    }
+    root.run("grant select, insert on test.seq to 'myuser'@'localhost'")
+        .unwrap();
+    let mut user = session_as(&registry, root.shared_catalog(), "myuser", "localhost");
+    assert_eq!(row_text(user.run("select nextval(seq)")), vec![vec!["1"]]);
+    assert_eq!(row_text(user.run("select lastval(seq)")), vec![vec!["1"]]);
+    assert_eq!(
+        row_text(user.run("select setval(seq, 10)")),
+        vec![vec!["10"]]
+    );
+    user.run("insert into t values ()").unwrap();
+}

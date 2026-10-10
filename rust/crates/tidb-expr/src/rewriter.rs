@@ -2128,34 +2128,67 @@ fn rewrite_leaf_compound(
                     Ok(call)
                 };
             }
-            // Master's predicate simplification folds repeated constant IN
-            // entries into one (the q16 template's county list repeats
-            // counties and master renders the deduplicated list); keep the
-            // first occurrence of each constant value.
-            // args[0] is the tested expression — only the LIST entries
-            // (args[1..]) participate in the duplicate fold.
-            // Prepared `?` markers and deferred subqueries evaluate per
-            // execution — never fold them, and never seed the seen set from
-            // them (their values change between executions).
-            let mut deduplicated = Vec::with_capacity(args.len());
-            let mut seen_values: Vec<tidb_datatype::Datum> = Vec::new();
-            for (position, argument) in args.into_iter().enumerate() {
-                let fixed_constant = matches!(&argument, Expression::Constant(constant)
-                    if constant.param_marker.is_none() && constant.deferred_expr.is_none());
-                let duplicate = position > 0
-                    && matches!(&argument, Expression::Constant(constant)
-                        if constant.param_marker.is_none() && constant.deferred_expr.is_none()
-                        && seen_values.iter().any(|seen| seen == &constant.value));
-                if !duplicate {
-                    if position > 0 {
-                        if let Expression::Constant(constant) = &argument {
-                            if constant.param_marker.is_none() && constant.deferred_expr.is_none() {
-                                seen_values.push(constant.value.clone());
-                            }
+            // Go `buildHashMapForConstArgs` keeps the first occurrence of each
+            // strict constant in the list (and one NULL), keyed the way its
+            // signature hashes: `InInt` by the evaluated int64 -- so -1 and
+            // 18446744073709551615 are one entry and the later is dropped --
+            // `InString` by the collation key of the IN's collation, every
+            // other signature by value. args[0] is the tested expression;
+            // only the LIST entries (args[1..]) take part. Prepared `?`
+            // markers and deferred subqueries evaluate per execution: never
+            // fold them, and never seed the seen set from them.
+            #[derive(PartialEq)]
+            enum InKey {
+                Int(i64),
+                Bytes(Vec<u8>),
+                Value(tidb_datatype::Datum),
+            }
+            let left_eval_type = args[0].static_type().map(FieldType::eval_type);
+            let string_collation = (left_eval_type == Some(EvalType::String))
+                .then(|| {
+                    crate::collation_derive::check_and_derive_collation_from_exprs(
+                        "IN",
+                        EvalType::Int,
+                        &args,
+                    )
+                    .ok()
+                    .and_then(|derived| tidb_datatype::Collation::from_name(&derived.collation))
+                })
+                .flatten();
+            let key_of = |value: &tidb_datatype::Datum| -> InKey {
+                match (left_eval_type, value) {
+                    (_, Datum::Null) => InKey::Value(Datum::Null),
+                    (Some(EvalType::Int), Datum::Int(int)) => InKey::Int(*int),
+                    (Some(EvalType::Int), Datum::UInt(uint)) => InKey::Int(*uint as i64),
+                    (Some(EvalType::String), value) => {
+                        match (string_collation, value.as_raw_bytes()) {
+                            (Some(collation), Some(bytes)) => InKey::Bytes(collation.key(bytes)),
+                            _ => InKey::Value(value.clone()),
                         }
                     }
-                    deduplicated.push(argument);
+                    (_, value) => InKey::Value(value.clone()),
                 }
+            };
+            let mut deduplicated = Vec::with_capacity(args.len());
+            let mut seen_keys: Vec<InKey> = Vec::new();
+            for (position, argument) in args.into_iter().enumerate() {
+                let strict_constant = match &argument {
+                    Expression::Constant(constant)
+                        if position > 0
+                            && constant.param_marker.is_none()
+                            && constant.deferred_expr.is_none() =>
+                    {
+                        Some(key_of(&constant.value))
+                    }
+                    _ => None,
+                };
+                if let Some(key) = strict_constant {
+                    if seen_keys.contains(&key) {
+                        continue;
+                    }
+                    seen_keys.push(key);
+                }
+                deduplicated.push(argument);
             }
             let mut args = deduplicated;
             // Go `inFunctionClass.verifyArgs`: a negative integer constant can

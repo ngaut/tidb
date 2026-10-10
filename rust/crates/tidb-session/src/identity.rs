@@ -136,17 +136,8 @@ impl Session {
         let Some((registry, user, host)) = self.privilege_context() else {
             return true;
         };
-        if let Some(verdict) =
-            self.sem_table_verdict(registry, user, host, database, table, global_priv.mask())
-        {
-            return verdict;
-        }
-        if let Some(verdict) =
-            crate::table_privilege::mem_db_verdict_mask(database, global_priv.mask())
-        {
-            return verdict;
-        }
-        registry.has_table_priv_with_roles(
+        scoped_privilege(
+            registry,
             user,
             host,
             self.active_roles(),
@@ -154,6 +145,36 @@ impl Session {
             table,
             global_priv,
         )
+    }
+
+    /// An owned [`Self::has_scoped_privilege`] for checks Go makes while
+    /// EVALUATING an expression (`NEXTVAL`/`LASTVAL`/`SETVAL` ask
+    /// `RequestVerification` from the builtin), which run with the session
+    /// out of reach. `None` is an unrestricted session.
+    #[must_use]
+    pub(crate) fn sequence_privilege_check(&self) -> Option<tidb_executor::SequencePrivilegeCheck> {
+        let (registry, user, host) = self.privilege_context()?;
+        let registry = registry.clone();
+        let (user, host) = (user.to_owned(), host.to_owned());
+        let roles = self.active_roles().to_vec();
+        Some(Arc::new(
+            move |database: &str, sequence: &str, insert: bool| {
+                let global_priv = if insert {
+                    privilege::GlobalPriv::Insert
+                } else {
+                    privilege::GlobalPriv::Select
+                };
+                scoped_privilege(
+                    &registry,
+                    &user,
+                    &host,
+                    &roles,
+                    database,
+                    sequence,
+                    global_priv,
+                )
+            },
+        ))
     }
 
     /// [`Self::has_scoped_privilege`] at table scope, the name the executor
@@ -982,4 +1003,40 @@ impl Session {
         }
         rows
     }
+}
+
+/// Go `RequestVerification(activeRoles, database, table, "", priv)` for an
+/// identity: the SEM table verdict, the virtual schemas, then the grants
+/// (own or through `roles`).
+fn scoped_privilege(
+    registry: &privilege::PrivilegeRegistry,
+    user: &str,
+    host: &str,
+    roles: &[privilege::Account],
+    database: &str,
+    table: &str,
+    global_priv: privilege::GlobalPriv,
+) -> bool {
+    if tidb_util::sem_compat::is_enabled() {
+        let has_restricted_tables_admin = registry.has_dynamic_priv_with_roles(
+            user,
+            host,
+            roles,
+            "RESTRICTED_TABLES_ADMIN",
+            false,
+        );
+        if let Some(verdict) = crate::table_privilege::sem_verdict_mask(
+            database,
+            table,
+            global_priv.mask(),
+            has_restricted_tables_admin,
+        ) {
+            return verdict;
+        }
+    }
+    if let Some(verdict) = crate::table_privilege::mem_db_verdict_mask(database, global_priv.mask())
+    {
+        return verdict;
+    }
+    registry.has_table_priv_with_roles(user, host, roles, database, table, global_priv)
 }

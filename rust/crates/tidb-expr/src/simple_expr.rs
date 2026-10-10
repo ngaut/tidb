@@ -616,81 +616,11 @@ pub fn build_cast_function(
             crate::rewriter::adjust_ret_ft_for_cast_string(&mut target, arg_ft);
         }
     }
-    // Go `TryPushCastIntoControlFunctionForHybridType` (builtin_cast.go:2898):
-    // a numeric-target cast over IF/CASE/ELT pushes INTO the branches when a
-    // branch is a hybrid type (Enum/Set — Bit excluded, issue 24725): the
-    // control function rebuilds over cast-wrapped branches so a branch's enum
-    // ORDINAL flows forward, where the unpushed shape would route the enum
-    // NAME through the string result and answer 0 for arithmetic.
-    if matches!(
-        target.eval_type(),
-        tidb_datatype::EvalType::Int | tidb_datatype::EvalType::Real
-    ) {
-        if let Expression::ScalarFunction(control) = &expr {
-            let name = control.func_name.lowercase();
-            if matches!(name, "if" | "case" | "elt") {
-                let is_hybrid = |e: &Expression| {
-                    e.static_type()
-                        .is_some_and(|ft| ft.is_hybrid() && ft.code() != FieldTypeCode::Bit)
-                };
-                let len = control.args.len();
-                let branch_indexes: Vec<usize> = match name {
-                    "if" => vec![1, 2],
-                    "case" => {
-                        let mut indexes: Vec<usize> = (1..len).step_by(2).collect();
-                        if len % 2 == 1 {
-                            indexes.push(len - 1);
-                        }
-                        indexes
-                    }
-                    _ => (1..len).collect(),
-                };
-                if branch_indexes.iter().any(|&i| is_hybrid(&control.args[i])) {
-                    let unsigned_flag = target.flags() & FieldTypeFlags::UNSIGNED != 0;
-                    let real = target.eval_type() == tidb_datatype::EvalType::Real;
-                    let mut args = control.args.clone();
-                    let mut pushed = true;
-                    for &i in &branch_indexes {
-                        match wrap_cast_for_hybrid_push(args[i].clone(), real, unsigned_flag) {
-                            Ok(wrapped) => args[i] = wrapped,
-                            Err(_) => {
-                                pushed = false;
-                                break;
-                            }
-                        }
-                    }
-                    if pushed {
-                        // Go rebuilds the control function over the wrapped
-                        // args and adopts the rebuilt signature's ret type;
-                        // the OUTER cast still wraps the rebuilt node.
-                        let inferred = if name == "case" {
-                            let branches: Vec<Expression> = args
-                                .iter()
-                                .skip(1)
-                                .step_by(2)
-                                .chain((args.len() % 2 == 1).then(|| args.last()).flatten())
-                                .cloned()
-                                .collect();
-                            crate::rewriter::builtin_return_type("case", &branches)
-                        } else if name == "elt" {
-                            crate::rewriter::builtin_return_type("elt", &args)
-                        } else {
-                            crate::rewriter::infer_type4_control_funcs("if", &args)
-                        };
-                        if let Some(ret_type) = inferred {
-                            expr = Expression::ScalarFunction(ScalarFunction::new(
-                                control.func_name.clone(),
-                                ret_type,
-                                args,
-                            ));
-                        }
-                        // Inference failure keeps the unpushed node, which is
-                        // Go's own `return expr` on error.
-                    }
-                }
-            }
-        }
-    }
+    expr = try_push_cast_into_control_function_for_hybrid_type(
+        expr,
+        &target,
+        crate::collation_derive::connection_charset_info(),
+    );
     let unsigned = target.flags() & FieldTypeFlags::UNSIGNED != 0;
     let source_eval_type = expr.static_type().map(FieldType::eval_type);
     // Go `castAsJSONFunctionClass.getFunction`: a string source picks
@@ -784,6 +714,102 @@ pub fn build_cast_function(
         target,
         vec![expr],
     )))
+}
+
+/// Go `TryPushCastIntoControlFunctionForHybridType` (builtin_cast.go:2898):
+/// for an INT or REAL `target`, an IF/CASE/ELT with a hybrid (ENUM/SET -- not
+/// BIT, issue 24725) branch is rebuilt over branches cast to `target`, so a
+/// branch's ENUM ordinal flows forward where the unpushed shape would route
+/// the ENUM name through the string result. Go's `buildSelection` applies it
+/// to each string-typed WHERE conjunct with a DOUBLE target and no outer cast;
+/// `BuildCastFunction` applies it under the cast it builds. Anything else, or
+/// a rebuild that fails, is returned unchanged. ELT's rebuild re-declares its
+/// value arguments as strings (`eltFunctionClass` wraps them again in a
+/// string cast under the connection charset).
+#[must_use]
+pub fn try_push_cast_into_control_function_for_hybrid_type(
+    expr: Expression,
+    target: &FieldType,
+    connection: (&str, &str),
+) -> Expression {
+    if !matches!(
+        target.eval_type(),
+        tidb_datatype::EvalType::Int | tidb_datatype::EvalType::Real
+    ) {
+        return expr;
+    }
+    let Expression::ScalarFunction(control) = &expr else {
+        return expr;
+    };
+    let name = control.func_name.lowercase();
+    if !matches!(name, "if" | "case" | "elt") {
+        return expr;
+    }
+    let is_hybrid = |e: &Expression| {
+        e.static_type()
+            .is_some_and(|ft| ft.is_hybrid() && ft.code() != FieldTypeCode::Bit)
+    };
+    let len = control.args.len();
+    let branch_indexes: Vec<usize> = match name {
+        "if" => vec![1, 2],
+        "case" => {
+            let mut indexes: Vec<usize> = (1..len).step_by(2).collect();
+            if len % 2 == 1 {
+                indexes.push(len - 1);
+            }
+            indexes
+        }
+        _ => (1..len).collect(),
+    };
+    if !branch_indexes.iter().any(|&i| is_hybrid(&control.args[i])) {
+        return expr;
+    }
+    let unsigned_flag = target.flags() & FieldTypeFlags::UNSIGNED != 0;
+    let real = target.eval_type() == tidb_datatype::EvalType::Real;
+    let mut args = control.args.clone();
+    for &i in &branch_indexes {
+        let Ok(wrapped) = wrap_cast_for_hybrid_push(args[i].clone(), real, unsigned_flag) else {
+            return expr;
+        };
+        args[i] = wrapped;
+    }
+    // Go rebuilds the control function over the wrapped args and adopts the
+    // rebuilt signature's ret type.
+    let inferred = match name {
+        "case" => {
+            let branches: Vec<Expression> = args
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .chain((args.len() % 2 == 1).then(|| args.last()).flatten())
+                .cloned()
+                .collect();
+            crate::rewriter::builtin_return_type("case", &branches)
+        }
+        "elt" => {
+            for arg in &mut args[1..] {
+                let Ok(wrapped) = crate::aggregation::wrap_cast::wrap_with_cast_as_string(
+                    arg.clone(),
+                    connection,
+                ) else {
+                    return expr;
+                };
+                *arg = wrapped;
+            }
+            crate::rewriter::builtin_return_type("elt", &args)
+        }
+        _ => crate::rewriter::infer_type4_control_funcs("if", &args),
+    };
+    // Inference failure keeps the unpushed node, which is Go's own
+    // `return expr` on error.
+    let Some(ret_type) = inferred else {
+        return expr;
+    };
+    Expression::ScalarFunction(ScalarFunction::new(
+        control.func_name.clone(),
+        ret_type,
+        args,
+    ))
 }
 
 /// Go `BuildCastCollationFunction` (`builtin_cast.go:2577`): a string

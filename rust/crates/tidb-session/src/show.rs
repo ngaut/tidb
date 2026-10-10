@@ -1251,7 +1251,16 @@ impl Session {
                 let text =
                     || tidb_datatype::FieldType::new(tidb_datatype::FieldTypeCode::VarString);
                 let mut rows = Vec::new();
+                let noop_enabled = self.vars.noop_variables_enabled();
                 for definition in sysvar::SYS_VARS {
+                    // Go `fetchShowVariables`: GLOBAL lists no SESSION-only
+                    // variable, and neither form lists a noop variable while
+                    // `tidb_enable_noop_variables` is OFF.
+                    if (show.global && definition.scope == sysvar::SCOPE_SESSION)
+                        || (definition.is_noop() && !noop_enabled)
+                    {
+                        continue;
+                    }
                     if self.sem_hides_sysvar(definition.name) {
                         continue;
                     }

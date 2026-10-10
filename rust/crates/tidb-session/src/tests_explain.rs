@@ -1608,11 +1608,13 @@ fn within_bucket_range_skew_setting_changes_analyzed_index_estimate() {
         .unwrap();
     let retained_session_value = estimate(&mut session);
     assert!(half < retained_session_value);
+    // Go `getVarValue`: a SESSION variable set to DEFAULT takes the GLOBAL
+    // value, here 0.5.
     session
         .run("SET SESSION tidb_opt_risk_range_skew_ratio = DEFAULT")
         .unwrap();
     let default_value = estimate(&mut session);
-    assert_eq!(default_value, zero);
+    assert_eq!(default_value, half);
     session
         .run("SET GLOBAL tidb_opt_risk_range_skew_ratio = DEFAULT")
         .unwrap();
@@ -5813,5 +5815,91 @@ fn subquery_hint_warnings_reach_the_statement() {
             "1815",
             "NO_DECORRELATE() is inapplicable because there are no correlated columns."
         ]]
+    );
+}
+
+/// Go `pruneRedundantApply`: a Selection that simplifies to TRUE over a LEFT
+/// OUTER (SEMI) Apply drops both, before NO_DECORRELATE is consulted, so
+/// `WHERE 1 = 1 OR EXISTS(...)` never reads the subquery's table. `1 = 0 OR`
+/// keeps it.
+#[test]
+fn a_true_selection_over_a_left_outer_semi_apply_is_pruned() {
+    let mut s = Session::new();
+    s.run("create table t1(a1 int, b1 int)").unwrap();
+    s.run("create table t2(a2 int, b2 int)").unwrap();
+    let reads_t2 = |s: &mut Session, sql: &str| {
+        row_text(s.run(sql))
+            .iter()
+            .any(|row| row.iter().any(|cell| cell.contains("table:t2")))
+    };
+    for sql in [
+        "explain SELECT 1 FROM t1 AS tab WHERE 1 = 1 OR (EXISTS(SELECT 1 FROM t2 WHERE a2 = a1))",
+        "explain SELECT 1 FROM t1 AS tab WHERE 1 = 1 OR a1 in (select a2 from t2)",
+        "explain SELECT 1 FROM t1 AS tab WHERE 1 = 1 OR (EXISTS(SELECT /*+ NO_DECORRELATE() */ 1 FROM t2 WHERE a2 = a1))",
+    ] {
+        assert!(!reads_t2(&mut s, sql), "{sql}");
+    }
+    assert!(reads_t2(
+        &mut s,
+        "explain SELECT 1 FROM t1 AS tab WHERE 1 = 0 OR (EXISTS(SELECT 1 FROM t2 WHERE a2 = a1))"
+    ));
+}
+
+/// Go `buildSelection` pushes a DOUBLE cast into an IF/CASE/ELT with an
+/// ENUM/SET branch (`TryPushCastIntoControlFunctionForHybridType`), so
+/// `WHERE elt(1, e)` tests the ENUM's ordinal; and Go's vectorized filter
+/// takes an ENUM/SET column's truth from its name (`toBool`), counting an
+/// empty name as true when '' is one of the members.
+#[test]
+fn enum_and_set_conditions_follow_go_truthiness() {
+    let mut s = Session::new();
+    s.run("create table e(e enum('c', 'b', 'a'))").unwrap();
+    s.run("insert into e values (3)").unwrap();
+    assert_eq!(
+        row_text(s.run("select e from e where elt(1, e)")),
+        vec![vec!["a"]]
+    );
+    assert!(row_text(s.run("explain select e from e where elt(1, e)"))
+        .iter()
+        .any(|row| row
+            .iter()
+            .any(|cell| cell
+                .contains("elt(1, cast(cast(test.e.e, double BINARY), var_string(370)))"))));
+    s.run("create table t(c set('a','','c'), d set('0','1','2'))")
+        .unwrap();
+    s.run("insert into t values (1, 1)").unwrap();
+    s.run("set @@sql_mode = ''").unwrap();
+    s.run("insert into t values ('', '')").unwrap();
+    assert_eq!(
+        row_text(s.run("select count(*) from t where c")),
+        vec![vec!["2"]]
+    );
+    assert_eq!(
+        row_text(s.run("select count(*) from t where d")),
+        vec![vec!["1"]]
+    );
+}
+
+/// Go `buildHashMapForConstArgs` keeps the first of each IN constant keyed by
+/// its signature: `InInt` by int64 (18446744073709551615 collides with -1 and
+/// leaves the list), `InString` by the collation key.
+#[test]
+fn in_lists_drop_constants_their_signature_hashes_alike() {
+    let mut s = Session::new();
+    s.run("create table t (a bigint unsigned)").unwrap();
+    s.run("insert into t values (0), (18446744073709551615)")
+        .unwrap();
+    assert_eq!(
+        row_text(s.run("select a from t where a not in (-1, -2, 18446744073709551615) order by a")),
+        vec![vec!["0"], vec!["18446744073709551615"]]
+    );
+    s.run("create table s (c varchar(10) collate utf8mb4_general_ci)")
+        .unwrap();
+    assert!(
+        row_text(s.run("explain select * from s where c in ('a', 'A', 'b')"))
+            .iter()
+            .any(|row| row
+                .iter()
+                .any(|cell| cell.contains(r#"in(test.s.c, "a", "b")"#)))
     );
 }

@@ -353,6 +353,16 @@ impl SequenceSnapshot {
         }
     }
 
+    /// Go `getSchemaAndSequence` with the `CurrentDB` default: the schema and
+    /// sequence names as written.
+    pub(crate) fn schema_and_name<'a>(&'a self, path: &'a [String]) -> Option<(&'a str, &'a str)> {
+        match path {
+            [name] => Some((self.current_db.as_str(), name.as_str())),
+            [database, name] => Some((database.as_str(), name.as_str())),
+            _ => None,
+        }
+    }
+
     /// Qualified name for Go's sequence error messages.
     pub(crate) fn key(&self, path: &[String]) -> String {
         match path {

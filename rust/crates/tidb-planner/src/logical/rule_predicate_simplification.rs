@@ -545,6 +545,12 @@ fn prune_empty_or_branches(
     predicates
 }
 
+/// Go `FindPredicateType(...) == TruePredicate`.
+#[must_use]
+pub(crate) fn is_true_predicate(ctx: &RuleContext<'_>, expression: &Expression) -> bool {
+    predicate_type(ctx, expression).1 == PredicateType::True
+}
+
 /// Go `applyPredicateSimplification`.
 #[must_use]
 pub fn apply_predicate_simplification(

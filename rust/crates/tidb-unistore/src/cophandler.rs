@@ -1217,10 +1217,21 @@ fn go_topn_heap_finish(
     topn_rows: Vec<(Vec<tidb_datatype::Datum>, Vec<tidb_datatype::Datum>)>,
     limit: usize,
 ) -> Vec<(Vec<tidb_datatype::Datum>, Vec<tidb_datatype::Datum>)> {
-    let ordering = |a: &[tidb_datatype::Datum], b: &[tidb_datatype::Datum]| {
+    // `heap_phase`: Go's `topNHeap.Less` compares an ENUM key by its ordinal
+    // (`GetUint64`), while the closing `topNSorter.Less` goes through
+    // `Datum.Compare`, which compares it by name.
+    let ordering_in = |a: &[tidb_datatype::Datum], b: &[tidb_datatype::Datum], heap_phase: bool| {
         let mut order = std::cmp::Ordering::Equal;
         for ((_, desc, collation), (left, right)) in by_items.iter().zip(a.iter().zip(b.iter())) {
-            let mut step = match compare_sort_keys(left, right, collation) {
+            let compared = match (left, right) {
+                (tidb_datatype::Datum::Enum(l, _), tidb_datatype::Datum::Enum(r, _))
+                    if heap_phase =>
+                {
+                    Ok(l.value().cmp(&r.value()))
+                }
+                _ => compare_sort_keys(left, right, collation),
+            };
+            let mut step = match compared {
                 Ok(step) => step,
                 Err(_) => std::cmp::Ordering::Equal,
             };
@@ -1234,11 +1245,14 @@ fn go_topn_heap_finish(
         }
         order
     };
+    let ordering =
+        |a: &[tidb_datatype::Datum], b: &[tidb_datatype::Datum]| ordering_in(a, b, false);
     // `heap_less(i, j)`: `topNHeap.Less` returns true when row i's key sorts
     // AFTER row j's (`ret > 0`), making the root the worst retained row.
-    let heap_less = |heap: &[(Vec<tidb_datatype::Datum>, Vec<tidb_datatype::Datum>)],
-                     i: usize,
-                     j: usize| { ordering(&heap[i].1, &heap[j].1) == std::cmp::Ordering::Greater };
+    let heap_less =
+        |heap: &[(Vec<tidb_datatype::Datum>, Vec<tidb_datatype::Datum>)], i: usize, j: usize| {
+            ordering_in(&heap[i].1, &heap[j].1, true) == std::cmp::Ordering::Greater
+        };
     let heap_up =
         |heap: &mut Vec<(Vec<tidb_datatype::Datum>, Vec<tidb_datatype::Datum>)>, mut j: usize| {
             while j > 0 {
@@ -1344,6 +1358,9 @@ fn compare_sort_keys(
         (Datum::Float32(l), Datum::Float32(r)) => l.total_cmp(r),
         (Datum::Time(l), Datum::Time(r)) => l.compare(*r),
         (Datum::Duration(l), Datum::Duration(r)) => l.compare(*r),
+        // `compareMysqlEnum`/`compareMysqlSet`: by name under the collator.
+        (Datum::Enum(l, _), Datum::Enum(r, _)) => collation.compare(l.name_bytes(), r.name_bytes()),
+        (Datum::Set(l, _), Datum::Set(r, _)) => collation.compare(l.name_bytes(), r.name_bytes()),
         _ => match (left.as_raw_bytes(), right.as_raw_bytes()) {
             (Some(l), Some(r)) => collation.key(l).cmp(&collation.key(r)),
             _ => return Err("ordering over this datum pair is a later course".to_owned()),

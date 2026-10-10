@@ -241,6 +241,19 @@ pub enum SequenceEvalError {
     /// Go `infoschema.ErrWrongObject` (1347). An existing table or view was
     /// named where Go's sequence lookup requires `SEQUENCE`.
     WrongObject(String),
+    /// Go `errSequenceAccessDenied` (`ErrTableaccessDenied`, 1142): the
+    /// builtin's own `RequestVerification` refused INSERT (`NEXTVAL`,
+    /// `SETVAL`) or SELECT (`LASTVAL`) on the sequence.
+    AccessDenied {
+        /// `INSERT` or `SELECT`.
+        privilege: &'static str,
+        /// Go `AuthUsername`.
+        user: String,
+        /// Go `AuthHostname`.
+        host: String,
+        /// The sequence name as written, unqualified.
+        sequence: String,
+    },
 }
 
 impl SequenceEvalError {
@@ -251,6 +264,7 @@ impl SequenceEvalError {
             SequenceEvalError::RunOut(_) => 4135,
             SequenceEvalError::NotASequence(_) => 1146,
             SequenceEvalError::WrongObject(_) => 1347,
+            SequenceEvalError::AccessDenied { .. } => 1142,
         }
     }
 
@@ -261,6 +275,14 @@ impl SequenceEvalError {
             SequenceEvalError::RunOut(name) => format!("Sequence '{name}' has run out"),
             SequenceEvalError::NotASequence(name) => format!("Table '{name}' doesn't exist"),
             SequenceEvalError::WrongObject(name) => format!("'{name}' is not SEQUENCE"),
+            SequenceEvalError::AccessDenied {
+                privilege,
+                user,
+                host,
+                sequence,
+            } => format!(
+                "{privilege} command denied to user '{user}'@'{host}' for table '{sequence}'"
+            ),
         }
     }
 }

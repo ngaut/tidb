@@ -91,6 +91,9 @@ fn is_set_literal(expr: &tidb_ast::Expr) -> bool {
 struct VariableBinder<'a> {
     session: &'a Session,
     error: Option<DriverError>,
+    /// Go `ErrGettingNoopVariable` (8145) per noop `@@var` read while
+    /// `tidb_enable_noop_variables` is OFF; appended once the walk is over.
+    noop_reads: Vec<String>,
 }
 
 impl Visitor for VariableBinder<'_> {
@@ -103,6 +106,13 @@ impl Visitor for VariableBinder<'_> {
         };
         if !matches!(expr, tidb_ast::Expr::SysVar { .. }) {
             return false;
+        }
+        if let tidb_ast::Expr::SysVar { name, .. } = &*expr {
+            if let Some(def) = sysvar::get_sys_var(name) {
+                if def.is_noop() && !self.session.vars.noop_variables_enabled() {
+                    self.noop_reads.push(def.name.to_owned());
+                }
+            }
         }
         match self.session.bind_variable_atom(expr) {
             Ok(bound) => *expr = bound,
@@ -517,6 +527,21 @@ impl Session {
             self.require_set_global_privilege()?;
         }
         self.require_sem_writable_sysvar(&assignment.name)?;
+        // Go `setSysVariable`: a noop variable may still be set, with a
+        // warning that it will not do anything (8144).
+        if sysvar::get_sys_var(&assignment.name).is_some_and(|def| def.is_noop())
+            && !self.vars.noop_variables_enabled()
+        {
+            self.append_warning(
+                crate::warnings::WarningLevel::Warning,
+                8144,
+                format!(
+                    "setting {} has no effect in TiDB",
+                    sysvar::get_sys_var(&assignment.name)
+                        .map_or(assignment.name.as_str(), |def| def.name)
+                ),
+            );
+        }
         // An explicit `SET INSTANCE` is Go's `v.IsInstance`; anything else
         // unqualified/SESSION reaches the tier only through the legacy
         // rewrite, which warns.
@@ -540,8 +565,17 @@ impl Session {
             self.vars.snapshot_ts()
         };
         let value = match &assignment.value {
-            // Go restores a variable to its registry default by clearing the
-            // session (or global) override.
+            // Go `getVarValue`: a SESSION (or unqualified) variable set to
+            // DEFAULT takes the GLOBAL value -- the compiled default only for
+            // a variable with no global scope (`GetGlobalSysVar` falls back to
+            // `sv.Value`) -- and is then set like any explicit value.
+            tidb_ast::SetVariableValue::Default if !is_node_wide => Some(
+                self.vars
+                    .global_value_for_session_default(&assignment.name)
+                    .map_err(var_error)?,
+            ),
+            // GLOBAL and INSTANCE DEFAULT restore the compiled default by
+            // clearing the stored override.
             tidb_ast::SetVariableValue::Default => {
                 if assignment
                     .name
@@ -569,37 +603,10 @@ impl Session {
                         .value;
                     self.apply_workload_repository_global(&assignment.name, default)?;
                     self.notify_global_config_change(&assignment.name, default);
-                } else if is_instance {
+                } else {
                     self.vars
                         .reset_instance(&assignment.name)
                         .map_err(var_error)?;
-                } else {
-                    if is_read_timestamp {
-                        self.check_snapshot_change_in_transaction(is_txn_read)?;
-                    }
-                    // go's scope check runs BEFORE the DEFAULT restore, so the
-                    // session-read-only variable refuses even `= DEFAULT`
-                    // with ErrReadOnlyVariable (1621).
-                    self.check_max_allowed_packet_scope(
-                        &assignment.name,
-                        &sysvar::get_sys_var(&assignment.name)
-                            .map(|definition| definition.value)
-                            .unwrap_or_default(),
-                        is_node_wide,
-                    )?;
-                    self.vars
-                        .reset_system(&assignment.name)
-                        .map_err(var_error)?;
-                    // Go resolves DEFAULT to the registry's default STRING and
-                    // then calls `SetSession` with it, so `SET rand_seed1 =
-                    // DEFAULT` really does push 0 into the generator rather
-                    // than leaving the seed where the last `SET` put it
-                    // (captured: after `SET rand_seed1 = 19`, two DEFAULTs make
-                    // the next `RAND()` exactly 0).
-                    self.seed_rand_from_sysvar(&assignment.name)?;
-                    if is_read_timestamp {
-                        self.load_snapshot_schema_after_set(old_snapshot_ts, is_txn_read)?;
-                    }
                 }
                 return Ok(());
             }
@@ -1385,10 +1392,11 @@ impl Session {
     /// Resolves system-variable scope and visibility before shared planning.
     /// User-variable AST nodes remain intact so the rewriter can observe inline
     /// assignments' declared types in source order.
-    pub(crate) fn bind_variables(&self, stmt: &mut Stmt) -> Result<(), DriverError> {
+    pub(crate) fn bind_variables(&mut self, stmt: &mut Stmt) -> Result<(), DriverError> {
         let mut binder = VariableBinder {
             session: self,
             error: None,
+            noop_reads: Vec::new(),
         };
         // Go resolves `@@x` and `@x` inside DML too (a WHERE predicate, an
         // UPDATE SET expression, an INSERT VALUES row), so the walk covers
@@ -1404,7 +1412,19 @@ impl Session {
                 .error
                 .expect("variable traversal stops only after recording an error"));
         }
+        let noop_reads = binder.noop_reads;
+        self.append_noop_read_warnings(noop_reads);
         Ok(())
+    }
+
+    fn append_noop_read_warnings(&mut self, names: Vec<String>) {
+        for name in names {
+            self.append_warning(
+                crate::warnings::WarningLevel::Warning,
+                8145,
+                format!("variable {name} has no effect in TiDB"),
+            );
+        }
     }
 
     /// Substitutes one variable atom. The complete child walk belongs to
@@ -1571,17 +1591,20 @@ impl Session {
 
     /// Substitutes variables in a standalone expression, such as a `SET`
     /// value, through the same complete visitor a query uses.
-    fn bind_variables_in(&self, expr: &tidb_ast::Expr) -> Result<tidb_ast::Expr, DriverError> {
+    fn bind_variables_in(&mut self, expr: &tidb_ast::Expr) -> Result<tidb_ast::Expr, DriverError> {
         let mut bound = expr.clone();
         let mut binder = VariableBinder {
             session: self,
             error: None,
+            noop_reads: Vec::new(),
         };
         if !bound.accept(&mut binder) {
             return Err(binder
                 .error
                 .expect("variable traversal stops only after recording an error"));
         }
+        let noop_reads = binder.noop_reads;
+        self.append_noop_read_warnings(noop_reads);
         Ok(bound)
     }
 

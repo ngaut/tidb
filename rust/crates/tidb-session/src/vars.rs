@@ -3126,7 +3126,9 @@ impl SessionVars {
                         self.systems.get(def.name).map(String::as_str),
                     )));
                 }
-                return Ok(crate::sysvar::effective_default_value(def));
+                return self
+                    .unseeded_noop_value(index)
+                    .unwrap_or_else(|| Ok(crate::sysvar::effective_default_value(def)));
             }
         }
         // The registry name is the lowercase key `systems` is written under,
@@ -3136,10 +3138,34 @@ impl SessionVars {
                 self.systems.get(def.name).map(String::as_str),
             )));
         }
-        self.systems.get(def.name).map_or_else(
-            || Ok(crate::sysvar::effective_default_value(def)),
-            |value| Ok(Cow::Borrowed(value.as_str())),
-        )
+        if let Some(value) = self.systems.get(def.name) {
+            return Ok(Cow::Borrowed(value.as_str()));
+        }
+        self.unseeded_noop_value(index)
+            .unwrap_or_else(|| Ok(crate::sysvar::effective_default_value(def)))
+    }
+
+    /// Go `GetSessionOrGlobalSystemVar` for a variable `SkipInit` left out of
+    /// the session: a noop variable is never copied at connect, so its first
+    /// session read takes the GLOBAL value.
+    fn unseeded_noop_value(&self, index: usize) -> Option<Result<Cow<'_, str>, VarError>> {
+        let def = &crate::sysvar::SYS_VARS[index];
+        (def.is_noop() && def.has_global_scope()).then(|| {
+            self.globals
+                .get_by_registry_index(index)
+                .map(|value| Cow::Owned(global_get_hook(def.name, value)))
+        })
+    }
+
+    /// Go `vardef.EnableNoopVariables`: the GLOBAL
+    /// `tidb_enable_noop_variables` switch.
+    #[must_use]
+    pub(crate) fn noop_variables_enabled(&self) -> bool {
+        self.get_global(tidb_vardef::tidb_vars::TIDB_ENABLE_NOOP_VARIABLES)
+            .map_or(
+                tidb_vardef::defaults::DEF_TIDB_ENABLE_NOOP_VARIABLES,
+                |value| value.eq_ignore_ascii_case("ON"),
+            )
     }
 
     pub fn get_system(&self, name: &str) -> Result<String, VarError> {
@@ -3769,6 +3795,34 @@ impl SessionVars {
     /// Go (`config.GetGlobalConfig().Store`) that this tier is not told, so
     /// `tidb_enable_async_commit`/`tidb_enable_1pc` resolve to their
     /// non-TiKV-store defaults here; every other override is unconditional.
+    /// Go `GetGlobalSysVar` as a SESSION `SET x = DEFAULT` reads it: the
+    /// stored GLOBAL value, or -- when nothing was ever stored -- the value
+    /// bootstrap writes into `mysql.global_variables`
+    /// (`globalSystemVariableInitialValue`). A variable without a global scope
+    /// answers its compiled default.
+    pub(crate) fn global_value_for_session_default(&self, name: &str) -> Result<String, VarError> {
+        let def = get_sys_var(name)
+            .ok_or_else(|| VarError::UnknownSystemVariable(name.to_ascii_lowercase()))?;
+        let default = crate::sysvar::effective_default(def);
+        if !def.has_global_scope() {
+            return Ok(default);
+        }
+        if let Some(stored) = self.globals.overrides().get(def.name) {
+            return Ok(global_get_hook(def.name, stored.clone()));
+        }
+        Ok(
+            tidb_vardef::global_sysvar_initial::global_system_variable_initial_value(
+                def.name,
+                &default,
+                tidb_vardef::global_sysvar_initial::GlobalSysvarEnvironment {
+                    store_is_tikv: false,
+                    in_test: false,
+                    next_gen: false,
+                },
+            ),
+        )
+    }
+
     pub fn reset_system(&mut self, name: &str) -> Result<(), VarError> {
         let def = get_sys_var(name)
             .ok_or_else(|| VarError::UnknownSystemVariable(name.to_ascii_lowercase()))?;
