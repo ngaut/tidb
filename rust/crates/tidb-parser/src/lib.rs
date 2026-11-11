@@ -1344,10 +1344,16 @@ impl Parser {
 
     fn bump(&mut self) -> Token {
         let t = self.toks[self.pos].clone();
+        self.advance();
+        t
+    }
+
+    /// Consume a token whose owned contents are not needed. Keep the token
+    /// intact for source offsets, lookback and speculative parser rollback.
+    fn advance(&mut self) {
         if self.pos + 1 < self.toks.len() {
             self.pos += 1;
         }
-        t
     }
 
     fn at_eof(&self) -> bool {
@@ -2168,7 +2174,11 @@ fn is_name_or_keyword(t: &Token) -> bool {
 }
 
 fn normalize_identifier(name: String) -> String {
-    name.replace('\u{fffd}', "?")
+    if name.contains('\u{fffd}') {
+        name.replace('\u{fffd}', "?")
+    } else {
+        name
+    }
 }
 
 fn is_table_name_first_token(token: &Token) -> bool {
