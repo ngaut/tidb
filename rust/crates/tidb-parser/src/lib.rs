@@ -55,6 +55,7 @@ mod user;
 pub mod util_parser;
 
 use std::any::Any;
+use std::collections::BTreeMap;
 
 use tidb_ast::{
     AdminStmt, DdlStmt, ExplainForStmt, ExplainStmt, ExplainTarget, Expr,
@@ -776,6 +777,9 @@ struct Parser {
     source: String,
     toks: Vec<Token>,
     pos: usize,
+    /// Decoded string aliases seen ahead of a parenthesized derived join.
+    /// Nested joins can have more than one outstanding token position.
+    lookahead_aliases: BTreeMap<usize, String>,
     enable_mariadb: bool,
     param_marker_position: usize,
     /// Decoded byte length of the first token in the most recently parsed
@@ -1004,6 +1008,7 @@ impl Parser {
             source: sql.to_owned(),
             toks,
             pos: 0,
+            lookahead_aliases: BTreeMap::new(),
             enable_mariadb,
             param_marker_position: 0,
             string_projection_offset: None,
@@ -1302,6 +1307,7 @@ impl Parser {
             source: sql.to_owned(),
             toks,
             pos: 0,
+            lookahead_aliases: BTreeMap::new(),
             enable_mariadb: false,
             param_marker_position: 0,
             string_projection_offset: None,
@@ -1344,10 +1350,16 @@ impl Parser {
 
     fn bump(&mut self) -> Token {
         let t = self.toks[self.pos].clone();
+        self.advance();
+        t
+    }
+
+    /// Consume a token whose owned contents are not needed. Keep the token
+    /// intact for source offsets, lookback and speculative parser rollback.
+    fn advance(&mut self) {
         if self.pos + 1 < self.toks.len() {
             self.pos += 1;
         }
-        t
     }
 
     fn at_eof(&self) -> bool {
