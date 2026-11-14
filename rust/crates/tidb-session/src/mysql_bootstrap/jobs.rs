@@ -669,6 +669,7 @@ mod tests {
             )
             .unwrap(),
             ddl_table_version: 0,
+            store_is_tikv: false,
         }
     }
 

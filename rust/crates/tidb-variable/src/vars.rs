@@ -2346,20 +2346,28 @@ pub fn parse_read_timestamp(
 /// value bootstrap seeds into `mysql.global_variables` and `SET x = DEFAULT`
 /// resolves to.
 ///
-/// The environment is the stock one. `store_is_tikv` is a PROCESS fact in Go
-/// (`config.GetGlobalConfig().Store`) that this tier is not told, so
-/// `tidb_enable_async_commit`/`tidb_enable_1pc` resolve to their non-TiKV-store
-/// defaults here; every other override is unconditional.
+/// The store is the configured one ([`configured_store_is_tikv`]), so a
+/// TiKV-backed node resolves `tidb_enable_async_commit`/`tidb_enable_1pc` to
+/// ON as Go does; test mode and the kernel type stay at their stock values.
 pub fn global_system_variable_initial_value(def: &SysVarDef) -> String {
     tidb_vardef::global_sysvar_initial::global_system_variable_initial_value(
         def.name,
         &crate::sysvar::effective_default(def),
         tidb_vardef::global_sysvar_initial::GlobalSysvarEnvironment {
-            store_is_tikv: false,
+            store_is_tikv: configured_store_is_tikv(),
             in_test: false,
             next_gen: false,
         },
     )
+}
+
+/// Go `config.GetGlobalConfig().Store == config.StoreTypeTiKV`: whether this
+/// process's published configuration names TiKV as its store. A node publishes
+/// its configuration before it bootstraps or serves; until then the default
+/// configuration names unistore.
+pub fn configured_store_is_tikv() -> bool {
+    let config = tidb_config::config_tree::config::get_global_config();
+    config.store.0 == tidb_config::store::STORE_TYPE_TIKV
 }
 
 /// Go's `GetGlobal` hooks that report something other than the stored text:

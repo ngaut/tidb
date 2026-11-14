@@ -85,6 +85,11 @@ pub struct BootstrapEnvironment {
     /// The bootstrap planner creates every newer version group and records the
     /// resulting version in both metadata and `mysql.tidb`, as Go does.
     pub ddl_table_version: i64,
+    /// Go `config.GetGlobalConfig().Store == config.StoreTypeTiKV`. A
+    /// TiKV-backed cluster seeds `tidb_enable_async_commit` and
+    /// `tidb_enable_1pc` ON (`GlobalSystemVariableInitialValue`); any other
+    /// store seeds them OFF.
+    pub store_is_tikv: bool,
 }
 
 /// Writes every seed row Go's `doDMLWorks` writes, with its index entries.
@@ -141,6 +146,10 @@ pub fn seed(
 /// them (a `pkg/session` test does not import it); and the test-mode
 /// `GlobalSystemVariableInitialValue` arms are left out, so
 /// `tidb_mem_oom_action` is `CANCEL` and `tidb_enable_auto_analyze` is `ON`.
+///
+/// The test bootstrapped a mock store, so the fixture holds the non-TiKV
+/// values of `tidb_enable_async_commit` and `tidb_enable_1pc` (`OFF`); the
+/// seed applies the store arm from [`BootstrapEnvironment::store_is_tikv`].
 const GLOBAL_VARIABLES_FIXTURE: &str = include_str!("global_variables_fixture.tsv");
 
 /// The `mysql.global_variables` rows a bootstrapped cluster holds, as
@@ -154,22 +163,37 @@ pub(crate) fn bootstrapped_global_variables() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Parses [`GLOBAL_VARIABLES_FIXTURE`] into one seed row per global variable.
+/// Parses [`GLOBAL_VARIABLES_FIXTURE`] into one seed row per global variable,
+/// each value adjusted for the cluster's store (see the fixture's doc).
 ///
 /// A blank line is skipped (there are none in the captured fixture, but an
 /// empty file must not panic); a line without a tab is a fixture that no
 /// longer matches its own doc comment, so parsing refuses rather than
 /// silently dropping a variable Go would have seeded.
-fn global_variable_rows() -> Result<Vec<SeedRow>, BootstrapError> {
+fn global_variable_rows(
+    environment: &BootstrapEnvironment,
+) -> Result<Vec<SeedRow>, BootstrapError> {
+    // Only the store differs from the fixture's environment; every other
+    // arm maps the fixture's values to themselves.
+    let sysvar_environment = tidb_vardef::global_sysvar_initial::GlobalSysvarEnvironment {
+        store_is_tikv: environment.store_is_tikv,
+        in_test: false,
+        next_gen: false,
+    };
     GLOBAL_VARIABLES_FIXTURE
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| {
-            let (name, value) = line.split_once('\t').ok_or_else(|| {
+            let (name, fixture_value) = line.split_once('\t').ok_or_else(|| {
                 BootstrapError::Encode(format!(
                     "global_variables fixture line `{line}` is not NAME\\tVALUE"
                 ))
             })?;
+            let value = tidb_vardef::global_sysvar_initial::global_system_variable_initial_value(
+                name,
+                fixture_value,
+                sysvar_environment,
+            );
             Ok(SeedRow {
                 table: "global_variables",
                 values: vec![
@@ -262,7 +286,7 @@ fn seed_rows(environment: &BootstrapEnvironment) -> Result<Vec<SeedRow>, Bootstr
             "TiDB Cluster ID.",
         ),
     ];
-    rows.extend(global_variable_rows()?);
+    rows.extend(global_variable_rows(environment)?);
     // Go insertBuiltinBindInfoRow: every binding writer locks this record.
     let lock_sql = "builtin_pseudo_sql_for_bind_lock";
     let zero = Datum::Time(
@@ -431,4 +455,87 @@ fn clustered(table: &TableInfo) -> bool {
 
 fn encode(error: RowEncodeError) -> BootstrapError {
     BootstrapError::Encode(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn environment(store_is_tikv: bool) -> BootstrapEnvironment {
+        BootstrapEnvironment {
+            system_tz: "UTC".to_owned(),
+            new_collation_enabled: true,
+            cluster_id: 1,
+            current_timestamp: Time::from_date_checked(
+                2026,
+                11,
+                14,
+                0,
+                0,
+                0,
+                0,
+                TimeType::Timestamp,
+                0,
+            )
+            .expect("a fixed calendar date is a valid timestamp"),
+            ddl_table_version: 0,
+            store_is_tikv,
+        }
+    }
+
+    /// The seeded `mysql.global_variables` rows as `(name, value)`.
+    fn seeded_global_variables(environment: &BootstrapEnvironment) -> Vec<(String, String)> {
+        global_variable_rows(environment)
+            .expect("the fixture parses")
+            .iter()
+            .map(|row| {
+                let text = |column: &str| match &row
+                    .values
+                    .iter()
+                    .find(|value| value.column == column)
+                    .expect("every seed row names both columns")
+                    .value
+                {
+                    Datum::Bytes(bytes) => String::from_utf8(bytes.clone()).expect("UTF-8"),
+                    other => panic!("{column} is not text: {other:?}"),
+                };
+                (text("variable_name"), text("variable_value"))
+            })
+            .collect()
+    }
+
+    fn seeded(environment: &BootstrapEnvironment, name: &str) -> String {
+        seeded_global_variables(environment)
+            .into_iter()
+            .find(|(seeded_name, _)| seeded_name == name)
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("{name} is not seeded"))
+    }
+
+    // Go `GlobalSystemVariableInitialValue`: a TiKV store turns both faster
+    // commit protocols on; the fixture was captured on a mock store.
+    #[test]
+    fn a_tikv_cluster_seeds_async_commit_and_one_pc_on() {
+        let tikv = environment(true);
+        assert_eq!(seeded(&tikv, "tidb_enable_async_commit"), "ON");
+        assert_eq!(seeded(&tikv, "tidb_enable_1pc"), "ON");
+
+        let other_store = environment(false);
+        assert_eq!(seeded(&other_store, "tidb_enable_async_commit"), "OFF");
+        assert_eq!(seeded(&other_store, "tidb_enable_1pc"), "OFF");
+    }
+
+    #[test]
+    fn the_store_changes_no_other_seeded_global_variable() {
+        let tikv = seeded_global_variables(&environment(true));
+        let other_store = seeded_global_variables(&environment(false));
+        assert_eq!(tikv.len(), other_store.len());
+        let differing: Vec<&str> = tikv
+            .iter()
+            .zip(&other_store)
+            .filter(|(on_tikv, elsewhere)| on_tikv != elsewhere)
+            .map(|(on_tikv, _)| on_tikv.0.as_str())
+            .collect();
+        assert_eq!(differing, ["tidb_enable_1pc", "tidb_enable_async_commit"]);
+    }
 }

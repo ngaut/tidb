@@ -119,6 +119,7 @@ pub fn publish_bootstrap_with_effects<S: StoreClient>(
         cluster_id: opener.cluster_id(),
         current_timestamp: utc_now_timestamp(),
         ddl_table_version: 0,
+        store_is_tikv: tidb_variable::vars::configured_store_is_tikv(),
     };
     let mut transaction = opener.begin().map_err(|error| error.to_string())?;
     let start_ts = transaction.start_ts();
