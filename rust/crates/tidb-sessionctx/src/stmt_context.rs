@@ -438,7 +438,14 @@ pub trait TiFlashClusterInfo: Send + Sync {
 /// statement effects (warnings, memory, locks and counters) retain their
 /// existing shared owners.
 #[derive(Clone, Default)]
-pub struct StmtContext(Arc<StmtContextData>);
+pub struct StmtContext {
+    data: Arc<StmtContextData>,
+    /// The session-owned publication cell for the plan-derived fields Go
+    /// stores on `ProcessInfo` while building the ordinary executor. It sits
+    /// beside the shared configuration, so a context detached from it
+    /// ([`Self::without_process_plan_info`]) still shares that configuration.
+    process_plan_info: Option<Arc<Mutex<ProcessPlanInfo>>>,
+}
 
 /// Go `LogicalPlanBuildState`: what [`StmtContext::save_logical_plan_build_ctx`]
 /// keeps of the statement for the rounds that build its plan again.
@@ -456,14 +463,14 @@ impl std::ops::Deref for StmtContext {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.data
     }
 }
 
 impl std::ops::DerefMut for StmtContext {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        Arc::make_mut(&mut self.0)
+        Arc::make_mut(&mut self.data)
     }
 }
 
@@ -1417,9 +1424,6 @@ pub struct StmtContextData {
     /// prepared-statement layer that reads it is outside the driver that
     /// knows.
     planned_apply: Arc<AtomicBool>,
-    /// The session-owned publication cell for the plan-derived fields Go
-    /// stores on `ProcessInfo` while building the ordinary executor.
-    process_plan_info: Option<Arc<Mutex<ProcessPlanInfo>>>,
     /// Whether the published process info renders `BriefBinaryPlan`. Go
     /// drops the plan detail for a binary-protocol EXECUTE (`executeStmtImpl`,
     /// `pkg/session/session.go`: "for exec-stmt on bin-protocol, ignore the
@@ -1778,7 +1782,7 @@ macro_rules! context_configuration {
             $(
                 $(#[$attr])*
                 pub fn $name(mut $this $(, $arg: $ty)*) -> Self {
-                    let _ = Arc::make_mut(&mut $this.0).$name($($arg),*);
+                    let _ = Arc::make_mut(&mut $this.data).$name($($arg),*);
                     $this
                 }
             )*
@@ -2477,13 +2481,6 @@ context_configuration! {
     #[must_use]
     pub fn with_allow_write_row_id(mut self, allowed: bool) -> Self {
         self.allow_write_row_id = allowed;
-        self
-    }
-
-    /// Installs the current session's process-plan publication cell.
-    #[must_use]
-    pub fn with_process_plan_info_sink(mut self, sink: Arc<Mutex<ProcessPlanInfo>>) -> Self {
-        self.process_plan_info = Some(sink);
         self
     }
 
@@ -3221,8 +3218,16 @@ impl StmtContext {
     /// Statement effects keep their existing shared owners, as for with_* calls.
     #[must_use]
     pub fn configure(mut self, configure: impl FnOnce(&mut StmtContextData)) -> Self {
-        configure(Arc::make_mut(&mut self.0));
+        configure(Arc::make_mut(&mut self.data));
         self
+    }
+
+    /// A context over `data` with no process-info sink installed.
+    fn from_data(data: Arc<StmtContextData>) -> Self {
+        Self {
+            data,
+            process_plan_info: None,
+        }
     }
 
     /// Initializes common state once. Query/DML constructors resolve error
@@ -3235,7 +3240,7 @@ impl StmtContext {
         memory: StatementMemory,
         session: StmtContextSessionState,
     ) -> Self {
-        Self(Arc::new(StmtContextData {
+        Self::from_data(Arc::new(StmtContextData {
             optional_props: optional_eval_props(&session.regions, &session.session_privilege, &session.dynamic_privilege),
             mpp_query_info: session.mpp_query_info,
             mpp_server_id: session.mpp_server_id,
@@ -3440,7 +3445,6 @@ impl StmtContext {
             index_merge: true,
             no_index_merge_hint: false,
             planned_apply: session.planned_apply,
-            process_plan_info: None,
             publish_brief_binary_plan: true,
             in_execute: false,
             cached_plan_digest: None,
@@ -3724,7 +3728,7 @@ impl StmtContext {
         valid: bool,
         allocator: Option<Arc<dyn tidb_chunk::alloc::Allocator>>,
     ) -> Self {
-        let data = Arc::make_mut(&mut self.0);
+        let data = Arc::make_mut(&mut self.data);
         data.chunk_alloc_valid = Arc::new(AtomicBool::new(valid));
         data.chunk_allocator = allocator.filter(|_| valid);
         self
@@ -3740,7 +3744,7 @@ impl StmtContext {
         valid: Arc<AtomicBool>,
         allocator: Option<Arc<dyn tidb_chunk::alloc::Allocator>>,
     ) -> Self {
-        let data = Arc::make_mut(&mut self.0);
+        let data = Arc::make_mut(&mut self.data);
         data.chunk_alloc_valid = valid;
         data.chunk_allocator = allocator;
         self
@@ -3764,7 +3768,7 @@ impl StmtContext {
         mut self,
         slot: Option<Arc<Mutex<Option<tidb_chunk::chunk::Chunk>>>>,
     ) -> Self {
-        Arc::make_mut(&mut self.0).result_write_chunk = slot;
+        Arc::make_mut(&mut self.data).result_write_chunk = slot;
         self
     }
 
@@ -5264,24 +5268,26 @@ impl StmtContext {
     /// Go `StatementContext.SetIndexForce` (`stmtctx.go:1034`): the statement
     /// carries a hint-forced access path somewhere.
     pub fn set_index_force(&self) {
-        self.0.index_force.store(true, Ordering::Release);
+        self.data.index_force.store(true, Ordering::Release);
     }
 
     /// Go `StmtCtx.ReadFromTableCache = true`.
     pub fn set_read_from_table_cache(&self) {
-        self.0.read_from_table_cache.store(true, Ordering::Release);
+        self.data
+            .read_from_table_cache
+            .store(true, Ordering::Release);
     }
 
     /// Go `StmtCtx.ReadFromTableCache`.
     #[must_use]
     pub fn read_from_table_cache(&self) -> bool {
-        self.0.read_from_table_cache.load(Ordering::Acquire)
+        self.data.read_from_table_cache.load(Ordering::Acquire)
     }
 
     /// Go `b.Ti` under `withStmtCtxLock`: the statement's telemetry, which
     /// its executor build writes.
     pub fn telemetry_info(&self) -> std::sync::MutexGuard<'_, crate::telemetry_info::TelemetryInfo> {
-        self.0
+        self.data
             .telemetry_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5290,7 +5296,7 @@ impl StmtContext {
     /// Go `StatementContext.GetIndexForce` (`stmtctx.go:1011`).
     #[must_use]
     pub fn get_index_force(&self) -> bool {
-        self.0.index_force.load(Ordering::Acquire)
+        self.data.index_force.load(Ordering::Acquire)
     }
 
     /// The statement side of Go `ExecStmt.Exec` between `buildExecutor` and
@@ -5381,9 +5387,17 @@ impl StmtContext {
         self
     }
 
+    /// Installs the current session's process-plan publication cell.
+    #[must_use]
+    pub fn with_process_plan_info_sink(mut self, sink: Arc<Mutex<ProcessPlanInfo>>) -> Self {
+        self.process_plan_info = Some(sink);
+        self
+    }
+
     /// This context without its process-info sink: what a value the
     /// process info itself keeps (its lazy plan source) plans under, so the
-    /// two do not own each other.
+    /// two do not own each other. The configuration stays shared; only the
+    /// sink is dropped.
     #[must_use]
     pub fn without_process_plan_info(mut self) -> Self {
         self.process_plan_info = None;
@@ -6211,7 +6225,7 @@ impl StmtContext {
             ErrorLevel::Warn
         };
         let mut context = Self::new(level, truncate, strict, ignore_err, memory, session);
-        Arc::make_mut(&mut context.0).set_strict_sql_mode(strict_sql_mode);
+        Arc::make_mut(&mut context.data).set_strict_sql_mode(strict_sql_mode);
         context
     }
 
@@ -7224,7 +7238,7 @@ impl Columns for StmtContext {
             // `StmtContext::default()` is an expression-only test helper, not
             // a real statement constructor. Its allocation identity still
             // prevents two such helpers from sharing a signature cache.
-            Arc::as_ptr(&self.0) as usize as u64
+            Arc::as_ptr(&self.data) as usize as u64
         }
     }
 
@@ -7828,6 +7842,24 @@ mod tests {
         assert!(cell.lock().unwrap().is_ddl_job_in_queue);
         ctx.set_ddl_job_in_queue(false);
         assert!(!cell.lock().unwrap().is_ddl_job_in_queue);
+    }
+
+    /// A lazy plan source plans under its statement's context without the
+    /// process-info sink: detaching the sink shares the configuration rather
+    /// than copying it, and only the original still publishes to the cell.
+    #[test]
+    fn detaching_the_process_plan_sink_shares_the_configuration() {
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(
+            tidb_stmtctx::ProcessPlanInfo::default(),
+        ));
+        let ctx = super::StmtContext::for_query()
+            .with_process_plan_info_sink(std::sync::Arc::clone(&cell));
+        let detached = ctx.clone().without_process_plan_info();
+        assert!(std::ptr::eq(&*ctx, &*detached));
+        detached.set_ddl_job_in_queue(true);
+        assert!(!cell.lock().unwrap().is_ddl_job_in_queue);
+        ctx.set_ddl_job_in_queue(true);
+        assert!(cell.lock().unwrap().is_ddl_job_in_queue);
     }
 
     /// Go `initStats`' `RecordUsedInfo` stores a source's table entry like

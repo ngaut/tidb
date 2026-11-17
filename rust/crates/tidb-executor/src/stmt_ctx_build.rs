@@ -1701,7 +1701,6 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                     .with_no_index_merge_hint(self.stmt_hints_ref().no_index_merge_hint)
                     .with_pushdown_blacklists(self.pushdown_blacklists().snapshot())
                     .with_stats_handle(self.stats_handle())
-                    .with_process_plan_info_sink(Arc::clone(&self.process_plan_info_ref()))
                     .with_statement_phase_observer(self.statement_phase_observer())
                     .with_phase_durations(self.phase_durations_ref().clone())
                     .with_sql_cpu_usages(Some(Arc::clone(&self.sql_cpu_usages_ref())))
@@ -1870,7 +1869,8 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                 if let Some(parameters) = &self.prepared_params_ref() {
                     let _ = ctx.with_prepared_params(Arc::clone(parameters));
                 }
-            });
+            })
+            .with_process_plan_info_sink(Arc::clone(&self.process_plan_info_ref()));
         }
         let (increment, offset) = self.auto_increment_step();
         crate::StmtContext::for_dml_with_session(
@@ -1913,7 +1913,6 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                         .get_system(tidb_vardef::tidb_vars::TIFLASH_REPLICA_READ)
                         .unwrap_or_default(),
                 ))
-                .with_process_plan_info_sink(Arc::clone(&self.process_plan_info_ref()))
                 .with_statement_phase_observer(self.statement_phase_observer())
                 .with_phase_durations(self.phase_durations_ref().clone())
                 .with_sql_cpu_usages(Some(Arc::clone(&self.sql_cpu_usages_ref())))
@@ -2124,6 +2123,7 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                 let _ = ctx.with_latest_info_schema(crate::LatestInfoSchema::new(latest_index_schema));
             }
         })
+        .with_process_plan_info_sink(Arc::clone(&self.process_plan_info_ref()))
     }
 
     /// Go `SessionVars.ForeignKeyChecks`, read off `@@foreign_key_checks`.
