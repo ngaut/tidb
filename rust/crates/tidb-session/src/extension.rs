@@ -124,6 +124,7 @@ impl Session {
     }
     /// Go `UserPrivileges.GetAuthWithoutVerification`.
     pub fn auth_without_verification(&mut self) {
+        self.forget_statement_privilege_checks();
         self.auth_plugin_verification = None;
     }
 

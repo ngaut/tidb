@@ -885,6 +885,10 @@ pub struct Session {
     /// account/role storage, while authorization readers treat the session
     /// as unrestricted.
     privilege_bypassed: bool,
+    /// The privilege checks this session's statement contexts carry, built
+    /// for its identity and active roles (see
+    /// [`Session::statement_privilege_checks`]).
+    statement_privilege_checks: std::sync::Mutex<Option<identity::CachedPrivilegeChecks>>,
     /// Go `SessionVars.Rng`: the generator unseeded `RAND()` advances, shared
     /// across every statement of this session (unlike constant `RAND(N)`,
     /// which owns a fresh per-statement generator -- see `StmtContext`).
@@ -1168,6 +1172,7 @@ impl Session {
             extension_statement: None,
             auth_plugin_verification: None,
             privilege_bypassed: false,
+            statement_privilege_checks: std::sync::Mutex::default(),
             rand: new_time_seeded_rand(),
             prepared_statements: prepared_statements::PreparedStore::default(),
             protocol_session_states: Default::default(),

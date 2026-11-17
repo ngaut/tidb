@@ -33,9 +33,81 @@ use tidb_hack::go_to_lower;
 
 /// Distinct prepared texts whose privilege requests one session keeps.
 
+/// Go `privilege.Manager` as a session holds it (`UserPrivileges`, made
+/// once when the session is created and authenticated): the privilege checks
+/// a statement context carries. They read the live registry, so a GRANT or
+/// FLUSH PRIVILEGES reaches them at once.
+#[derive(Clone)]
+pub(crate) struct StatementPrivilegeChecks {
+    pub(crate) sequence: tidb_sessionctx::SequencePrivilegeCheck,
+    pub(crate) dynamic: tidb_sessionctx::DynamicPrivilegeCheck,
+    pub(crate) view_definer: tidb_sessionctx::ViewDefinerPrivilegeCheck,
+    pub(crate) session: tidb_sessionctx::SessionPrivilegeCheck,
+}
+
+/// [`StatementPrivilegeChecks`] with the identity they were built for.
+/// `checks` is `None` for an unrestricted session.
+pub(crate) struct CachedPrivilegeChecks {
+    current_user: Option<String>,
+    active_roles: Arc<Vec<tidb_privilege::Account>>,
+    checks: Option<StatementPrivilegeChecks>,
+}
+
 impl Session {
+    /// The privilege checks of this session's statements, through `pick`.
+    /// `None` is an unrestricted session.
+    ///
+    /// Go builds one privilege manager per session, not per statement. The
+    /// checks are built again when the identity or active roles they were
+    /// built for change, and when [`Self::forget_statement_privilege_checks`]
+    /// drops them because the registry, extension checks or auth plugin
+    /// they capture changed.
+    pub(crate) fn statement_privilege_checks<T>(
+        &self,
+        pick: impl FnOnce(&StatementPrivilegeChecks) -> T,
+    ) -> Option<T> {
+        let mut cached = self
+            .statement_privilege_checks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = cached.as_ref().is_some_and(|cached| {
+            cached.current_user == self.vars.current_user
+                && *cached.active_roles == *self.vars.active_roles
+        });
+        if !current {
+            *cached = Some(CachedPrivilegeChecks {
+                current_user: self.vars.current_user.clone(),
+                active_roles: Arc::clone(&self.vars.active_roles),
+                checks: self.build_statement_privilege_checks(),
+            });
+        }
+        cached
+            .as_ref()
+            .and_then(|cached| cached.checks.as_ref())
+            .map(pick)
+    }
+
+    fn build_statement_privilege_checks(&self) -> Option<StatementPrivilegeChecks> {
+        Some(StatementPrivilegeChecks {
+            sequence: self.sequence_privilege_check()?,
+            dynamic: self.dynamic_privilege_check()?,
+            view_definer: self.request_verification_with_user()?,
+            session: self.session_privilege_check()?,
+        })
+    }
+
+    /// Drops [`Self::statement_privilege_checks`]: what they capture besides
+    /// the identity and active roles has changed.
+    pub(crate) fn forget_statement_privilege_checks(&mut self) {
+        *self
+            .statement_privilege_checks
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     /// Go `authenticateWithPlugin`: retain authorization callbacks only after a successful login.
     pub fn set_auth_plugin(&mut self, name: &str) {
+        self.forget_statement_privilege_checks();
         self.vars.auth_plugin = name.to_owned();
         self.auth_plugin_verification = tidb_extension::get_extensions()
             .expect("extensions setup before authentication")
@@ -1389,6 +1461,7 @@ impl Session {
     }
 
     pub fn attach_privileges(&mut self, registry: tidb_privilege::PrivilegeRegistry) {
+        self.forget_statement_privilege_checks();
         // Go `CreateSession`: `privileges.NewUserPrivileges(handle,
         // extension.GetExtensions())` keeps the extensions' access checks.
         self.extension_access_check_funcs = tidb_extension::get_extensions()
@@ -1448,6 +1521,7 @@ impl Session {
     /// session. Account and role storage remains attached; only privilege
     /// verification and role activation are bypassed.
     pub fn enable_privilege_bypass(&mut self) {
+        self.forget_statement_privilege_checks();
         self.privilege_bypassed = true;
         Arc::make_mut(&mut self.vars.active_roles).clear();
     }

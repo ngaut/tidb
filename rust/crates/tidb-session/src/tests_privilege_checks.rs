@@ -485,3 +485,32 @@ fn process_admits_a_metrics_schema_table_like_go() {
         ]
     );
 }
+
+/// Go keeps one privilege manager per session (`UserPrivileges`), not one per
+/// statement: a session's statement contexts share its privilege checks
+/// until its active roles change. The checks read the live registry, so a
+/// GRANT made after they were built is answered.
+#[test]
+fn statements_share_the_session_privilege_checks_until_its_roles_change() {
+    use tidb_executor::stmt_ctx_build::StmtCtxSession;
+    let (registry, mut root) = setup();
+    root.run("create user u1, r1").unwrap();
+    root.run("grant r1 to u1").unwrap();
+    let mut u1 = session_as(&registry, root.shared_catalog(), "u1", "%");
+    let first = StmtCtxSession::session_privilege_check(&u1).expect("u1 is restricted");
+    let second = StmtCtxSession::session_privilege_check(&u1).expect("u1 is restricted");
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+
+    // A GRANT reaches checks built before it.
+    assert!(!first("test", "t", "", tidb_mysql::SelectPriv));
+    root.run("grant select on test.* to u1").unwrap();
+    assert!(first("test", "t", "", tidb_mysql::SelectPriv));
+
+    // Activating a role builds the checks again, for the new roles.
+    root.run("grant update on test.* to r1").unwrap();
+    u1.run("set role r1").unwrap();
+    let with_role = StmtCtxSession::session_privilege_check(&u1).expect("u1 is restricted");
+    assert!(!std::sync::Arc::ptr_eq(&first, &with_role));
+    assert!(with_role("test", "t", "", tidb_mysql::UpdatePriv));
+    assert!(!first("test", "t", "", tidb_mysql::UpdatePriv));
+}
