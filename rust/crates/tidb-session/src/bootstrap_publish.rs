@@ -113,6 +113,7 @@ pub fn publish_bootstrap_with_effects<S: StoreClient>(
         cluster_id: opener.cluster_id(),
         current_timestamp: utc_now_timestamp(),
         ddl_table_version: 0,
+        store_is_tikv: tidb_variable::vars::configured_store_is_tikv(),
     };
     let mut transaction = opener.begin().map_err(|error| error.to_string())?;
     environment.ddl_table_version = get_ddl_table_version(
@@ -222,7 +223,7 @@ mod tests {
         let environment = crate::mysql_bootstrap::BootstrapEnvironment {
             system_tz: tidb_timeutil::infer_system_tz(), new_collation_enabled: true,
             cluster_id: opener.cluster_id(), current_timestamp: tidb_datatype::current_time::utc_now_timestamp(),
-            ddl_table_version: 0,
+            ddl_table_version: 0, store_is_tikv: false,
         };
         // Deliberately lose the DML write, as Go's test stops after doDDLWorks.
         let _uncommitted_dml = crate::mysql_bootstrap::jobs::execute(

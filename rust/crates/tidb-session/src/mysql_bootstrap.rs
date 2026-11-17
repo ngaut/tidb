@@ -537,6 +537,7 @@ mod source_tests {
             )
             .unwrap(),
             ddl_table_version: 0,
+            store_is_tikv: false,
         };
         let write = plan_mysql_bootstrap(&mut snapshot, 1, &environment).unwrap();
         let raw_key = schema_cache_size_kv_key();
@@ -582,6 +583,7 @@ mod source_tests {
             )
             .unwrap(),
             ddl_table_version: 0,
+            store_is_tikv: false,
         };
         let write = plan_mysql_bootstrap(&mut snapshot, 1, &environment).unwrap();
         let stored = |raw_key: Vec<u8>| {

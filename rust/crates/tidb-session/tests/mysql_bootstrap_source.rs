@@ -79,6 +79,7 @@ fn environment() -> BootstrapEnvironment {
         )
         .expect("a fixed calendar date is a valid timestamp"),
         ddl_table_version: 0,
+        store_is_tikv: false,
     }
 }
 
