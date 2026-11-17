@@ -161,6 +161,14 @@ pub struct StatementVarSnapshot {
     /// Go `SessionVars.LockWaitTimeout` (`innodb_lock_wait_timeout`, in
     /// seconds), which every pessimistic lock request reads.
     pub lock_wait_timeout_secs: u64,
+    /// The session settings below are Go `SessionVars` fields every
+    /// statement context copies, derived here once per generation.
+    allow_remove_auto_inc: bool,
+    placement_mode_ignore: bool,
+    lock_unchanged_keys: bool,
+    mpp_version: tidb_txnkv::MppVersion,
+    mpp_exchange_compression_mode: tidb_vardef::modes::ExchangeCompressionMode,
+    tiflash_fine_grained_shuffle: tidb_sessionctx::TiFlashFineGrainedShuffleSession,
 }
 
 
@@ -1328,6 +1336,12 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or_default(),
             sql_mode,
+            allow_remove_auto_inc: self.allow_remove_auto_inc(),
+            placement_mode_ignore: self.placement_mode_ignore(),
+            lock_unchanged_keys: self.lock_unchanged_keys(),
+            mpp_version: self.choose_mpp_version(),
+            mpp_exchange_compression_mode: self.mpp_exchange_compression_mode(),
+            tiflash_fine_grained_shuffle: self.tiflash_fine_grained_shuffle_session(),
         });
         *self.statement_var_cache_ref().borrow_mut() = Some(Arc::clone(&snapshot));
         snapshot
@@ -1659,7 +1673,7 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                     // Go's DDL reads `@@tidb_allow_remove_auto_inc` from the
                     // session (`GetModifiableColumnJob`), whatever context
                     // the statement takes.
-                    .with_allow_remove_auto_inc(self.allow_remove_auto_inc())
+                    .with_allow_remove_auto_inc(snapshot.allow_remove_auto_inc)
                     .with_string_type_flags(string_type_flags)
                     .with_cte_max_recursion_depth(cte_depth)
                     .with_join_reorder_threshold(join_reorder_threshold)
@@ -1810,19 +1824,19 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                         self.session_vars().query_cop_store_limit() as isize,
                     ))
                     .with_enable_check_constraint(self.enable_check_constraint())
-                    .with_placement_mode_ignore(self.placement_mode_ignore())
-                    .with_lock_unchanged_keys(self.lock_unchanged_keys())
+                    .with_placement_mode_ignore(snapshot.placement_mode_ignore)
+                    .with_lock_unchanged_keys(snapshot.lock_unchanged_keys)
                     .with_rc_check_ts(self.stmt_rc_check_ts())
                     .with_pessimistic_txn_provider(self.pessimistic_txn_provider())
-                    .with_mpp_exchange_compression_mode(self.mpp_exchange_compression_mode())
-                    .with_mpp_version(self.choose_mpp_version())
+                    .with_mpp_exchange_compression_mode(snapshot.mpp_exchange_compression_mode)
+                    .with_mpp_version(snapshot.mpp_version)
                     .with_tiflash_fast_scan(
                         self.session_vars()
                             .get_system(tidb_vardef::tidb_vars::TIFLASH_FAST_SCAN)
                             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("ON")),
                     )
                     .with_tiflash_fine_grained_shuffle(
-                        self.tiflash_fine_grained_shuffle_session(),
+                        snapshot.tiflash_fine_grained_shuffle,
                         self.tiflash_cluster_info(),
                     )
                     .with_weak_consistency(self.stmt_weak_consistency())
@@ -2030,19 +2044,19 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                 .with_auto_increment_step(increment, offset)
                 .with_foreign_key_checks(self.foreign_key_checks())
                 .with_enable_check_constraint(self.enable_check_constraint())
-                .with_placement_mode_ignore(self.placement_mode_ignore())
-                    .with_lock_unchanged_keys(self.lock_unchanged_keys())
+                .with_placement_mode_ignore(snapshot.placement_mode_ignore)
+                    .with_lock_unchanged_keys(snapshot.lock_unchanged_keys)
                     .with_rc_check_ts(self.stmt_rc_check_ts())
                     .with_pessimistic_txn_provider(self.pessimistic_txn_provider())
-                    .with_mpp_exchange_compression_mode(self.mpp_exchange_compression_mode())
-                    .with_mpp_version(self.choose_mpp_version())
+                    .with_mpp_exchange_compression_mode(snapshot.mpp_exchange_compression_mode)
+                    .with_mpp_version(snapshot.mpp_version)
                     .with_tiflash_fast_scan(
                         self.session_vars()
                             .get_system(tidb_vardef::tidb_vars::TIFLASH_FAST_SCAN)
                             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("ON")),
                     )
                     .with_tiflash_fine_grained_shuffle(
-                        self.tiflash_fine_grained_shuffle_session(),
+                        snapshot.tiflash_fine_grained_shuffle,
                         self.tiflash_cluster_info(),
                     )
                     .with_weak_consistency(self.stmt_weak_consistency())
@@ -2079,7 +2093,7 @@ pub trait ResetContextOfStmt: crate::stmt_ctx_build::StmtCtxSession {
                     self.statement_txn_mode().is_pessimistic()
                         && self.session_vars().connection_id.is_some_and(|id| id > 0),
                 )
-                .with_allow_remove_auto_inc(self.allow_remove_auto_inc())
+                .with_allow_remove_auto_inc(snapshot.allow_remove_auto_inc)
                 .with_cte_max_recursion_depth(cte_depth)
                 .with_join_reorder_threshold(join_reorder_threshold)
                 .with_advanced_join_reorder(advanced_join_reorder)
