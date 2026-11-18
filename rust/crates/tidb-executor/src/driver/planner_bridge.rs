@@ -3547,7 +3547,10 @@ fn optimize_built_logical(
 #[derive(Debug)]
 pub(crate) struct CachedSelectPlan {
     statement: tidb_ast::Stmt,
-    physical: PhysicalPlan,
+    /// Shared with the process info each execution publishes, as Go's
+    /// `StmtCtx.SetPlan` shares the plan pointer; a rebind copies it only
+    /// while an earlier statement's process info still holds it.
+    physical: std::sync::Arc<PhysicalPlan>,
     generation: u64,
     /// Go `PlanCacheStmt.NormalizedPlan` / `PlanDigest`, shared by every
     /// execution of this entry.
@@ -3558,7 +3561,7 @@ impl CachedSelectPlan {
     pub(super) fn clone_for_execution(&self) -> Self {
         Self {
             statement: self.statement.clone(),
-            physical: self.physical.deep_clone(),
+            physical: std::sync::Arc::new(self.physical.deep_clone()),
             generation: self.generation,
             digest: std::sync::Arc::clone(&self.digest),
         }
@@ -3588,10 +3591,11 @@ impl CachedSelectPlan {
                 &needs_statement,
             )
         };
-        let rebuilt = self.physical.rebuild_plan_for_cache_in_place(
-            &tidb_planner::physical_plan_cache::CachedPlanRebuildContext::new(values)
-                .with_deferred_evaluator(&evaluator),
-        );
+        let rebuilt = super::physical_builder::unique_plan(&mut self.physical)
+            .rebuild_plan_for_cache_in_place(
+                &tidb_planner::physical_plan_cache::CachedPlanRebuildContext::new(values)
+                    .with_deferred_evaluator(&evaluator),
+            );
         if needs_statement.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(CachedPlanBindFailure::NeedsStatement);
         }
@@ -3607,7 +3611,7 @@ impl CachedSelectPlan {
     pub(crate) fn execution_mut(
         &mut self,
         generation: u64,
-    ) -> Option<(&tidb_ast::Stmt, &mut PhysicalPlan)> {
+    ) -> Option<(&tidb_ast::Stmt, &mut std::sync::Arc<PhysicalPlan>)> {
         (self.generation == generation).then_some((&self.statement, &mut self.physical))
     }
 }
@@ -3753,7 +3757,7 @@ pub(crate) fn cached_query_plan(
     Ok(Some((
         CachedSelectPlan {
             statement: tidb_ast::Stmt::Query(tidb_ast::NodeBox::new(query.clone())),
-            physical,
+            physical: std::sync::Arc::new(physical),
             generation: 0,
             digest: std::sync::Arc::default(),
         },

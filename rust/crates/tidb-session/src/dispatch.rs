@@ -242,7 +242,7 @@ pub(crate) fn filter_sem_restricted_hints(stmt: &mut Stmt) -> Vec<String> {
 /// `used` records whether the schema still matched while the catalog was
 /// locked; a moved schema falls through to ordinary physical planning.
 struct RetainedSelectPlan<'a> {
-    physical: &'a mut tidb_planner_core_operator_physicalop::PhysicalPlan,
+    physical: &'a mut std::sync::Arc<tidb_planner_core_operator_physicalop::PhysicalPlan>,
     schema_version: u64,
     used: &'a mut bool,
 }

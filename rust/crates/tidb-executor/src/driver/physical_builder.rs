@@ -7687,12 +7687,22 @@ pub(super) fn planned_result_columns(
 
 /// Go's common query execution seam: both SELECT and set-operation logical
 /// roots are already physical plans before executor construction begins.
+/// The plan behind `shared`, to change: copied first while an earlier
+/// statement's published process info still holds it.
+pub(crate) fn unique_plan(shared: &mut std::sync::Arc<PhysicalPlan>) -> &mut PhysicalPlan {
+    if std::sync::Arc::get_mut(shared).is_none() {
+        *shared = std::sync::Arc::new(shared.deep_clone());
+    }
+    std::sync::Arc::get_mut(shared).expect("a freshly copied plan has no other owner")
+}
+
 pub(super) fn open_query(
     query: &tidb_ast::QueryStmt,
-    physical: &mut PhysicalPlan,
+    shared: &mut std::sync::Arc<PhysicalPlan>,
     catalog: &SessionExtendedInfoSchema,
     ctx: &crate::StmtContext,
 ) -> Result<super::RecordSet, DriverError> {
+    let physical = unique_plan(shared);
     // Go `runStmt` -> `ExecStmt.Exec`: build the executor and open it --
     // or, for a prepared point get in autocommit (`stmt.PsStmt`, set when
     // `IsSafeToReusePointGetExecutor` holds and the plan is a
@@ -7709,7 +7719,9 @@ pub(super) fn open_query(
     }
     prepare_execution_plan(physical, catalog, ctx)?;
     crate::isolation_advise::advise_optimize_with_plan(ctx, physical, false);
-    crate::explain::publish_physical_process_info(ctx, physical, catalog)?;
+    // Go `StmtCtx.SetPlan`: the process info keeps the plan itself.
+    crate::explain::publish_shared_physical_process_info(ctx, shared, catalog)?;
+    let physical: &PhysicalPlan = shared;
     let root = build(physical, catalog, ctx)?;
     let columns = match query {
         tidb_ast::QueryStmt::Select(select) => {

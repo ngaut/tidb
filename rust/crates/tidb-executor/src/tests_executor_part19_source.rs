@@ -209,6 +209,56 @@ fn prepared_plan_cache_selection_rebinds_a_range_without_replanning_the_shape() 
     );
 }
 
+/// Go `StmtCtx.SetPlan` keeps the plan pointer: the process info each
+/// execution of a cached SELECT publishes holds the cache entry's plan
+/// itself rather than a copy of it.
+#[test]
+fn a_cached_select_publishes_the_cached_plan_without_copying_it() {
+    use tidb_planner_core_operator_physicalop::PhysicalPlan;
+    let cache = crate::SessionPlanCache::default();
+    let catalog = prepared_catalog();
+    let plan = prepared_select_plan(
+        "SELECT v FROM prepared_part19 WHERE id BETWEEN ? AND ? ORDER BY id",
+        2,
+        &catalog,
+    );
+    let cell = Arc::new(std::sync::Mutex::new(
+        tidb_stmtctx::ProcessPlanInfo::default(),
+    ));
+    let ctx = ctx().with_process_plan_info_sink(Arc::clone(&cell));
+    for values in [
+        [Datum::Int(1), Datum::Int(2)],
+        [Datum::Int(2), Datum::Int(3)],
+    ] {
+        let execution = plan
+            .bind(
+                &cache,
+                &values,
+                &catalog,
+                DEFAULT_DATABASE,
+                &ctx,
+                &PreparedPlanCacheEnvironment::default(),
+            )
+            .expect("prepared values bind");
+        run_prepared_select_for_test(&execution, &catalog, DEFAULT_DATABASE, &ctx)
+            .expect("prepared statement runs");
+        let published = cell
+            .lock()
+            .unwrap()
+            .stmt_plan
+            .as_ref()
+            .and_then(tidb_stmtctx::StoredPlan::get::<PhysicalPlan>)
+            .expect("the execution published its plan");
+        let cached = execution
+            .with_plan(|_, physical| {
+                let physical: &PhysicalPlan = physical;
+                physical as *const PhysicalPlan
+            })
+            .expect("the cache entry still holds this execution's plan");
+        assert!(std::ptr::eq(Arc::as_ptr(&published), cached));
+    }
+}
+
 /// `plan_cache_test.go:574::TestPreparedPlanCacheOperators`.
 #[test]
 fn prepared_plan_cache_reuses_a_parameterized_operator_tree() {

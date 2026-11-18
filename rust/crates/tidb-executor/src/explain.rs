@@ -3450,12 +3450,35 @@ pub fn publish_physical_process_info(
     physical: &tidb_planner_core_operator_physicalop::PhysicalPlan,
     catalog: &tidb_infoschema::SessionExtendedInfoSchema,
 ) -> Result<(), tidb_driver_error::DriverError> {
+    // The caller keeps changing its plan, so the process info keeps a copy.
+    publish_process_info_of(ctx, catalog, || std::sync::Arc::new(physical.deep_clone()))
+}
+
+/// [`publish_physical_process_info`] for a plan its caller holds shared: the
+/// process info keeps the plan itself, as Go's `StmtCtx.SetPlan` keeps the
+/// pointer, and the caller copies it before it next changes it.
+///
+/// # Errors
+/// The quarantine error of a KILL runaway watch.
+pub fn publish_shared_physical_process_info(
+    ctx: &crate::StmtContext,
+    physical: &std::sync::Arc<tidb_planner_core_operator_physicalop::PhysicalPlan>,
+    catalog: &tidb_infoschema::SessionExtendedInfoSchema,
+) -> Result<(), tidb_driver_error::DriverError> {
+    publish_process_info_of(ctx, catalog, || std::sync::Arc::clone(physical))
+}
+
+fn publish_process_info_of(
+    ctx: &crate::StmtContext,
+    catalog: &tidb_infoschema::SessionExtendedInfoSchema,
+    physical: impl FnOnce() -> std::sync::Arc<tidb_planner_core_operator_physicalop::PhysicalPlan>,
+) -> Result<(), tidb_driver_error::DriverError> {
     let Some(execution_started) = ctx.begin_physical_process_info() else {
         return Ok(());
     };
-    let plan = process_plan_info_with_brief(
+    let plan = shared_process_plan_info_with_brief(
         ctx,
-        physical,
+        &physical(),
         catalog,
         ctx.publishes_brief_binary_plan(),
     );
@@ -3474,7 +3497,23 @@ pub fn process_plan_info_with_brief(
     catalog: &SessionExtendedInfoSchema,
     with_brief: bool,
 ) -> crate::ProcessPlanInfo {
-    let stored = std::sync::Arc::new(physical.deep_clone());
+    shared_process_plan_info_with_brief(
+        statement_context,
+        &std::sync::Arc::new(physical.deep_clone()),
+        catalog,
+        with_brief,
+    )
+}
+
+/// [`process_plan_info_with_brief`] over a plan the process info keeps shared.
+fn shared_process_plan_info_with_brief(
+    statement_context: &crate::StmtContext,
+    shared: &std::sync::Arc<PhysicalPlan>,
+    catalog: &SessionExtendedInfoSchema,
+    with_brief: bool,
+) -> crate::ProcessPlanInfo {
+    let physical: &PhysicalPlan = shared;
+    let stored = std::sync::Arc::clone(shared);
     // The summary and the slow log render the encodings when they sample or
     // write the plan (Go `LazyInfo`), after the statement ran.
     let plan_source = {
