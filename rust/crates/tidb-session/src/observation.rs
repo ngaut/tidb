@@ -20,7 +20,7 @@
 //! not certify those execution-detail contracts.
 use crate::*;
 use tidb_executor::exec_stmt_observation::{
-    ExecStmtObservation as _, StatementObservation, StatementPhases,
+    BindingSource, ExecStmtObservation as _, StatementObservation, StatementPhases,
 };
 use tidb_topsql_stmtstats::{ExecFinishInfo, StatementObserver};
 
@@ -466,8 +466,7 @@ impl Session {
             plan_replayer_continues_capture_valid: false,
             routed: false,
             original_table_hints: Vec::new(),
-            binding_sql: String::new(),
-            binding_digest: String::new(),
+            binding_source: None,
             kv_exec_counter: Default::default(),
             cop_stats: Arc::new(
                 tidb_executor::statement_cop_stats::StatementCopStats::with_ru_details(Arc::clone(
@@ -784,8 +783,10 @@ impl Session {
                     observation.original_table_hints =
                         tidb_hint::extract_table_hints_from_stmt_node(&handled).0;
                 }
-                (observation.binding_sql, observation.binding_digest) =
-                    tidb_bindinfo::binding::normalize_stmt_for_binding(stmt, &self.vars.current_db);
+                observation.binding_source = Some(Arc::new(BindingSource {
+                    stmt: stmt.clone(),
+                    current_db: self.vars.current_db.clone(),
+                }));
             }
             observation.prepared |= prepared;
             observation.plan_replayer_continues_capture_valid = observation.prepared

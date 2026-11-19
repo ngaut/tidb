@@ -3515,11 +3515,20 @@ pub fn process_plan_info_with_brief(
         }),
         normalized_plan,
         plan_digest,
-        plan_hints: tidb_planner::plan_hint::gen_hints_from_physical_plan(
-            physical,
-            &CatalogHints(catalog),
-            &statement_context.block_as_names(),
-        ),
+        // Go `getEncodedPlan` generates them only when the summary samples
+        // the plan.
+        plan_hints: Some({
+            let catalog = catalog.clone();
+            let plan = std::sync::Arc::clone(&stored);
+            let block_as_names = statement_context.block_as_names();
+            tidb_stmtctx::PlanHintsSource(std::sync::Arc::new(move || {
+                tidb_planner::plan_hint::gen_hints_from_physical_plan(
+                    &plan,
+                    &CatalogHints(&catalog),
+                    &block_as_names,
+                )
+            }))
+        }),
         is_fast_plan: matches!(
             fast_candidate,
             PhysicalPlan::PointGet(_) | PhysicalPlan::TableDual(_)

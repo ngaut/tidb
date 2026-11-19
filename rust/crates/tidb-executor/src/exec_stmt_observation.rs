@@ -48,9 +48,9 @@ pub struct StatementObservation {
     /// Go `StmtCtx.OriginalTableHints`: the table hints the statement wrote,
     /// after the query-block handler took the view hints out.
     pub original_table_hints: Vec<tidb_ast::Hint>,
-    /// Go `ExecStmt.GetBindingSQLAndDigest`.
-    pub binding_sql: String,
-    pub binding_digest: String,
+    /// What Go `ExecStmt.GetBindingSQLAndDigest` normalizes, kept for the
+    /// statement summary to normalize only when it records the statement.
+    pub binding_source: Option<Arc<BindingSource>>,
     pub phases: Arc<Mutex<StatementPhases>>,
     pub kv_exec_counter: tidb_topsql_stmtstats::KvExecCounterHandle,
     /// Go `StmtCtx.ExecDetails`: what the statement's coprocessor responses
@@ -111,6 +111,13 @@ impl StatementPhases {
     }
 }
 
+/// Go `ExecStmt.StmtNode` and `SessionVars.CurrentDB`, the inputs of
+/// `GetBindingSQLAndDigest`.
+pub struct BindingSource {
+    pub stmt: tidb_ast::Stmt,
+    pub current_db: String,
+}
+
 struct LazyStatement {
     sql: String,
     /// The plan's encodings, rendered here once, when the summary first asks
@@ -120,14 +127,34 @@ struct LazyStatement {
     /// `tidb_generate_binary_plan` as the statement finished.
     binary_plan_enabled: bool,
     plan_digest: String,
-    plan_hint: String,
-    binding_sql: String,
-    binding_digest: String,
+    /// Go `getEncodedPlan`'s hints: the ones that reproduce the plan, then
+    /// the statement's own hints of the kinds Go keeps, rendered once when the
+    /// summary first asks. A routed or internal statement has neither.
+    plan_hints: Option<tidb_stmtctx::PlanHintsSource>,
+    statement_hints: Vec<tidb_ast::Hint>,
+    plan_hint: std::sync::OnceLock<String>,
+    binding_source: Option<Arc<BindingSource>>,
+    /// The binding SQL and digest, normalized once, when the summary first
+    /// asks (Go `LazyInfo.GetBindingSQLAndDigest`, which only a new summary
+    /// record calls).
+    binding: std::sync::OnceLock<(String, String)>,
 }
 impl LazyStatement {
     fn rendered(&self) -> &(String, String) {
         self.rendered_plan
             .get_or_init(|| self.plan_source.as_ref().map(crate::PlanSource::render).unwrap_or_default())
+    }
+
+    fn plan_hint(&self) -> &str {
+        self.plan_hint.get_or_init(|| {
+            let mut hints = self
+                .plan_hints
+                .as_ref()
+                .map(tidb_stmtctx::PlanHintsSource::generate)
+                .unwrap_or_default();
+            hints.extend(self.statement_hints.iter().cloned());
+            tidb_hint::restore_optimizer_hints(&hints)
+        })
     }
 }
 impl StmtExecLazyInfo for LazyStatement {
@@ -135,7 +162,7 @@ impl StmtExecLazyInfo for LazyStatement {
         self.sql.clone()
     }
     fn encoded_plan(&self) -> Result<(String, String), EncodedPlanError> {
-        Ok((self.rendered().0.clone(), self.plan_hint.clone()))
+        Ok((self.rendered().0.clone(), self.plan_hint().to_owned()))
     }
     fn binary_plan(&self) -> String {
         if !self.binary_plan_enabled {
@@ -147,7 +174,13 @@ impl StmtExecLazyInfo for LazyStatement {
         self.plan_digest.clone()
     }
     fn binding_sql_and_digest(&self) -> (String, String) {
-        (self.binding_sql.clone(), self.binding_digest.clone())
+        self.binding
+            .get_or_init(|| {
+                self.binding_source.as_ref().map_or_else(Default::default, |source| {
+                    tidb_bindinfo::binding::normalize_stmt_for_binding(&source.stmt, &source.current_db)
+                })
+            })
+            .clone()
     }
 }
 
@@ -768,36 +801,39 @@ pub trait ExecStmtObservation: crate::sessionctx::SessionContext {
             },
             plan_cache_unqualified: self.plan_cache_unqualified(),
             lazy_info: Arc::new(LazyStatement {
-                plan_hint: if observation.routed || internal {
-                    String::new()
+                plan_hints: if observation.routed || internal {
+                    None
+                } else {
+                    plan.plan_hints
+                },
+                statement_hints: if observation.routed || internal {
+                    Vec::new()
                 } else {
                     // Go `getEncodedPlan`: the hints reproducing the plan,
                     // then the statement's own hints of these kinds.
-                    let mut hints = plan.plan_hints.clone();
-                    hints.extend(
-                        observation
-                            .original_table_hints
-                            .iter()
-                            .filter(|hint| {
-                                matches!(
-                                    hint.lower_name().as_str(),
-                                    "memory_quota"
-                                        | "use_toja"
-                                        | "no_index_merge"
-                                        | "max_execution_time"
-                                        | "ignore_index"
-                                        | "read_from_storage"
-                                        | "merge"
-                                        | "semi_join_rewrite"
-                                        | "no_decorrelate"
-                                )
-                            })
-                            .cloned(),
-                    );
-                    tidb_hint::restore_optimizer_hints(&hints)
+                    observation
+                        .original_table_hints
+                        .iter()
+                        .filter(|hint| {
+                            matches!(
+                                hint.lower_name().as_str(),
+                                "memory_quota"
+                                    | "use_toja"
+                                    | "no_index_merge"
+                                    | "max_execution_time"
+                                    | "ignore_index"
+                                    | "read_from_storage"
+                                    | "merge"
+                                    | "semi_join_rewrite"
+                                    | "no_decorrelate"
+                            )
+                        })
+                        .cloned()
+                        .collect()
                 },
-                binding_sql: observation.binding_sql.clone(),
-                binding_digest: observation.binding_digest.clone(),
+                plan_hint: std::sync::OnceLock::new(),
+                binding_source: observation.binding_source.clone(),
+                binding: std::sync::OnceLock::new(),
                 sql: summary_sql,
                 plan_digest: if observation.routed {
                     String::new()

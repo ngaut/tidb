@@ -96,6 +96,31 @@ impl PartialEq for BriefPlanSource {
     }
 }
 
+/// Go `getEncodedPlan`'s `GenHintsFromFlatPlan`: the hints that reproduce the
+/// published plan, generated only when the statement summary samples it.
+#[derive(Clone)]
+pub struct PlanHintsSource(pub Arc<dyn Fn() -> Vec<tidb_ast::Hint> + Send + Sync>);
+
+impl PlanHintsSource {
+    /// The hints that reproduce the plan.
+    #[must_use]
+    pub fn generate(&self) -> Vec<tidb_ast::Hint> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for PlanHintsSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PlanHintsSource")
+    }
+}
+
+impl PartialEq for PlanHintsSource {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// The plan facts a statement publishes for its process-list row and its
 /// statement-summary entry.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -123,7 +148,7 @@ pub struct ProcessPlanInfo {
     pub plan_digest: String,
     /// Go `GenHintsFromFlatPlan` over the retained plan: the hints that
     /// reproduce it, for the statement summary's `PLAN_HINT`.
-    pub plan_hints: Vec<tidb_ast::Hint>,
+    pub plan_hints: Option<PlanHintsSource>,
     /// Go executor `IsFastPlan` (one optional projection over PointGet/TableDual).
     pub is_fast_plan: bool,
     /// Go `StmtCtx.TableIDs`.

@@ -50,6 +50,12 @@ impl Store {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
+thread_local! {
+    /// How many times this thread generated the hints that reproduce a plan.
+    pub static GEN_HINTS_FROM_PHYSICAL_PLAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Go `GenHintsFromFlatPlan`.
 ///
 /// `block_as_names` is Go's `PlannerSelectBlockAsName`: the alias a derived
@@ -60,6 +66,8 @@ pub fn gen_hints_from_physical_plan(
     catalog: &dyn HintCatalog,
     block_as_names: &[(String, String)],
 ) -> Vec<Hint> {
+    #[cfg(any(test, feature = "test-util"))]
+    GEN_HINTS_FROM_PHYSICAL_PLAN_CALLS.with(|count| count.set(count.get() + 1));
     let (select_plan, node_type) = match plan {
         PhysicalPlan::Dml(dml) => {
             let node_type = match dml.go_operator.as_str() {

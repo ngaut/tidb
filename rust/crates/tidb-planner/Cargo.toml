@@ -96,3 +96,7 @@ tidb-vardef = { path = "../tidb-vardef" }
 [[test]]
 name = "all"
 path = "tests/all.rs"
+
+[features]
+# Test-only instrumentation: `plan_hint::GEN_HINTS_FROM_PHYSICAL_PLAN_CALLS`.
+test-util = []
