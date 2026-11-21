@@ -54,6 +54,7 @@ tidb-parser = { path = "../tidb-parser" }
 tidb-sessionstates = { path = "../tidb-sessionstates" }
 tidb-vardef = { path = "../tidb-vardef" }
 tikv-client.workspace = true
+foldhash.workspace = true
 chrono = { workspace = true }
 serde_json.workspace = true
 tidb-txnkv = { path = "../tidb-txnkv" }
