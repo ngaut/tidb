@@ -663,9 +663,34 @@ impl Session {
         if self.routed_statement_observation_depth != 0 {
             return;
         }
+        let (normalized, digest) = normalize_statement_digest(&self.statement_text(sql));
+        self.install_initialized_exec_details(sql, normalized, digest);
+    }
+
+    /// [`Self::context_with_initialized_exec_details`] for an EXECUTE of a
+    /// prepared statement: Go's `ResetContextOfStmt` installs the statement's
+    /// PREPARE-time `NormalizedSQL`/`SQLDigest` (`InitSQLDigest`) instead of
+    /// normalizing its text again.
+    pub fn context_with_initialized_prepared_exec_details(
+        &mut self,
+        sql: &str,
+        normalized: &str,
+        digest: &tidb_parser::Digest,
+    ) {
+        if self.routed_statement_observation_depth != 0 {
+            return;
+        }
+        self.install_initialized_exec_details(sql, normalized.to_owned(), digest.clone());
+    }
+
+    fn install_initialized_exec_details(
+        &mut self,
+        sql: &str,
+        normalized: String,
+        digest: tidb_parser::Digest,
+    ) {
         let ru_details = Arc::new(tikv_client::RuDetails::new());
         let exec_details = Arc::default();
-        let (normalized, digest) = normalize_statement_digest(&self.statement_text(sql));
         self.publish_kv_context(&ru_details, &exec_details, &normalized, &digest, None);
         self.pending_statement_exec_details = Some(PendingStatementExecDetails {
             sql: sql.to_owned(),

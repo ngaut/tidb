@@ -297,11 +297,12 @@ pub struct CursorMaterializationAuthority {
 #[derive(Clone, Debug)]
 pub struct PreparedGeneral {
     sql: String,
-    /// The statement's SQL digest, computed once at PREPARE. Go keeps
-    /// `NormalizedSQL`/`SQLDigest` on the `PlanCacheStmt` and every EXECUTE
-    /// installs them with `InitSQLDigest` (`pkg/executor/select.go:1058`)
-    /// instead of normalizing the text again.
-    digest: String,
+    /// The statement's normalized SQL and digest, computed once at PREPARE.
+    /// Go keeps `NormalizedSQL`/`SQLDigest` on the `PlanCacheStmt` and every
+    /// EXECUTE installs them with `InitSQLDigest`
+    /// (`pkg/executor/select.go:1058`) instead of normalizing the text again.
+    normalized: String,
+    digest: tidb_parser::Digest,
     parameter_count: usize,
     result_fields: Vec<ResultFieldMetadata>,
     /// The session owns the parse, cache candidate and execution readiness.
@@ -312,9 +313,10 @@ impl PreparedGeneral {
     /// Creates one from its statement text and the metadata a PREPARE reports.
     #[must_use]
     pub fn new(sql: String, parameter_count: usize, result_fields: Vec<ResultFieldMetadata>) -> Self {
-        let digest = tidb_parser::normalize_digest(&sql).1.to_string();
+        let (normalized, digest) = tidb_parser::normalize_digest(&sql);
         Self {
             sql,
+            normalized,
             digest,
             parameter_count,
             result_fields,
@@ -323,16 +325,20 @@ impl PreparedGeneral {
     }
 
     /// Retains the session's prepared definition and its cache lifecycle.
+    /// `statement_text` is Go's `prepared.Stmt.Text()` (the session's
+    /// [`crate::Session::statement_text`] of the SQL at PREPARE), which Go's
+    /// PREPARE normalizes once (`GeneratePlanCacheStmtWithAST`).
     #[must_use]
     pub fn with_prepared_ast(
         prepared_ast: crate::PreparedAst,
+        statement_text: &str,
         result_fields: Vec<ResultFieldMetadata>,
     ) -> Self {
+        let (normalized, digest) = tidb_parser::normalize_digest(statement_text);
         Self {
             sql: prepared_ast.sql().to_owned(),
-            digest: tidb_parser::normalize_digest(prepared_ast.sql())
-                .1
-                .to_string(),
+            normalized,
+            digest,
             parameter_count: prepared_ast.parameter_count(),
             result_fields,
             prepared_ast: Some(prepared_ast),
@@ -356,7 +362,14 @@ impl PreparedGeneral {
     /// The digest of [`Self::sql`], fixed at PREPARE.
     #[must_use]
     pub fn digest(&self) -> &str {
-        &self.digest
+        self.digest.as_str()
+    }
+
+    /// The normalized [`Self::sql`] and its digest, fixed at PREPARE (Go
+    /// `PlanCacheStmt.NormalizedSQL` / `SQLDigest`).
+    #[must_use]
+    pub fn normalized_digest(&self) -> (&str, &tidb_parser::Digest) {
+        (&self.normalized, &self.digest)
     }
 
     /// Positional markers the execute packet must supply.

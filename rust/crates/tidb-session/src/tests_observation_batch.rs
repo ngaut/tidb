@@ -231,6 +231,35 @@ fn observation_batch_prepared_execution_records_original_sql() {
     assert_eq!(summary_execution_count(sql), before + 1);
 }
 
+/// A binary EXECUTE installs the normalized SQL and digest its PREPARE
+/// computed (Go `InitSQLDigest(prepareStmt.NormalizedSQL,
+/// prepareStmt.SQLDigest)`) instead of normalizing the text every time.
+#[test]
+fn observation_batch_binary_execute_reuses_the_prepare_digest() {
+    let mut session = Session::new();
+    session.set_user("root@%".into(), "root@localhost".into());
+    session
+        .run("CREATE TABLE prepare_digest (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    session
+        .run("INSERT INTO prepare_digest VALUES (1, 10)")
+        .unwrap();
+    let sql = "SELECT v FROM prepare_digest WHERE id = ?";
+    let prepared = crate::tests_support::prepare_binary(&mut session, sql);
+    let before = summary_execution_count(sql);
+    tidb_sessmgr::STATEMENT_DIGEST_CALLS.with(|count| count.set(0));
+    for _ in 0..3 {
+        crate::tests_support::execute_binary(&mut session, &prepared, &[1]);
+    }
+    assert_eq!(
+        tidb_sessmgr::STATEMENT_DIGEST_CALLS.with(|count| count.get()),
+        0,
+        "no execution normalizes the prepared text again"
+    );
+    // The executions still record under the statement's digest.
+    assert_eq!(summary_execution_count(sql), before + 3);
+}
+
 #[test]
 fn observation_batch_routed_completion_waits_for_durable_outcome() {
     let mut session = Session::new();
