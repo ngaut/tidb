@@ -79,9 +79,17 @@ pub fn restore_without_db(stmt: &Stmt) -> String {
     tidb_parser::util_parser::restore_without_db(stmt)
 }
 
+#[cfg(any(test, feature = "test-util"))]
+thread_local! {
+    /// How many times this thread normalized a statement for its binding.
+    pub static NORMALIZE_STMT_FOR_BINDING_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Go `bindinfo.NormalizeStmtForBinding`, the with-DB half: the normalized
 /// text and its digest.
 pub fn normalize_stmt_for_binding(stmt: &Stmt, default_db: &str) -> (String, String) {
+    #[cfg(any(test, feature = "test-util"))]
+    NORMALIZE_STMT_FOR_BINDING_CALLS.with(|count| count.set(count.get() + 1));
     let (normalized, digest) =
         tidb_parser::normalize_digest_for_binding(&restore_with_default_db(stmt, default_db));
     (normalized, digest.as_str().to_owned())
