@@ -1367,6 +1367,7 @@ mod nontransactional;
 pub use nontransactional::{NonTransactionalDml, NonTransactionalInput, NonTransactionalStep};
 mod noop;
 mod observation;
+pub use observation::ObservedNode;
 use tidb_executor::compiler::prepared_ast;
 use tidb_executor::compiler::prepared as prepared_statements;
 pub mod session_states;
@@ -3211,10 +3212,10 @@ impl Session {
     /// cache, and the execution that follows opens no second boundary. A
     /// boundary the sandbox refuses stays closed, and the statement's
     /// lifecycle reports the refusal.
-    pub fn reset_context_of_prepared_stmt(&mut self, sql: &str, stmt: &Stmt) {
+    pub fn reset_context_of_prepared_stmt(&mut self, sql: &str, node: crate::observation::ObservedNode<'_>) {
         self.close_context_of_prepared_stmt();
         if self.begin_statement_execution(sql).is_ok() {
-            self.begin_prepared_statement_boundary(stmt, None);
+            self.begin_prepared_statement_boundary(node, None);
             self.context_of_stmt_reset = true;
             self.statement_boundary_open = true;
         }
@@ -3696,7 +3697,11 @@ mod session_source_tests {
             .unwrap();
         session.bind_committed_snapshot().unwrap();
         let opened = session
-            .open_prepared_point_get(execution, prepared.statement(), sql)
+            .open_prepared_point_get(
+                execution,
+                crate::observation::ObservedNode::Shared(prepared.shared_statement()),
+                sql,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(

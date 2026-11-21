@@ -253,6 +253,7 @@ tidb-ddl = { path = "../tidb-ddl", features = ["failpoints"] }
 tidb-infoschema-issyncer = { path = "../tidb-infoschema-issyncer", features = ["failpoints"] }
 tidb-expensivequery = { path = "../tidb-expensivequery" }
 tidb-executor = { path = "../tidb-executor", features = ["test-util"] }
+tidb-bindinfo = { path = "../tidb-bindinfo", features = ["test-util"] }
 tidb-store-driver-txn = { path = "../tidb-store-driver-txn", features = ["test-util"] }
 # The `show-agg-mode` failpoint Go's tiflashtest enables.
 tidb-expression-aggregation = { path = "../tidb-expression-aggregation" }

@@ -148,6 +148,13 @@ impl PreparedAst {
         &self.statement
     }
 
+    /// [`Self::statement`] as the node every execution shares, for a consumer
+    /// that keeps it past the statement (Go hands out `PreparedAst.Stmt`).
+    #[must_use]
+    pub fn shared_statement(&self) -> &Arc<Stmt> {
+        &self.statement
+    }
+
     /// The immutable fast point-read plan compiled while the statement was
     /// prepared, when its shape is safe to reuse for every EXECUTE.
     #[must_use]

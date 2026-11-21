@@ -800,7 +800,11 @@ fn tidb_index_usage_sizes_a_prepared_point_read_without_statistics() {
             .expect("the point plan binds its handle");
         session.bind_committed_snapshot().unwrap();
         let opened = session
-            .open_prepared_point_get(execution, prepared.statement(), sql)
+            .open_prepared_point_get(
+                execution,
+                crate::observation::ObservedNode::Shared(prepared.shared_statement()),
+                sql,
+            )
             .unwrap()
             .unwrap();
         let output = crate::tests_support::collect_record_set(opened.attach(&mut session));

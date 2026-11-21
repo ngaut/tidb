@@ -1501,6 +1501,46 @@ fn held_prepared_execution_reuses_published_digest() {
     );
 }
 
+/// Go's `ExecStmt.StmtNode` for a prepared statement is the
+/// `PreparedAst.Stmt` pointer: a prepared point read's observation keeps the
+/// prepared node itself for the summary's lazy binding SQL, not a copy.
+#[test]
+fn prepared_point_get_observation_shares_the_prepared_statement_node() {
+    let mut session = Session::new();
+    session
+        .run("CREATE TABLE shared_node (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    session
+        .run("INSERT INTO shared_node VALUES (1, 10)")
+        .unwrap();
+    let sql = "SELECT v FROM shared_node WHERE id=?";
+    let prepared = session.prepare_ast(sql).unwrap();
+    let plan = prepared
+        .point_get_plan()
+        .expect("a primary-key read retains its point plan");
+    let execution = session
+        .bind_cached_prepared_point_get(&plan, &[Datum::Int(1)])
+        .unwrap();
+    session.bind_committed_snapshot().unwrap();
+    let opened = session
+        .open_prepared_point_get(
+            execution,
+            crate::ObservedNode::Shared(prepared.shared_statement()),
+            sql,
+        )
+        .unwrap()
+        .unwrap();
+    let source = session
+        .statement_observation
+        .as_ref()
+        .and_then(|observation| observation.binding_source.clone())
+        .expect("the summary keeps the statement's binding source");
+    let kept: &tidb_ast::Stmt = &source.stmt;
+    assert!(std::ptr::eq(kept, prepared.statement()));
+    drop(source);
+    crate::tests_support::collect_record_set(opened.attach(&mut session));
+}
+
 #[test]
 fn nonclustered_primary_retains_prepared_point_plan() {
     let mut session = Session::new();
@@ -1523,7 +1563,11 @@ fn nonclustered_primary_retains_prepared_point_plan() {
             .expect("nonclustered point plan binds its unique index key");
         session.bind_committed_snapshot().unwrap();
         let opened = session
-            .open_prepared_point_get(execution, prepared.statement(), sql)
+            .open_prepared_point_get(
+                execution,
+                crate::observation::ObservedNode::Shared(prepared.shared_statement()),
+                sql,
+            )
             .unwrap()
             .unwrap();
         let output = crate::tests_support::collect_record_set(opened.attach(&mut session));
@@ -1575,7 +1619,11 @@ fn nonclustered_point_plan_requires_complete_visible_unique_key() {
             .unwrap();
         session.bind_committed_snapshot().unwrap();
         let opened = session
-            .open_prepared_point_get(execution, prepared.statement(), sql)
+            .open_prepared_point_get(
+                execution,
+                crate::observation::ObservedNode::Shared(prepared.shared_statement()),
+                sql,
+            )
             .unwrap()
             .unwrap();
         let output = crate::tests_support::collect_record_set(opened.attach(&mut session));
@@ -2852,7 +2900,11 @@ fn result_output_names_carry_each_column_origin() {
         .unwrap();
     session.bind_committed_snapshot().unwrap();
     let opened = session
-        .open_prepared_point_get(execution, prepared.statement(), sql)
+        .open_prepared_point_get(
+            execution,
+            crate::observation::ObservedNode::Shared(prepared.shared_statement()),
+            sql,
+        )
         .unwrap()
         .unwrap();
     let crate::StatementExecution::Rows(record_set) = opened.attach(&mut session) else {

@@ -20,7 +20,7 @@
 //! not certify those execution-detail contracts.
 use crate::*;
 use tidb_executor::exec_stmt_observation::{
-    ExecStmtObservation as _, StatementObservation, StatementPhases,
+    BindingSource, ExecStmtObservation as _, StatementObservation, StatementPhases,
 };
 use tidb_topsql_stmtstats::{ExecFinishInfo, StatementObserver};
 
@@ -88,6 +88,36 @@ pub(crate) fn observe_statement_tables_in<'a>(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .tables = tables;
+}
+
+/// The statement node an observation keeps for the statement summary's lazy
+/// binding SQL (Go `ExecStmt.StmtNode`).
+#[derive(Clone, Copy)]
+pub enum ObservedNode<'a> {
+    /// A prepared statement's node, which the observation shares.
+    Shared(&'a Arc<Stmt>),
+    /// A node the observation copies if it keeps it.
+    Borrowed(&'a Stmt),
+}
+
+impl<'a> ObservedNode<'a> {
+    /// The node itself.
+    #[must_use]
+    pub fn stmt(self) -> &'a Stmt {
+        match self {
+            Self::Shared(stmt) => stmt,
+            Self::Borrowed(stmt) => stmt,
+        }
+    }
+
+    /// The node to keep: the shared one itself, or a copy of a borrowed one.
+    #[must_use]
+    pub fn to_shared(self) -> Arc<Stmt> {
+        match self {
+            Self::Shared(stmt) => Arc::clone(stmt),
+            Self::Borrowed(stmt) => Arc::new(stmt.clone()),
+        }
+    }
 }
 
 impl Session {
@@ -466,8 +496,7 @@ impl Session {
             plan_replayer_continues_capture_valid: false,
             routed: false,
             original_table_hints: Vec::new(),
-            binding_sql: String::new(),
-            binding_digest: String::new(),
+            binding_source: None,
             kv_exec_counter: Default::default(),
             cop_stats: Arc::new(
                 tidb_executor::statement_cop_stats::StatementCopStats::with_ru_details(Arc::clone(
@@ -732,7 +761,8 @@ impl Session {
         self.attach_and_register_top_sql_info();
     }
 
-    pub(crate) fn observe_statement_node(&mut self, stmt: &Stmt, prepared: bool) {
+    pub(crate) fn observe_statement_node(&mut self, node: ObservedNode<'_>, prepared: bool) {
+        let stmt = node.stmt();
         self.set_request_source(stmt);
         if self.routed_statement_observation_depth != 0
             && self
@@ -784,8 +814,10 @@ impl Session {
                     observation.original_table_hints =
                         tidb_hint::extract_table_hints_from_stmt_node(&handled).0;
                 }
-                (observation.binding_sql, observation.binding_digest) =
-                    tidb_bindinfo::binding::normalize_stmt_for_binding(stmt, &self.vars.current_db);
+                observation.binding_source = Some(Arc::new(BindingSource {
+                    stmt: node.to_shared(),
+                    current_db: self.vars.current_db.clone(),
+                }));
             }
             observation.prepared |= prepared;
             observation.plan_replayer_continues_capture_valid = observation.prepared
@@ -857,7 +889,7 @@ impl Session {
     /// Starts observation when durable completion belongs outside Session.
     pub fn begin_routed_statement_observation(&mut self, sql: &str, stmt: &Stmt) {
         self.begin_statement_observation(sql);
-        self.observe_statement_node(stmt, self.binary_prepared_execution);
+        self.observe_statement_node(ObservedNode::Borrowed(stmt), self.binary_prepared_execution);
         // The outer routed execution owns one LazyTxn.onStmtStart, including
         // transaction control and SET. Its inner executor only republishes.
         if self.routed_statement_observation_depth == 0 {

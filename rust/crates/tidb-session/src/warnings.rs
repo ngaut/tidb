@@ -265,7 +265,7 @@ impl Session {
         };
         self.record_observation_parse(sql, parse_started.elapsed());
         self.record_ruv2_session_parse(sql);
-        self.observe_statement_node(&stmt, false);
+        self.observe_statement_node(crate::observation::ObservedNode::Borrowed(&stmt), false);
         self.reset_text_prepared_params(&stmt);
         self.install_statement_warning_state(&stmt, previous);
         // go's recoverable parser diagnostics land as warning rows AFTER the
@@ -372,7 +372,7 @@ impl Session {
     /// the front end already parsed: Go parses a command once
     /// (`session.ParseSQL`) and every later step reads that node.
     pub(crate) fn begin_text_statement_boundary(&mut self, stmt: &Stmt) {
-        self.observe_statement_node(stmt, false);
+        self.observe_statement_node(crate::observation::ObservedNode::Borrowed(stmt), false);
         // The front end's own parse already opened the boundary
         // (`parse_at_statement_boundary`); a second open would take the
         // (already-empty) buffer and reset the counts the first boundary
@@ -400,10 +400,11 @@ impl Session {
     /// Starts a statement boundary for an AST retained by PREPARE.
     pub(crate) fn begin_prepared_statement_boundary(
         &mut self,
-        stmt: &Stmt,
+        node: crate::observation::ObservedNode<'_>,
         parameters: Option<std::sync::Arc<[Datum]>>,
     ) {
-        self.observe_statement_node(stmt, true);
+        let stmt = node.stmt();
+        self.observe_statement_node(node, true);
         self.prepared_params = parameters;
         // Go's `ResetContextOfStmt` runs once per statement: a binary EXECUTE
         // opened this boundary before its plan-cache lookup.
