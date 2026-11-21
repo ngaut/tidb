@@ -211,7 +211,8 @@ pub struct IndexLookUpExecutor {
     /// Go `resultCh`, `resultCurr` and its cursor.
     result_ch: Option<Receiver<TaskDone>>,
     result_curr: Option<(TaskRows, usize)>,
-    workers: Vec<std::thread::JoinHandle<()>>,
+    /// Go's index and table worker goroutines, joined by their ends.
+    workers: Vec<Receiver<()>>,
     worker_started: bool,
     /// Go `dummy`: not a real reader, only the KV ranges a union scan reads
     /// the cached or temporary table's rows over (`setDummy`).
@@ -740,7 +741,7 @@ impl IndexLookUpExecutor {
             let table_request = Arc::clone(&table_request);
             // Go's table workers run under `e.workerCtx`, the context of the
             // `Next` that started them.
-            self.workers.push(std::thread::spawn(tidb_executor_internal_exec::ruv2::inherit_goroutine(move || loop {
+            let worker = tidb_executor_internal_exec::ruv2::inherit_goroutine(move || loop {
                 let next = work_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
                 let Ok(task) = next else {
                     return;
@@ -756,7 +757,8 @@ impl IndexLookUpExecutor {
                     stats.table_task_recorder().record_table_task(started, rows.order.len());
                 }
                 let _ = done.send(rows);
-            })));
+            });
+            self.workers.push(tidb_goruntime::worker_pool::spawn_lane("idxlookup-table", worker));
         }
         // Go `startIndexWorker`: the index worker's tracker, which its
         // requests charge (`SetMemTracker(tracker)`).
@@ -787,9 +789,10 @@ impl IndexLookUpExecutor {
             index_look_up_push_down: self.index_look_up_push_down,
             tbl_scan_idx_for_rewrite_partition_id,
         };
-        self.workers.push(std::thread::spawn(tidb_executor_internal_exec::ruv2::inherit_goroutine(move || {
+        let worker = tidb_executor_internal_exec::ruv2::inherit_goroutine(move || {
             index_worker.run(&result_tx, &work_tx);
-        })));
+        });
+        self.workers.push(tidb_goruntime::worker_pool::spawn_lane("idxlookup-index", worker));
         self.worker_started = true;
         Ok(())
     }
@@ -1725,7 +1728,7 @@ impl Executor for IndexLookUpExecutor {
             while result_ch.recv().is_ok() {}
         }
         for worker in self.workers.drain(..) {
-            let _ = worker.join();
+            let _ = worker.recv();
         }
         self.worker_started = false;
         self.result_curr = None;

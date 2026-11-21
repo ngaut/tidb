@@ -81,13 +81,28 @@ pub fn goroutine_labels() -> Option<LabelSet> {
 
 /// Go's `go f()`: a goroutine starts with its creator's labels. Wraps `f`
 /// to run, on whatever thread runs it, with the calling thread's labels.
+/// The running thread gets its own labels back when `f` ends, so a reused
+/// thread does not carry them into its next task.
 pub fn inherit<R>(f: impl FnOnce() -> R) -> impl FnOnce() -> R {
     let labels = goroutine_labels();
     move || {
-        if labels.is_some() {
-            set_goroutine_labels(labels);
+        let running = goroutine_labels();
+        if labels.is_none() && running.is_none() {
+            return f();
         }
+        let _restore = RestoreGoroutineLabels(running);
+        set_goroutine_labels(labels);
         f()
+    }
+}
+
+/// Gives the thread back the labels it held before an [`inherit`]ed task,
+/// on return and on unwind.
+struct RestoreGoroutineLabels(Option<LabelSet>);
+
+impl Drop for RestoreGoroutineLabels {
+    fn drop(&mut self) {
+        set_goroutine_labels(self.0.take());
     }
 }
 
@@ -186,5 +201,30 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(polled, (Some(sql), true));
+    }
+
+    /// A thread that runs inherited work for several creators in turn (a
+    /// reused lane) carries each creator's labels only while its work runs,
+    /// an unlabeled creator's included.
+    #[test]
+    fn inherited_work_leaves_the_running_thread_its_own_labels() {
+        let sql = with_labels(None, &[("sql_digest", "aa".to_owned())]);
+        set_goroutine_labels(Some(Arc::clone(&sql)));
+        let labeled = inherit(goroutine_labels);
+        set_goroutine_labels(None);
+        let unlabeled = inherit(goroutine_labels);
+
+        let own = with_labels(None, &[("sql_digest", "bb".to_owned())]);
+        let seen = std::thread::spawn(move || {
+            set_goroutine_labels(Some(Arc::clone(&own)));
+            let seen_labeled = labeled();
+            let after_labeled = goroutine_labels();
+            let seen_unlabeled = unlabeled();
+            let after_unlabeled = goroutine_labels();
+            (seen_labeled, after_labeled == Some(Arc::clone(&own)), seen_unlabeled, after_unlabeled == Some(own))
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen, (Some(sql), true, None, true));
     }
 }
