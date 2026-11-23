@@ -47,6 +47,10 @@ tidb-goruntime = { path = "../tidb-goruntime" }
 chrono = { workspace = true }
 prometheus = { version = "0.14", default-features = false }
 
+[features]
+# Test-only instrumentation: `binding::NORMALIZE_STMT_FOR_BINDING_CALLS`.
+test-util = []
+
 [dev-dependencies]
 tidb-resolve = { path = "../tidb-resolve" }
 

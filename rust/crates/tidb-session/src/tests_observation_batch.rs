@@ -87,6 +87,41 @@ fn summary_execution_count(sql: &str) -> u64 {
         .sum()
 }
 
+/// Go normalizes a statement for its binding only when the statement summary
+/// creates the statement's record (`NewStmtRecord` calls
+/// `LazyInfo.GetBindingSQLAndDigest`), not on every execution.
+#[test]
+fn observation_batch_binding_sql_is_normalized_once_per_summary_record() {
+    let mut session = Session::new();
+    session.set_user("root@%".into(), "root@localhost".into());
+    session.run("CREATE TABLE binding_lazy (id INT PRIMARY KEY, v INT)").unwrap();
+    session.run("INSERT INTO binding_lazy VALUES (1, 10)").unwrap();
+    let sql = "SELECT v FROM binding_lazy WHERE id = ?";
+    let prepared = tests_support::prepare_binary(&mut session, sql);
+    tidb_bindinfo::binding::NORMALIZE_STMT_FOR_BINDING_CALLS.with(|count| count.set(0));
+    for _ in 0..3 {
+        tests_support::execute_binary(&mut session, &prepared, &[1]);
+    }
+    assert_eq!(
+        tidb_bindinfo::binding::NORMALIZE_STMT_FOR_BINDING_CALLS.with(|count| count.get()),
+        1,
+        "only the execution that created the summary record normalizes for the binding"
+    );
+    // The record still carries the statement's binding SQL and digest.
+    let (_, digest) = normalize_statement_digest(sql);
+    let stmt = tidb_parser::parse(sql).unwrap();
+    let expected = tidb_bindinfo::binding::normalize_stmt_for_binding(&stmt, &session.vars.current_db);
+    let recorded: Vec<_> = tidb_stmtsummary::statement_summary::STMT_SUMMARY_BY_DIGEST_MAP
+        .summary_map_values()
+        .iter()
+        .filter_map(|record| {
+            let record = record.lock().unwrap();
+            (record.digest == digest.as_str()).then(|| (record.binding_sql.clone(), record.binding_digest.clone()))
+        })
+        .collect();
+    assert_eq!(recorded, vec![expected]);
+}
+
 #[test]
 fn observation_batch_streaming_result_publishes_once_at_close() {
     let mut session = Session::new();

@@ -944,7 +944,10 @@ impl Session {
         privilege_requests: &[tidb_executor::table_privilege::TablePrivilegeRequest],
     ) -> Result<PendingExecution, DriverError> {
         let parameters = tidb_executor::bound_parameter_values(&mut stmt)?;
-        self.begin_prepared_statement_boundary(&stmt, parameters);
+        self.begin_prepared_statement_boundary(
+            crate::observation::ObservedNode::Borrowed(&stmt),
+            parameters,
+        );
         if let Some(reason) = self.pending_plan_cache_refusal.take() {
             self.warn_skip_prepared_plan_cache(reason);
         }
@@ -990,11 +993,12 @@ impl Session {
     pub fn open_prepared_point_get(
         &mut self,
         execution: tidb_executor::PreparedPointGetExecution,
-        statement: &Stmt,
+        node: crate::observation::ObservedNode<'_>,
         sql: &str,
     ) -> Result<Option<crate::OpenedStatement>, DriverError> {
         self.begin_statement_execution(sql)?;
-        self.observe_statement_node(statement, true);
+        self.observe_statement_node(node, true);
+        let statement = node.stmt();
         let result = (|| {
             self.set_statement_arbitration_key(sql);
             let cache_hit = execution.cache_hit();
@@ -1030,7 +1034,7 @@ impl Session {
             }
             let ctx = self.prepared_point_get_context();
             let stmt_ctx = self.statement_context_for_stmt(statement, false);
-            self.publish_fast_point_plan(&execution, statement, &stmt_ctx)?;
+            self.publish_fast_point_plan(&execution, node, &stmt_ctx)?;
             // Go `ExecStmt.Exec` observes the statement's execution begin for
             // every plan it runs, the point-get fast plan included.
             self.notify_before_executor_first_run();
@@ -1059,9 +1063,10 @@ impl Session {
     fn publish_fast_point_plan(
         &mut self,
         execution: &tidb_executor::PreparedPointGetExecution,
-        statement: &Stmt,
+        node: crate::observation::ObservedNode<'_>,
         stmt_ctx: &tidb_sessionctx::StmtContext,
     ) -> Result<(), DriverError> {
+        let statement = node.stmt();
         let current_database = self.vars.current_db.clone();
         let (normalized_plan, plan_digest) = {
             let catalog = self.lock_catalog()?;
@@ -1088,11 +1093,14 @@ impl Session {
         };
         let source = {
             let catalog = self.shared_catalog();
-            let statement = statement.clone();
+            // Shared, not copied: the source renders only when the summary
+            // samples the plan or the slow log writes it.
+            let statement = node.to_shared();
             let parameters = std::sync::Arc::clone(execution.parameters());
             let ctx = stmt_ctx.clone().without_process_plan_info();
             tidb_stmtctx::PlanSource(std::sync::Arc::new(move || {
-                let bound = tidb_executor::bind_statement(statement.clone(), &parameters).ok()?;
+                let bound =
+                    tidb_executor::bind_statement(Stmt::clone(&statement), &parameters).ok()?;
                 let catalog = catalog.lock().ok()?;
                 tidb_executor::fast_point_process_plan_info(
                     &bound,
@@ -1179,7 +1187,10 @@ impl Session {
         prepared: &crate::PreparedAst,
     ) -> Result<crate::OpenedStatement, DriverError> {
         self.begin_statement_execution(prepared.sql())?;
-        self.observe_statement_node(prepared.statement(), true);
+        self.observe_statement_node(
+            crate::observation::ObservedNode::Shared(prepared.shared_statement()),
+            true,
+        );
         let result = self.open_cached_prepared_select(execution, prepared)?;
         let result = match result {
             Some(result) => Ok(result),
@@ -1285,7 +1296,10 @@ impl Session {
         let mut used = false;
         let output = execution
             .with_plan(|statement, physical| {
-                self.begin_prepared_statement_boundary(statement, Some(execution.parameters()));
+                self.begin_prepared_statement_boundary(
+                    crate::observation::ObservedNode::Borrowed(statement),
+                    Some(execution.parameters()),
+                );
                 for warning in execution.take_planning_warnings() {
                     self.append_sql_warning(warning);
                 }
@@ -1319,7 +1333,10 @@ impl Session {
         parameters: &[tidb_datatype::Datum],
         failure: tidb_executor::compiler::GenerateNewPlanError,
     ) -> DriverError {
-        self.begin_prepared_statement_boundary(statement, Some(parameters.into()));
+        self.begin_prepared_statement_boundary(
+            crate::observation::ObservedNode::Borrowed(statement),
+            Some(parameters.into()),
+        );
         for warning in failure.warnings {
             self.append_sql_warning(warning);
         }
@@ -1392,7 +1409,10 @@ impl Session {
         let mut stats_update: Option<(String, String, i64)> = None;
         let output = execution
             .with_plan(|statement, physical| {
-                self.begin_prepared_statement_boundary(statement, Some(execution.parameters()));
+                self.begin_prepared_statement_boundary(
+                    crate::observation::ObservedNode::Borrowed(statement),
+                    Some(execution.parameters()),
+                );
                 for warning in execution.take_planning_warnings() {
                     self.append_sql_warning(warning);
                 }

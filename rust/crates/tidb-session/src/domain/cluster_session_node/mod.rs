@@ -2182,6 +2182,16 @@ impl<'s> ClusterServerSession<'s> {
             (Some(effective), binding_sql)
         });
         let effective = effective_template.as_deref();
+        // The prepared definition's own node, when no binding rewrote it:
+        // what the statement's observation and plan source share.
+        let effective_node = effective.map(|template| {
+            match (&effective_template, prepared_ast.as_ref()) {
+                (Some(std::borrow::Cow::Borrowed(_)), Some(prepared)) => {
+                    crate::ObservedNode::Shared(prepared.shared_statement())
+                }
+                _ => crate::ObservedNode::Borrowed(template),
+            }
+        });
         // Go `Compile` of the EXECUTE counts the prepared statement once its
         // `Optimize` planned it: a cached plan when it binds, a rebuilt one
         // when the compile boundary succeeds (counted once, however many
@@ -2230,7 +2240,10 @@ impl<'s> ClusterServerSession<'s> {
                     .begin_prepared_routed_statement_observation(&sql, template);
             }
             self.session.set_binary_prepared_execution(true);
-            self.session.reset_context_of_prepared_stmt(&sql, template);
+            self.session.reset_context_of_prepared_stmt(
+                &sql,
+                effective_node.expect("an effective template has its node"),
+            );
             self.session.set_binary_prepared_execution(false);
             // Go `GetPlanFromPlanCache` step 3, before the lookups below.
             self.session
@@ -2340,7 +2353,7 @@ impl<'s> ClusterServerSession<'s> {
                     if let Some(point) = &cached_point_get {
                         if let Some(opened) = session.open_prepared_point_get(
                             point.clone(),
-                            effective.expect("point plan retains its statement"),
+                            effective_node.expect("point plan retains its statement"),
                             &sql,
                         )? {
                             return Ok(opened);

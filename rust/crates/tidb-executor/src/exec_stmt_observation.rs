@@ -48,9 +48,9 @@ pub struct StatementObservation {
     /// Go `StmtCtx.OriginalTableHints`: the table hints the statement wrote,
     /// after the query-block handler took the view hints out.
     pub original_table_hints: Vec<tidb_ast::Hint>,
-    /// Go `ExecStmt.GetBindingSQLAndDigest`.
-    pub binding_sql: String,
-    pub binding_digest: String,
+    /// What Go `ExecStmt.GetBindingSQLAndDigest` normalizes, kept for the
+    /// statement summary to normalize only when it records the statement.
+    pub binding_source: Option<Arc<BindingSource>>,
     pub phases: Arc<Mutex<StatementPhases>>,
     pub kv_exec_counter: tidb_topsql_stmtstats::KvExecCounterHandle,
     /// Go `StmtCtx.ExecDetails`: what the statement's coprocessor responses
@@ -111,6 +111,13 @@ impl StatementPhases {
     }
 }
 
+/// Go `ExecStmt.StmtNode` and `SessionVars.CurrentDB`, the inputs of
+/// `GetBindingSQLAndDigest`.
+pub struct BindingSource {
+    pub stmt: Arc<tidb_ast::Stmt>,
+    pub current_db: String,
+}
+
 struct LazyStatement {
     sql: String,
     /// The plan's encodings, rendered here once, when the summary first asks
@@ -121,8 +128,11 @@ struct LazyStatement {
     binary_plan_enabled: bool,
     plan_digest: String,
     plan_hint: String,
-    binding_sql: String,
-    binding_digest: String,
+    binding_source: Option<Arc<BindingSource>>,
+    /// The binding SQL and digest, normalized once, when the summary first
+    /// asks (Go `LazyInfo.GetBindingSQLAndDigest`, which only a new summary
+    /// record calls).
+    binding: std::sync::OnceLock<(String, String)>,
 }
 impl LazyStatement {
     fn rendered(&self) -> &(String, String) {
@@ -147,7 +157,13 @@ impl StmtExecLazyInfo for LazyStatement {
         self.plan_digest.clone()
     }
     fn binding_sql_and_digest(&self) -> (String, String) {
-        (self.binding_sql.clone(), self.binding_digest.clone())
+        self.binding
+            .get_or_init(|| {
+                self.binding_source.as_ref().map_or_else(Default::default, |source| {
+                    tidb_bindinfo::binding::normalize_stmt_for_binding(&source.stmt, &source.current_db)
+                })
+            })
+            .clone()
     }
 }
 
@@ -783,8 +799,8 @@ pub trait ExecStmtObservation: crate::sessionctx::SessionContext {
                     );
                     tidb_hint::restore_optimizer_hints(&hints)
                 },
-                binding_sql: observation.binding_sql.clone(),
-                binding_digest: observation.binding_digest.clone(),
+                binding_source: observation.binding_source.clone(),
+                binding: std::sync::OnceLock::new(),
                 sql: summary_sql,
                 plan_digest: if observation.routed {
                     String::new()
