@@ -336,6 +336,19 @@ impl DdlSessionPool for NodeDdlSessionPool {
         self.sess_pool.get().cloned()
     }
 
+    /// The domain's store's; before the pool is bound, the API-V1 value.
+    fn keyspace_id(&self) -> u32 {
+        self.domain.get().and_then(Weak::upgrade).map_or(u32::MAX, |domain| domain.keyspace_id())
+    }
+
+    fn vardef(&self) -> Option<Arc<tidb_vardef::VardefSnapshot>> {
+        self.domain.get().and_then(Weak::upgrade).map(|domain| domain.vardef())
+    }
+
+    fn info_syncer(&self) -> Option<Arc<tidb_domain_infosync::info_syncer::InfoSyncer>> {
+        self.domain.get().and_then(Weak::upgrade).and_then(|domain| domain.info_syncer().cloned())
+    }
+
     fn ddl_event_ch(
         &self,
     ) -> Option<crossbeam_channel::Sender<tidb_ddl_notifier::SchemaChangeEvent>> {
@@ -587,6 +600,11 @@ impl DdlSessionPool for CrossKsDdlSessionPool {
         Some(Arc::clone(&self.sess_pool))
     }
 
+    /// The target keyspace's store's.
+    fn keyspace_id(&self) -> u32 {
+        self.resources.target.transactions.keyspace_id()
+    }
+
     /// A fresh statement of a default session.
     fn system_session(&self) -> Box<dyn tidb_ddl_build::session_context::DdlSessionContext> {
         Box::new(StmtContext::for_query())
@@ -677,6 +695,8 @@ impl ClusterTransactions for StepTransactions {
     fn kv_storage(&self) -> Arc<dyn tidb_txnkv::kv_storage::Storage> { self.inner.kv_storage() }
     /// Go `session.GetStore().GetCodec().GetKeyspaceID`.
     fn keyspace_id(&self) -> u32 { self.inner.keyspace_id() }
+    /// Go `session.GetStore().GetKeyspace`.
+    fn store_keyspace(&self) -> String { self.inner.store_keyspace() }
     fn fresh_timestamp(&self) -> Result<u64, String> {
         self.inner.fresh_timestamp()
     }

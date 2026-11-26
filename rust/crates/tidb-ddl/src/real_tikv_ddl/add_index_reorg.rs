@@ -426,7 +426,7 @@ where
     // before the reorganization's version, which is this transaction's
     // start timestamp.
     crate::delay_for_async_commit();
-    let result = reorg_transaction(opener, timeout, &crate::job_ctx::backfill_request_source(reorg.job_id), |meta, snapshot, buffer, start_ts| {
+    let result = reorg_transaction(opener, timeout, &crate::job_ctx::backfill_request_source(crate::job_ctx::JobKey::new(opener.keyspace_id(), reorg.job_id)), |meta, snapshot, buffer, start_ts| {
         let handle = if reorg.merging {
             // Go `checkIfTempIndexReorgWorkCanSkip`.
             let empty = match tidb_failpoint::eval("github.com/pingcap/tidb/pkg/ddl/skipReorgWorkForTempIndex") {
@@ -597,9 +597,11 @@ impl ReorgSlot {
                 let rows = Arc::new(AtomicI64::new(row_count));
                 let reorg_warnings = Arc::new(Mutex::new(Vec::new()));
                 let (thread_rows, thread_warnings) = (Arc::clone(&rows), Arc::clone(&reorg_warnings));
-                std::thread::spawn(tidb_cpuprofile::labels::inherit(move || {
+                // The reorganization reads the vardef values of the
+                // keyspace whose DDL step starts it (design §6.3).
+                std::thread::spawn(tidb_cpuprofile::labels::inherit(tidb_vardef::snapshot::inherit(move || {
                     let _ = done_tx.send(reorg_fn(thread_rows, thread_warnings));
-                }));
+                })));
                 ReorgCtx { step_cancelled: Arc::clone(step_cancelled), done, row_count: rows, warnings: reorg_warnings }
             });
             (ctx.done.clone(), Arc::clone(&ctx.row_count), Arc::clone(&ctx.warnings))
@@ -823,7 +825,7 @@ where
             items.push((None, current.start_key.clone(), current.end_key.clone()));
         } else {
             // Go `updateReorgInfo`: the next partition's range, persisted.
-            let range = reorg_transaction(opener, timeout, &crate::job_ctx::backfill_request_source(reorg.job_id), |_, snapshot, buffer, _| {
+            let range = reorg_transaction(opener, timeout, &crate::job_ctx::backfill_request_source(crate::job_ctx::JobKey::new(opener.keyspace_id(), reorg.job_id)), |_, snapshot, buffer, _| {
                 Ok((
                     table_range(backfiller, reorg, *physical_id, snapshot, buffer)?,
                     Vec::new(),
@@ -915,7 +917,9 @@ where
                     step_cancelled,
                 ),
             };
-            // Go `reorgInfo.UpdateConfigFromSysTbl`.
+            // Go `reorgInfo.UpdateConfigFromSysTbl`. The reorganization's
+            // thread entered its keyspace's values (`ReorgSlot::run`).
+            let vardef = tidb_vardef::snapshot::current();
             let reload_config = || {
                 latest_job(sess_pool, reorg.job_id)
                 .map(|job| {
@@ -926,8 +930,8 @@ where
                     job.filter(|job| job.state == JobState::RUNNING && job.is_alterable())
                         .map(|job| {
                             (
-                                crate::cluster_ddl::add_index::job_concurrency(&job),
-                                crate::cluster_ddl::add_index::job_batch_size(&job),
+                                crate::cluster_ddl::add_index::job_concurrency(&job, &vardef),
+                                crate::cluster_ddl::add_index::job_batch_size(&job, &vardef),
                             )
                         })
                 })
@@ -944,7 +948,7 @@ where
                 .flatten()
             };
             let range_end_key = |start: &[u8], end: &[u8]| {
-                reorg_transaction(opener, timeout, &crate::job_ctx::backfill_request_source(reorg.job_id), |_, snapshot, buffer, _| {
+                reorg_transaction(opener, timeout, &crate::job_ctx::backfill_request_source(crate::job_ctx::JobKey::new(opener.keyspace_id(), reorg.job_id)), |_, snapshot, buffer, _| {
                     let answer = backfiller.reorg_add_index(
                         reorg,
                         AddIndexReorgWork::RangeEndKey { start, end },
@@ -976,7 +980,7 @@ where
             let region_store = backfiller.region_store();
             let job_query = reorg.query.to_utf8_lossy_go();
             let exec = BackfillExecutor {
-                job_id: reorg.job_id,
+                job: crate::job_ctx::JobKey::new(opener.keyspace_id(), reorg.job_id),
                 job_query: &job_query,
                 region_store: region_store.as_deref(),
                 physical_id: current.physical_id,
@@ -1046,7 +1050,7 @@ where
     // Go's merge workers run each batch in `RunInNewTxn(..., false, ...)`
     // and retry a conflict themselves (`merge_temp_index_batch`); the other
     // backfill workers' transactions are retryable.
-    let source = crate::job_ctx::backfill_request_source(reorg.job_id);
+    let source = crate::job_ctx::backfill_request_source(crate::job_ctx::JobKey::new(opener.keyspace_id(), reorg.job_id));
     let step = run_in_new_txn(opener, timeout, &source, None, merge_index.is_none(), |_, snapshot, buffer, _| {
         if !reorg_runnable(step_cancelled, check_owner)? {
             return Ok((BatchStep::Interrupted, Vec::new()));

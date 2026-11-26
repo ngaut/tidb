@@ -85,7 +85,13 @@ pub fn gc_worker_deps<S: tidb_store_driver_txn::transaction::StoreClient + 'stat
                 .map_err(|error| error.to_string())
             }),
         )),
-        rules: Arc::new(NodeGcRules { pd_http_client }),
+        rules: Arc::new(NodeGcRules {
+            pd_http_client,
+            // Go `w.store.GetCodec()`: the keyspace the bundles are keyed by,
+            // as the DDL job's delivery keys them.
+            codec: tidb_domain_infosync::info_syncer::store_codec(tidb_keyspace::KeyspaceCodec::keyspace_id(store)),
+            info_syncer: factory.info_syncer().cloned(),
+        }),
         // Go `extworkload.GetManagerFromStore(w.store)`.
         gcv2: tidb_extworkload::get_manager_from_store()
             .map(|manager| Arc::new(ExtWorkloadGcV2(manager)) as Arc<dyn crate::seams::GcV2Manager>),
@@ -308,12 +314,20 @@ impl GcSession for NodeGcSession<'_> {
 }
 
 /// `infosync`'s placement and label rule calls, over the store's PD HTTP
-/// client.
+/// client and the domain's info syncer.
 struct NodeGcRules {
     pd_http_client: Option<tikv_client::pd_http::Client>,
+    /// The store's keyspace codec, `None` for an API-V1 store.
+    codec: Option<tikv_client::request::ApiV2Codec>,
+    /// The domain's PD managers (design §6.2); `None` reads the process's.
+    info_syncer: Option<Arc<tidb_domain_infosync::info_syncer::InfoSyncer>>,
 }
 
 impl NodeGcRules {
+    fn info_syncer(&self) -> Arc<tidb_domain_infosync::info_syncer::InfoSyncer> {
+        self.info_syncer.clone().unwrap_or_else(tidb_domain_infosync::info_syncer::get)
+    }
+
     fn pd_http_client(&self) -> GcResult<&tikv_client::pd_http::Client> {
         self.pd_http_client
             .as_ref()
@@ -321,39 +335,146 @@ impl NodeGcRules {
     }
 }
 
+/// A multi-keyspace node leaves PD's TiFlash rules alone when it GCs a
+/// tenant's dropped objects (design §10 phase 2): their IDs (`table-<id>-r`)
+/// carry no keyspace, so a tenant's cleanup could delete another keyspace's
+/// rules. Label rules and placement bundles carry their keyspace and are
+/// cleaned up.
+fn skip_pd_rule_cleanup() -> bool {
+    tidb_keyspace::is_multi_keyspace_mode()
+}
+
 impl GcRuleClient for NodeGcRules {
     /// Go `infosync.DeleteTiFlashPlacementRules`.
     fn delete_tiflash_placement_rules(&self, physical_table_ids: &[i64]) -> GcResult<()> {
-        tidb_domain_infosync::tiflash_manager::delete_tiflash_placement_rules(physical_table_ids)
+        if skip_pd_rule_cleanup() {
+            return Ok(());
+        }
+        let _info_syncer = tidb_domain_infosync::info_syncer::enter(self.info_syncer());
+        tidb_domain_infosync::info_syncer::delete_tiflash_placement_rules(physical_table_ids)
             .map_err(GcError::new)
     }
 
     fn put_rule_bundles(&self, bundles: Vec<tidb_placement::Bundle>) -> GcResult<()> {
         tidb_ddl::placement_delivery::put_rule_bundles(
             self.pd_http_client()?,
+            self.codec.as_ref(),
             &bundles,
             GC_RPC_TIMEOUT,
         )
         .map_err(gc_error)
     }
 
+    /// Go `infosync.GetLabelRules`, kept to the rules of the store's keyspace
+    /// (`filterRulesByKeyspace`): an ID a keyspace-less codec built (a job
+    /// an older node ran) names no keyspace, and another keyspace may hold
+    /// it, so the keyspace's GC leaves it alone.
     fn get_label_rules(
         &self,
         rule_ids: &[String],
     ) -> GcResult<HashMap<String, tidb_ddl_label::Rule>> {
-        tidb_domain_infosync::label_manager::label_rule_manager()
+        let info_syncer = self.info_syncer();
+        let rules = info_syncer
+            .label_rule_manager()
             .get_label_rules(rule_ids)
-            .map(|rules| rules.into_iter().collect())
-            .map_err(GcError::new)
+            .map_err(GcError::new)?;
+        Ok(tidb_domain_infosync::label_manager::filter_rules_by_keyspace(
+            rules.into_values().collect(),
+            info_syncer.label_codec(),
+        )
+        .into_iter()
+        .map(|rule| (rule.id.clone(), rule))
+        .collect())
+    }
+
+    fn label_codec(&self) -> Box<dyn tidb_ddl_label::LabelCodec> {
+        match self.codec {
+            Some(codec) => Box::new(codec),
+            None => Box::new(tidb_ddl_label::CodecV1),
+        }
     }
 
     fn delete_label_rules(&self, rule_ids: Vec<String>) -> GcResult<()> {
-        tidb_domain_infosync::label_manager::label_rule_manager()
+        self.info_syncer()
+            .label_rule_manager()
             .update_label_rules(&tidb_ddl_label::new_rule_patch(
                 Vec::new(),
                 rule_ids,
             ))
             .map_err(GcError::new)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tidb_domain_infosync::info_syncer::InfoSyncer;
+    use tidb_domain_infosync::label_manager::{LabelRuleManager, MockLabelManager};
+
+    use super::*;
+
+    /// A keyspace's GC finds a dropped table's label rule by the ranges the
+    /// rule was built with, its keyspace's (design §6.2). Go's `getGCRules`
+    /// compares keyspace-less ranges, which never match a next-generation
+    /// rule, so the rule stayed in PD forever.
+    #[test]
+    fn gc_finds_a_dropped_tables_keyspace_label_rule() {
+        if !tidb_config_kerneltype::is_next_gen() {
+            // Keyspace-aware label rules are next-generation only.
+            return;
+        }
+        let own = InfoSyncer::new(1);
+        let mut rule: tidb_ddl_label::Rule =
+            serde_json::from_value(serde_json::json!({"labels": [{"key": "merge_option", "value": "deny"}]})).unwrap();
+        rule.reset(own.label_codec(), "d", "t", "", &[100]);
+        let rules = NodeGcRules {
+            pd_http_client: None,
+            codec: tidb_domain_infosync::info_syncer::store_codec(1),
+            info_syncer: Some(Arc::new(own)),
+        };
+        let held = [(rule.id.clone(), rule)].into_iter().collect();
+        assert_eq!(
+            crate::gc_worker::get_gc_rules(&[100], &held, GcRuleClient::label_codec(&rules).as_ref()),
+            ["keyspace/1/schema/d/t"]
+        );
+        assert!(crate::gc_worker::get_gc_rules(&[100], &held, &tidb_ddl_label::CodecV1).is_empty());
+        assert!(crate::gc_worker::get_gc_rules(&[101], &held, GcRuleClient::label_codec(&rules).as_ref()).is_empty());
+    }
+
+    /// A keyspace's GC reads only its own keyspace's label rules (design
+    /// §6.2): the same table rule of another keyspace, and one whose ID
+    /// names no keyspace, stay for their own GC.
+    #[test]
+    fn gc_reads_only_its_keyspaces_label_rules() {
+        if !tidb_config_kerneltype::is_next_gen() {
+            // Keyspace-aware label rules are next-generation only.
+            return;
+        }
+        let pd = Arc::new(MockLabelManager::default());
+        let mut ids = Vec::new();
+        for keyspace_id in [1, 2, u32::MAX] {
+            let syncer = InfoSyncer::new(keyspace_id);
+            let mut rule = tidb_ddl_label::Rule::new();
+            rule.reset(syncer.label_codec(), "d", "t", "", &[100]);
+            pd.put_label_rule(&rule).unwrap();
+            ids.push(rule.id);
+        }
+        let own = InfoSyncer::new(1);
+        own.init_label_rule_manager(Some(pd.clone()));
+        let rules = NodeGcRules {
+            pd_http_client: None,
+            codec: None,
+            info_syncer: Some(Arc::new(own)),
+        };
+        let found = GcRuleClient::get_label_rules(&rules, &ids).unwrap();
+        assert_eq!(found.keys().cloned().collect::<Vec<_>>(), ["keyspace/1/schema/d/t"]);
+        GcRuleClient::delete_label_rules(&rules, found.into_keys().collect()).unwrap();
+        let left = pd.get_all_label_rules(&tidb_ddl_label::CodecV1).unwrap();
+        assert_eq!(
+            left.into_iter().map(|rule| rule.id).collect::<Vec<_>>(),
+            ["keyspace/2/schema/d/t", "schema/d/t"]
+        );
     }
 }
 

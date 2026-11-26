@@ -128,7 +128,8 @@ pub trait ShowExec: crate::simple::account_password::AccountPasswordExec {
     where
         Self: crate::sessionctx::SessionContext,
     {
-        let status_vars = tidb_variable::statusvar::get_status_vars(Some(self.session_vars()))
+        let keyspace = self.viewer_state().keyspace;
+        let status_vars = tidb_variable::statusvar::get_keyspace_status_vars(Some(self.session_vars()), keyspace.as_deref())
             .map_err(|error| DriverError::Mysql(tidb_terror::MysqlError::unknown(error)))?;
         Ok(status_vars
             .into_iter()
@@ -265,6 +266,7 @@ pub trait ShowExec: crate::simple::account_password::AccountPasswordExec {
                 .cmp(&left.db_lower)
                 .then(right.table_id.cmp(&left.table_id))
         });
+        crate::multi_keyspace::refuse_on_multi_keyspace_node("SHOW AFFINITY")?;
         let states = tidb_domain_affinity::get_all_group_states().map_err(|error| {
             DriverError::Mysql(crate::MysqlError::unknown(error.to_string()))
         })?;
@@ -593,10 +595,13 @@ pub trait ShowExec: crate::simple::account_password::AccountPasswordExec {
             | T::OpenTables
             | T::Plugins => Vec::new(),
             T::Backups => {
+                // The BRIE queue is process-wide.
+                crate::multi_keyspace::refuse_on_multi_keyspace_node("SHOW BACKUPS")?;
                 crate::brie::require_brie_privilege(self, tidb_ast::BrieKind::Backup)?;
                 crate::brie::GLOBAL_BRIE_QUEUE.fetch_show_brie(tidb_ast::BrieKind::Backup)
             },
             T::Restores => {
+                crate::multi_keyspace::refuse_on_multi_keyspace_node("SHOW RESTORES")?;
                 crate::brie::require_brie_privilege(self, tidb_ast::BrieKind::Restore)?;
                 crate::brie::GLOBAL_BRIE_QUEUE.fetch_show_brie(tidb_ast::BrieKind::Restore)
             },
@@ -1785,38 +1790,13 @@ pub trait ShowExec: crate::simple::account_password::AccountPasswordExec {
                 rows.extend(set.rows);
             }
         }
-        // Go `fetchRangesPlacementPlocy`: the `global`, then the `meta`
-        // range, when a policy holds it (`infosync.GetReplicationState` is
-        // PENDING without PD).
-        for range_bundle_id in [
-            tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_GLOBAL,
-            tidb_placement::TIDB_BUNDLE_RANGE_PREFIX_FOR_META,
-        ] {
-            let policy_name = tidb_ddl::cluster_ddl::placement_policy::get_range_placement_policy_name(range_bundle_id)
-                .map_err(|error| DriverError::Mysql(crate::MysqlError::unknown(error)))?;
-            if policy_name.is_empty() {
-                continue;
-            }
-            let settings = self.with_catalog_mut(|catalog| {
-                Ok(catalog.policy(&policy_name).map(|policy| {
-                    policy
-                        .placement_settings
-                        .as_ref()
-                        .map(|settings| settings.read().to_string())
-                        .unwrap_or_default()
+        rows.extend(crate::show::placement::range_rows(&mut |policy_name| {
+            self.with_catalog_mut(|catalog| {
+                Ok(catalog.policy(policy_name).map(|policy| {
+                    policy.placement_settings.as_ref().map(|settings| settings.read().to_string()).unwrap_or_default()
                 }))
-            })?;
-            let Some(settings) = settings else {
-                return Err(DriverError::Mysql(crate::MysqlError::unknown(format!(
-                    "Policy with name '{policy_name}' not found"
-                ))));
-            };
-            rows.push(vec![
-                Datum::Bytes(format!("RANGE {range_bundle_id}").into_bytes()),
-                Datum::Bytes(settings.into_bytes()),
-                Datum::Bytes(crate::show::placement::PENDING.as_bytes().to_vec()),
-            ]);
-        }
+            })
+        })?);
         Ok(rows)
     }
 

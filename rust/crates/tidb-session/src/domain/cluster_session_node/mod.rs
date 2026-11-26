@@ -395,6 +395,12 @@ impl NodeConn {
 pub struct ClusterServerSession<'s> {
     session: &'s mut Session,
     node: NodeLoan<'s>,
+    /// The session's vardef snapshot, entered on this thread while the store
+    /// half is lent; leaving restores the caller's.
+    _vardef: Option<tidb_vardef::snapshot::EnteredVardef>,
+    /// The domain's info syncer, entered beside the vardef snapshot: the
+    /// statement's PD calls go to its keyspace's managers (design §6.2).
+    _info_syncer: Option<tidb_domain_infosync::info_syncer::EnteredInfoSyncer>,
 }
 
 /// The store half a [`ClusterServerSession`] works on: taken from the
@@ -443,9 +449,20 @@ impl Session {
     /// On a session with no store.
     pub fn node_conn(&mut self) -> ClusterServerSession<'_> {
         let node = self.node.take().expect("a session on the store");
+        // The statement runs under the session's own keyspace values (design
+        // §6.3): the DDL it submits reads them on this thread, whichever
+        // caller runs it (a connection, an internal or pooled session).
+        let vardef = tidb_vardef::snapshot::enter(self.vars.vardef());
+        let info_syncer = node
+            .domain
+            .as_ref()
+            .and_then(|domain| domain.info_syncer())
+            .map(|syncer| tidb_domain_infosync::info_syncer::enter(Arc::clone(syncer)));
         ClusterServerSession {
             session: self,
             node: NodeLoan::Taken(Some(node)),
+            _vardef: Some(vardef),
+            _info_syncer: info_syncer,
         }
     }
 
@@ -462,6 +479,20 @@ impl Session {
 impl NodeConn {
     /// Go `session.GetStore().GetCodec().GetKeyspaceID`.
     pub(crate) fn keyspace_id(&self) -> u32 { self.transactions.keyspace_id() }
+    /// The keyspace this connection acts for (design §6.1): a cross-keyspace
+    /// target store's, else its domain's, else its own store's. `None` only
+    /// over an API-V1 store.
+    pub(crate) fn keyspace_context(&self) -> Option<Arc<tidb_keyspace::KeyspaceContext>> {
+        if let Some(target) = &self.cross_ks_store {
+            return tidb_keyspace::KeyspaceContext::of_store(&target.keyspace, target.transactions.keyspace_id())
+                .map(Arc::new);
+        }
+        if let Some(domain) = &self.domain {
+            return domain.keyspace_context().cloned();
+        }
+        tidb_keyspace::KeyspaceContext::of_store(&self.transactions.store_keyspace(), self.transactions.keyspace_id())
+            .map(Arc::new)
+    }
     /// Go `session.GetLatestInfoSchema`.
     pub(crate) fn latest_info_schema(&self) -> Arc<SessionExtendedInfoSchema> {self.catalog.get_latest()}
     /// Go `domain.GetDomain(sctx)`.
@@ -491,6 +522,8 @@ impl<'s> ClusterServerSession<'s> {
         ClusterServerSession {
             session: &mut *self.session,
             node: NodeLoan::Borrowed(&mut self.node),
+            _vardef: None,
+            _info_syncer: None,
         }
     }
 }

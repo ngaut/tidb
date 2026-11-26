@@ -111,6 +111,17 @@ pub struct GlobalSysvars {
     resolved: Arc<RwLock<Arc<ResolvedGlobals>>>,
     /// Serializes rebuilds of `resolved`; see `refresh_resolved`.
     refresh_lock: Arc<Mutex<()>>,
+    /// The values this table's `SetGlobal` hooks write the vardef global
+    /// statics to (multi-keyspace design §6.3): the process statics, or the
+    /// keyspace's own on a multi-keyspace node's other keyspaces.
+    vardef: Arc<tidb_vardef::VardefSnapshot>,
+    /// The store `tidb_external_ts` reads from for a keyspace that owns its
+    /// vardef values (its domain installs it); a table over the process
+    /// statics uses the process slot. Read-only: PD keeps one external
+    /// timestamp per cluster, not per keyspace, so `tidb_external_ts` is a
+    /// process variable (design §6.3) that only the configured keyspace
+    /// writes. Shared by every clone.
+    external_timestamp: Arc<std::sync::OnceLock<Arc<dyn tidb_variable::vars::ExternalTimestampProvider>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -266,12 +277,18 @@ impl Default for GlobalSysvars {
             domain_hooks: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             resolved: Arc::new(RwLock::new(EMPTY_RESOLVED.with(|it| it.clone()))),
             refresh_lock: Arc::default(),
+            vardef: tidb_vardef::snapshot::process(),
+            external_timestamp: Arc::default(),
         }
     }
 }
 
 /// Go `session`'s `GlobalVarAccessor` implementation over the domain.
 impl tidb_variable::GlobalVarAccessor for GlobalSysvars {
+    fn vardef(&self) -> Option<Arc<tidb_vardef::VardefSnapshot>> {
+        self.vardef.is_per_keyspace().then(|| Arc::clone(&self.vardef))
+    }
+
     fn run_set_global_hook(&self, name: &str, value: &str) -> Result<(), VarError> {
         let hook = self
             .set_global_hooks
@@ -391,8 +408,48 @@ impl GlobalSysvars {
         // copy are of the values it assigns, which a hook would replace with
         // the stored ones (Go hands SetGlobal the assigned value directly).
         self.set_global_hooks = other.set_global_hooks.clone();
+        self.vardef = Arc::clone(&other.vardef);
         self
     }
+
+    /// This table with values of its own for the vardef global statics: a
+    /// multi-keyspace node's keyspace other than its configured one (design
+    /// §6.3). Its `SetGlobal` hooks write them and its `GetGlobal` hooks read
+    /// them.
+    #[must_use]
+    pub fn with_keyspace_vardef(mut self) -> Self {
+        self.vardef = Arc::new(tidb_vardef::VardefSnapshot::per_keyspace());
+        self
+    }
+
+    /// The store this table's keyspace reads `tidb_external_ts` from, for a
+    /// keyspace that owns its vardef values (design §6.3). The value is the
+    /// PD cluster's; the keyspace never writes it.
+    pub fn set_external_timestamp_provider(&self, provider: Arc<dyn tidb_variable::vars::ExternalTimestampProvider>) {
+        let _ = self.external_timestamp.set(provider);
+    }
+
+    /// `tidb_external_ts` from this keyspace's own store, when it has one.
+    fn own_external_timestamp(&self, name: &str) -> Option<&Arc<dyn tidb_variable::vars::ExternalTimestampProvider>> {
+        if !name.eq_ignore_ascii_case(tidb_vardef::tidb_vars::TIDB_EXTERNAL_TS) {
+            return None;
+        }
+        self.external_timestamp.get()
+    }
+
+    /// Whether this table publishes process-wide settings: a live table over
+    /// the process statics. A keyspace that owns its vardef values never does
+    /// (design §6.3).
+    fn publishes_process_settings(&self) -> bool {
+        self.publishes_runtime_settings && !self.vardef.is_per_keyspace()
+    }
+
+    /// The values this table's keyspace reads the vardef global statics
+    /// from: the process statics unless it owns its own.
+    pub fn vardef(&self) -> Arc<tidb_vardef::VardefSnapshot> {
+        Arc::clone(&self.vardef)
+    }
+
 
     /// Go `variable.RegisterSysVar`'s `GetGlobal` for `name`, from a package
     /// outside the registry.
@@ -447,8 +504,10 @@ impl GlobalSysvars {
     /// `rebuildSysVarCache`: the domain takes the sysvar cache over, and every
     /// variable's SetGlobal hook runs with the value the startup left it.
     pub fn arm_domain_hooks(&self) {
-        // Go `initDomainSysVars`: the domain fills `variable`'s slots.
-        if self.publishes_runtime_settings {
+        // Go `initDomainSysVars`: the domain fills `variable`'s slots -- the
+        // process's, so only a table over the process statics does (design
+        // §6.3): another keyspace's open must not rebind them to its store.
+        if self.publishes_process_settings() {
             install_pd_client_dynamic_option(Arc::clone(&self.pd_region_policy));
         }
         if self
@@ -555,7 +614,10 @@ impl GlobalSysvars {
             .pd_region_policy
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(policy.clone());
-        if self.publishes_runtime_settings {
+        // The PD client options are process settings (design §6.3): only the
+        // table over the process statics binds the process's option callbacks
+        // to its store and seeds that store's client.
+        if self.publishes_process_settings() {
             install_pd_client_dynamic_option(Arc::clone(&self.pd_region_policy));
             policy.set_follower_handle(enabled(
                 tidb_vardef::tidb_vars::PD_ENABLE_FOLLOWER_HANDLE_REGION,
@@ -584,6 +646,9 @@ impl GlobalSysvars {
         if let Some(value) = self.run_get_global_hook(name) {
             return Ok(value);
         }
+        if let Some(provider) = self.own_external_timestamp(name) {
+            return provider.get().map(|ts| ts.to_string()).map_err(VarError::unknown);
+        }
         let Some(index) = tidb_variable::sysvar::sys_var_index_lookup(name) else {
             return Err(tidb_terror::MysqlError::from_terror(
                 &tidb_variable::variable_errors::ERR_UNKNOWN_SYSTEM_VAR
@@ -605,7 +670,7 @@ impl GlobalSysvars {
             }
             // Go `SysVar.GetGlobal`: the variable's process-wide value is the
             // live table's answer (a scratch table answers what it stores).
-            if let Some(value) = def.get_global_from_hook() {
+            if let Some(value) = def.get_global_from_hook(&self.vardef) {
                 return value;
             }
         }
@@ -662,7 +727,7 @@ impl GlobalSysvars {
                 ]),
             ));
         }
-        self.get(name).and_then(|value| global_get_hook(def, value))
+        self.get(name).and_then(|value| global_get_hook(def, &self.vardef, value))
     }
 
     /// Rebuilds the read-mostly image from the cache's global view and the
@@ -807,6 +872,9 @@ impl GlobalSysvars {
         if let Some(value) = self.run_get_global_hook(def.name) {
             return Ok(value);
         }
+        if let Some(provider) = self.own_external_timestamp(def.name) {
+            return provider.get().map(|ts| ts.to_string()).map_err(VarError::unknown);
+        }
         if let Some(value) = self.instance_plan_cache_limit_getter(def) {
             return Ok(value);
         }
@@ -822,7 +890,7 @@ impl GlobalSysvars {
             if let Some(value) = runtime_instance_value(self, def) {
                 return Ok(value);
             }
-            if let Some(value) = def.get_global_from_hook() {
+            if let Some(value) = def.get_global_from_hook(&self.vardef) {
                 return value;
             }
         }
@@ -989,6 +1057,13 @@ impl GlobalSysvars {
         {
             return;
         }
+        // A keyspace that owns its vardef values never writes the process's
+        // state (design §6.3): a process variable's hook would apply the
+        // keyspace's value (an explicit write, or a row its rebuild loaded)
+        // to every keyspace.
+        if self.vardef.is_per_keyspace() && tidb_variable::process_scope::is_process_variable(name) {
+            return;
+        }
         // Go `SetGlobalFromHook`: the variable's one `SetGlobal` -- its own
         // (its process state, e.g. `vardef`'s atomics and the LDAP impls) or
         // the one a package outside the registry gave it (Go
@@ -998,7 +1073,10 @@ impl GlobalSysvars {
         // logged-and-ignored rebuild error.
         match get_sys_var(name).and_then(|def| def.set_global) {
             Some(set_global) => {
-                let _ = set_global(&mut tidb_variable::vars::SessionVars::new(), value);
+                // The hook writes this table's keyspace's vardef values.
+                let mut vars = tidb_variable::vars::SessionVars::new();
+                vars.set_vardef(Arc::clone(&self.vardef));
+                let _ = set_global(&mut vars, value);
             }
             None => {
                 let _ = tidb_variable::GlobalVarAccessor::run_set_global_hook(self, name, value);
@@ -1072,7 +1150,8 @@ impl GlobalSysvars {
         }
         let stored_value = validated.value;
         if key == tidb_vardef::tidb_vars::TIDB_CLOUD_STORAGE_URI {
-            if self.publishes_runtime_settings {
+            // The URI is a process setting (design §6.3).
+            if self.publishes_process_settings() {
                 tidb_variable::cloud_storage::set_cloud_storage_uri(&tidb_gocontext::Context::background(), &stored_value).map_err(VarError::unknown)?;
             } else {
                 tidb_variable::cloud_storage::validate_cloud_storage_uri(&tidb_gocontext::Context::background(), &stored_value).map_err(VarError::unknown)?;
@@ -1513,8 +1592,10 @@ impl crate::sysvar_cache::SysVarCacheDeps for SysVarCacheRebuild<'_> {
         sv: &crate::sysvar_cache::SysVarSpec,
         value: &str,
     ) -> Result<(), String> {
+        // The URI is a process setting (design §6.3): a keyspace that owns its
+        // vardef values never applies it, not even its default.
         if sv.name == tidb_vardef::tidb_vars::TIDB_CLOUD_STORAGE_URI
-            && self.0.publishes_runtime_settings
+            && self.0.publishes_process_settings()
             && self.0.domain_hooks.load(std::sync::atomic::Ordering::SeqCst)
         {
             tidb_variable::cloud_storage::set_cloud_storage_uri(&tidb_gocontext::Context::background(), value)?;

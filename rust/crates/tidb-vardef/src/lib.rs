@@ -83,14 +83,17 @@ pub fn set_ddl_reorg_batch_size(cnt: i32) {
 
 static DDL_ERROR_COUNT_LIMIT: AtomicI64 = AtomicI64::new(defaults::DEF_TIDB_DDL_ERROR_COUNT_LIMIT);
 
-/// Go `GetDDLErrorCountLimit`, retained when a worker cannot refresh globals.
+/// Go `GetDDLErrorCountLimit`, retained when a worker cannot refresh
+/// globals: the value of the keyspace whose DDL the thread runs
+/// ([`snapshot::current`], multi-keyspace design §6.3).
 pub fn ddl_error_count_limit() -> i64 {
-    DDL_ERROR_COUNT_LIMIT.load(Ordering::SeqCst)
+    snapshot::current().ddl_error_count_limit().load(Ordering::SeqCst)
 }
 
-/// Go `SetDDLErrorCountLimit`; validation belongs to the sysvar registry.
+/// Go `SetDDLErrorCountLimit` for the keyspace whose DDL the thread runs;
+/// validation belongs to the sysvar registry.
 pub fn set_ddl_error_count_limit(limit: i64) {
-    DDL_ERROR_COUNT_LIMIT.store(limit, Ordering::SeqCst);
+    snapshot::current().ddl_error_count_limit().store(limit, Ordering::SeqCst);
 }
 
 /// Go `vardef.MaxAutoAnalyzeTime`: the seconds an auto-analyze job may run
@@ -447,16 +450,26 @@ pub fn set_plan_replayer_file_retention_time(nanoseconds: i64) {
 /// Loads Go `vardef.OOMAction`.
 #[must_use]
 pub fn oom_action() -> &'static str {
-    if OOM_ACTION.load(Ordering::SeqCst) == OOM_ACTION_LOG {
+    oom_action_of(&OOM_ACTION)
+}
+
+/// Stores Go `vardef.OOMAction` after sysvar validation.
+pub fn set_oom_action(value: &str) {
+    store_oom_action(&OOM_ACTION, value);
+}
+
+/// The `OOMAction` an `OOM_ACTION` cell holds.
+fn oom_action_of(cell: &AtomicU8) -> &'static str {
+    if cell.load(Ordering::SeqCst) == OOM_ACTION_LOG {
         tidb_vars::OOM_ACTION_LOG
     } else {
         tidb_vars::OOM_ACTION_CANCEL
     }
 }
 
-/// Stores Go `vardef.OOMAction` after sysvar validation.
-pub fn set_oom_action(value: &str) {
-    OOM_ACTION.store(
+/// Stores `value` into an `OOM_ACTION` cell.
+fn store_oom_action(cell: &AtomicU8, value: &str) {
+    cell.store(
         if value.eq_ignore_ascii_case(tidb_vars::OOM_ACTION_LOG) {
             OOM_ACTION_LOG
         } else {
@@ -494,6 +507,7 @@ pub fn is_read_only_var_in_next_gen(name: &str) -> bool {
 }
 
 pub mod bounds;
+pub mod classification;
 pub mod defaults;
 /// One function from `sessionctx/variable/sysvar.go` rather than from
 /// `vardef`: `GlobalSystemVariableInitialValue`, which decides the value a
@@ -503,6 +517,8 @@ pub mod defaults;
 /// leaf, and because it is pure policy over those same constants.
 pub mod global_sysvar_initial;
 pub mod modes;
+pub mod snapshot;
+pub use snapshot::VardefSnapshot;
 pub mod option_values;
 pub mod tidb_vars;
 pub mod txn_mode;

@@ -2530,6 +2530,14 @@ pub struct DdlJobSchemaState {
     /// `prepareTxn` tags with the job's SQL (`kv.ResourceGroupTagger`).
     /// `None` for a run without a transaction of its own.
     pub step_kv_context: Option<tidb_txnkv::StatementKvContextCell>,
+    /// The keyspace of the store the step runs on, whose name the step's
+    /// resource-group tags carry (design §6.1). `None` for a run without a
+    /// store of its own, which tags the process's configured keyspace.
+    pub keyspace: Option<std::sync::Arc<tidb_keyspace::KeyspaceContext>>,
+    /// The vardef values of the keyspace the DDL serves (design §6.3), which
+    /// the step reads; `None` for a DDL without a domain (the process
+    /// statics).
+    pub vardef: Option<std::sync::Arc<tidb_vardef::VardefSnapshot>>,
     /// Go `jobContext.infoCache`: the schema a step reads beside its job's
     /// own schemas, which it reads from meta (`jobCtx.metaMut`). `None` reads
     /// the whole schema from the snapshot.
@@ -2547,6 +2555,8 @@ impl DdlJobSchemaState {
             reorg: Vec::new(),
             worker,
             step_kv_context: None,
+            keyspace: None,
+            vardef: None,
             info_cache: None,
         }
     }
@@ -3143,16 +3153,20 @@ fn plan_persisted_ddl_job_with<S: MetaSnapshot>(
     }
     // Go `transitOneJobStep` -> `prepareTxn`'s `attachTopProfilingInfo`:
     // every step, finishing ones included, runs under the job's SQL.
-    crate::job_ctx::attach_top_profiling_info(active.job.id, &active.job.query.to_utf8_lossy_go());
+    let job_key = schema_state.worker.job_key(active.job.id);
+    crate::job_ctx::attach_top_profiling_info(job_key, &active.job.query.to_utf8_lossy_go());
     if let Some(step_kv_context) = &schema_state.step_kv_context {
         // Go `prepareTxn`: `setDDLSourceForDiagnosis`, then the
         // transaction's `kv.RequestSourceType` and `kv.ResourceGroupTagger`.
-        let source_type = crate::job_ctx::set_ddl_source_for_diagnosis(active.job.id, active.job.type_);
+        let source_type = crate::job_ctx::set_ddl_source_for_diagnosis(job_key, active.job.type_);
         step_kv_context.publish(tidb_txnkv::StatementKvContext {
-            resource_group_tagger: crate::job_ctx::get_resource_group_tagger_for_top_sql(active.job.id),
+            resource_group_tagger: crate::job_ctx::get_resource_group_tagger_for_top_sql(
+                job_key,
+                schema_state.keyspace.as_ref(),
+            ),
             request_source_type: Some(source_type),
             resource_group_name: Some(crate::job_ctx::job_resource_group_name(
-                active.job.id,
+                job_key,
                 active
                     .job
                     .reorg_meta
@@ -3212,18 +3226,86 @@ fn plan_persisted_ddl_job_with<S: MetaSnapshot>(
     let cancelling = active.job.is_cancelling();
     let was_rollingback = active.job.is_rollingback();
     let previous_schema_version = active.job.last_schema_version;
+    // A multi-keyspace node writes no PD state for a tenant that PD keeps by
+    // bare object IDs (design §10 phase 2; label rules and placement
+    // bundles carry their keyspace, §6.2). The check is on the step's
+    // resolved write, so it covers what the statement did not spell out: a
+    // TRUNCATE or partition change of a table that already carries such
+    // state, a job queued before the restart.
+    let multi_keyspace = tidb_keyspace::is_multi_keyspace_mode();
+    let refused_pd_write = std::cell::Cell::new(false);
     let outcome = recover_ddl_action(|| {
         if cancelling {
             run_in_job_txn(snapshot, start_ts, &schema_state.worker, |txn| {
                 plan_cancel_persisted_ddl_job(txn, &catalog, &mut active, start_ts)
             })
+            .map(|mut step| {
+                // A rollback puts back the PD state its job changed; a job
+                // refused here changed none, and an older job's ID-named
+                // state stays for the operator.
+                if multi_keyspace {
+                    strip_pd_writes(&mut step.write);
+                }
+                step
+            })
         } else {
             if !active.job.is_rollingback() {
                 active.job.state = JobState::RUNNING;
             }
-            plan_action(snapshot, &catalog, &mut active)
+            // Whether the delivered job can still be cancelled cleanly.
+            let delivered = (multi_keyspace && active.job.is_running() && active.job.is_rollbackable())
+                .then(|| active.job.clone());
+            // The action's own PD writes (TiFlash rules) refuse a step that
+            // can be cancelled and are skipped by one that cannot.
+            let pd_writes = match (multi_keyspace, delivered.is_some()) {
+                (false, _) => StepPdWrites::Allow,
+                (true, true) => StepPdWrites::Refuse,
+                (true, false) => StepPdWrites::Skip,
+            };
+            let previous = STEP_PD_WRITES.with(|cell| cell.replace(pd_writes));
+            let planned = plan_action(snapshot, &catalog, &mut active);
+            STEP_PD_WRITES.with(|cell| cell.set(previous));
+            let feature = match &planned {
+                Ok(step) => pd_backed_write_feature(&step.write),
+                Err(error) if multi_keyspace && is_multi_keyspace_refusal(error) => Some("TIFLASH REPLICA"),
+                Err(_) => None,
+            };
+            match (feature, delivered, planned) {
+                (Some(feature), Some(delivered), planned) => {
+                    // Go's `job.State = JobStateCancelled; return err` before
+                    // the action changes anything: the job as delivered,
+                    // rolled back (cancelled) by its next step.
+                    active.job = delivered;
+                    active.job.state = JobState::CANCELLING;
+                    refused_pd_write.set(true);
+                    Err(match planned {
+                        Err(refusal) => refusal,
+                        Ok(_) => multi_keyspace_refusal(feature),
+                    })
+                }
+                (Some(feature), None, Ok(mut step)) if multi_keyspace => {
+                    // Past the point a job can be cancelled (a job queued
+                    // before the restart, or a later step of one): it
+                    // finishes without touching PD, whose ID-named rules
+                    // for the object stay for the operator.
+                    tidb_ddl_logutil::ddl_logger().warn(
+                        "multi-keyspace node skips a DDL step's PD writes",
+                        &[
+                            tidb_log::Field::new("jobID", tidb_log::Value::I64(active.job.id)),
+                            tidb_log::Field::new("feature", tidb_log::Value::Str(feature.to_owned())),
+                        ],
+                    );
+                    strip_pd_writes(&mut step.write);
+                    Ok(step)
+                }
+                (_, _, planned) => planned,
+            }
         }
     });
+    if refused_pd_write.get() {
+        // Nothing the refused step staged is committed.
+        schema_state.worker.step_buffer.reset();
+    }
     let panicked = outcome.is_err();
     if let Ok(Ok(PersistedDdlActionStep {
         reorg: Some(reorg), ..
@@ -4130,7 +4212,7 @@ fn plan_persisted_drop_schema_job_step(
     let mut affinity_groups = crate::ddl_affinity::AffinityGroupUpdate::default();
     let mut label_rules = LabelRuleSteps::new();
     if db_info.state == SchemaState::PUBLIC
-        && tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::Relaxed)
+        && tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::Relaxed)
     {
         // Go `checkDatabaseHasForeignKeyReferredInOwner`.
         let fk_check = tidb_model::get_drop_schema_args(&mut active.job)
@@ -4148,7 +4230,7 @@ fn plan_persisted_drop_schema_job_step(
             .map(LabelRuleTable::from_table_info)
             .collect::<Vec<_>>();
         label_rules.push(
-            label_rules::drop_schema_label_rules(&active.job.schema_name.to_string(), &tables),
+            label_rules::drop_schema_label_rules(label_rules.codec(), &active.job.schema_name.to_string(), &tables),
             None,
         )?;
     }
@@ -4337,7 +4419,7 @@ fn plan_persisted_drop_table_job_step(
             &schema_name,
             &table_name,
             &ignored,
-            fk_check && tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::Relaxed),
+            fk_check && tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::Relaxed),
         ) {
             return Err(cancel_ddl_job(
                 active,
@@ -4431,7 +4513,9 @@ fn plan_persisted_drop_table_job_step(
         // Go `onDropTableOrView`'s `dropMaskingPoliciesOnTable`.
         masking_policy::drop_masking_policies_on_table(txn, table.id)?;
         let old_partition_ids = add_index::partition_ids(&table);
-        let codec = tidb_ddl_label::CodecV1;
+        // Go `jobCtx.store.GetCodec()`.
+        let info_syncer = tidb_domain_infosync::info_syncer::get();
+        let codec = info_syncer.label_codec();
         let schema_name = active.job.schema_name.to_string();
         let mut rule_ids: Vec<String> = table
             .partition
@@ -4444,7 +4528,7 @@ fn plan_persisted_drop_table_job_step(
                     .iter()
                     .map(|definition| {
                         tidb_ddl_label::new_rule_id(
-                            &codec,
+                            codec,
                             &schema_name,
                             table.name.lowercase(),
                             definition.name.lowercase(),
@@ -4454,7 +4538,7 @@ fn plan_persisted_drop_table_job_step(
             })
             .unwrap_or_default();
         rule_ids.push(tidb_ddl_label::new_rule_id(
-            &codec,
+            codec,
             &schema_name,
             table.name.lowercase(),
             "",
@@ -4552,10 +4636,52 @@ fn pd_step_error(context: Option<&str>, error: String) -> DdlPlanError {
     ))
 }
 
+/// What a job step on a multi-keyspace node does with a PD write its action
+/// makes directly (TiFlash rules, TiFlash schema sync): set around the
+/// action by [`plan_persisted_ddl_job_step`] (design §10 phase 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepPdWrites {
+    /// A single-keyspace node: the write is made.
+    Allow,
+    /// The step can still be cancelled: the write refuses the step.
+    Refuse,
+    /// The step is past its cancel point: the write is skipped.
+    Skip,
+}
+
+thread_local! {
+    static STEP_PD_WRITES: std::cell::Cell<StepPdWrites> = const { std::cell::Cell::new(StepPdWrites::Allow) };
+}
+
+/// The 1235 a multi-keyspace node answers for `feature`.
+fn multi_keyspace_refusal(feature: &str) -> DdlPlanError {
+    DdlPlanError::Source(tidb_plannererrors::ERR_NOT_SUPPORTED_YET.gen_with_stack_by_args(&[
+        format!("{feature} on a multi-keyspace node").into(),
+    ]))
+}
+
+/// Whether `error` is a step's [`multi_keyspace_refusal`].
+fn is_multi_keyspace_refusal(error: &DdlPlanError) -> bool {
+    error.equal(&tidb_plannererrors::ERR_NOT_SUPPORTED_YET) && error.to_string().ends_with("on a multi-keyspace node'")
+}
+
+/// Gate for a PD write a job step's action makes itself: `Ok(true)` to
+/// make it, `Ok(false)` to skip it, or the step's refusal.
+pub(crate) fn step_pd_write(feature: &str) -> Result<bool, DdlPlanError> {
+    match STEP_PD_WRITES.with(std::cell::Cell::get) {
+        StepPdWrites::Allow => Ok(true),
+        StepPdWrites::Skip => Ok(false),
+        StepPdWrites::Refuse => Err(multi_keyspace_refusal(feature)),
+    }
+}
+
 /// Go `infosync.ConfigureTiFlashPDForTable` in a job step; a PD refusal is
 /// the step's error.
 pub(crate) fn configure_tiflash_pd_for_table(id: i64, count: u64, labels: &[String]) -> Result<(), DdlPlanError> {
-    tidb_domain_infosync::tiflash_manager::configure_tiflash_pd_for_table(id, count, labels)
+    if !step_pd_write("TIFLASH REPLICA")? {
+        return Ok(());
+    }
+    tidb_domain_infosync::info_syncer::configure_tiflash_pd_for_table(id, count, labels)
         .map_err(|error| pd_step_error(None, error))
 }
 
@@ -4567,8 +4693,11 @@ pub(crate) fn configure_tiflash_pd_for_partitions(
     labels: &[String],
     table_id: i64,
 ) -> Result<(), DdlPlanError> {
+    if !step_pd_write("TIFLASH REPLICA")? {
+        return Ok(());
+    }
     let ids: Vec<i64> = definitions.iter().map(|definition| definition.id).collect();
-    tidb_domain_infosync::tiflash_manager::configure_tiflash_pd_for_partitions(accel, &ids, count, labels, table_id)
+    tidb_domain_infosync::info_syncer::configure_tiflash_pd_for_partitions(accel, &ids, count, labels, table_id)
         .map_err(|error| pd_step_error(None, error))
 }
 
@@ -4995,6 +5124,23 @@ pub(super) fn record_ddl_action_error(job: &mut Job, error: &DdlPlanError) -> bo
     true
 }
 
+/// The PD write a job step's resolved metadata would make, if any, that a
+/// multi-keyspace node refuses. Label rules, placement bundles and resource
+/// groups are not among them: they carry the job's keyspace where they
+/// meet PD (the resource manager client is the keyspace's store's).
+fn pd_backed_write_feature(write: &DdlWrite) -> Option<&'static str> {
+    if !write.affinity_groups.is_empty() {
+        Some("AFFINITY")
+    } else {
+        None
+    }
+}
+
+/// Drops the PD writes [`pd_backed_write_feature`] refuses.
+fn strip_pd_writes(write: &mut DdlWrite) {
+    write.affinity_groups = Default::default();
+}
+
 /// Outcome of an action that could not complete its staged work.
 #[derive(Debug)]
 pub enum PersistedDdlJobFailure {
@@ -5121,11 +5267,20 @@ pub enum ResourceGroupUpdate {
 }
 
 impl ResourceGroupUpdate {
+    /// The group the write names.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Add(group) | Self::Modify(group) => &group.name,
+            Self::Delete(name) => name,
+        }
+    }
+
     /// Makes the write; the error is the job's.
     pub fn apply(&self) -> Result<(), String> {
         match self {
             Self::Add(group) => {
-                match tidb_domain_infosync::resource_manager_client::add_resource_group((**group).clone()) {
+                match tidb_domain_infosync::info_syncer::add_resource_group((**group).clone()) {
                     Ok(()) => Ok(()),
                     // Go: TiDB adds the default group when it bootstraps, so a
                     // keyspace-mode TiDB skips that one's "already exists".
@@ -5139,9 +5294,9 @@ impl ResourceGroupUpdate {
                 }
             }
             Self::Modify(group) => {
-                tidb_domain_infosync::resource_manager_client::modify_resource_group((**group).clone())
+                tidb_domain_infosync::info_syncer::modify_resource_group((**group).clone())
             }
-            Self::Delete(name) => tidb_domain_infosync::resource_manager_client::delete_resource_group(name),
+            Self::Delete(name) => tidb_domain_infosync::info_syncer::delete_resource_group(name),
         }
     }
 }
@@ -5256,20 +5411,23 @@ pub struct LabelRuleStep {
     pub error_context: Option<&'static str>,
 }
 
-/// The label-rule writes of one job step, staged over the node's manager so
-/// the step's later reads see its earlier writes, as Go's step, which writes
-/// PD call by call, does.
+/// The label-rule writes of one job step, staged over its keyspace's manager
+/// so the step's later reads see its earlier writes, as Go's step, which
+/// writes PD call by call, does.
 pub(crate) struct LabelRuleSteps {
     staged: tidb_domain_infosync::label_manager::StagedLabelRules,
+    /// The job's DDL's info syncer (design §6.2), whose codec is Go's
+    /// `jobCtx.store.GetCodec()`.
+    info_syncer: std::sync::Arc<tidb_domain_infosync::info_syncer::InfoSyncer>,
     steps: Vec<LabelRuleStep>,
 }
 
 impl LabelRuleSteps {
     fn new() -> Self {
+        let info_syncer = tidb_domain_infosync::info_syncer::get();
         Self {
-            staged: tidb_domain_infosync::label_manager::StagedLabelRules::new(
-                tidb_domain_infosync::label_manager::label_rule_manager(),
-            ),
+            staged: tidb_domain_infosync::label_manager::StagedLabelRules::new(info_syncer.label_rule_manager()),
+            info_syncer,
             steps: Vec::new(),
         }
     }
@@ -5277,6 +5435,12 @@ impl LabelRuleSteps {
     /// The rules as the step sees them.
     fn manager(&self) -> &dyn tidb_domain_infosync::label_manager::LabelRuleManager {
         &self.staged
+    }
+
+    /// Go `jobCtx.store.GetCodec()`: the keyspace the rule IDs and ranges
+    /// carry.
+    fn codec(&self) -> &dyn tidb_ddl_label::LabelCodec {
+        self.info_syncer.label_codec()
     }
 
     fn push(
@@ -5306,6 +5470,7 @@ impl LabelRuleSteps {
     ) -> Result<(), DdlPlanError> {
         let writes = label_rules::partition_label_writes(
             self.manager(),
+            self.codec(),
             &schema.go_to_lower(),
             &LabelRuleTable::from_table_info(before),
             &LabelRuleTable::from_table_info(after),
@@ -5997,13 +6162,16 @@ fn apply_truncate_table(
     let label_table = LabelRuleTable::from_table_info(&info);
     let old_rules = label_rules::get_old_label_rules(
         label_rules.manager(),
+        label_rules.codec(),
         &label_table,
+        &LabelRuleTable::from_table_info(stored).ids(),
         &schema.go_to_lower(),
         &label_table.name,
     )
     .map_err(|error| pd_step_error(Some("failed to get old label rules from PD"), error))?;
     label_rules.push(
         label_rules::update_label_rules(
+            label_rules.codec(),
             &schema.go_to_lower(),
             &label_table,
             &old_rules,

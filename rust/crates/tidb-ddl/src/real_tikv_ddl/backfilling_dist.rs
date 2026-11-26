@@ -86,6 +86,15 @@ fn get_tbl_info<S: StoreClient>(
     )
     .map_err(|e| Arc::new(e) as Error)
 }
+/// The vardef values a DXF step executor's unset reorg fields fall back to:
+/// the process's. Step executors run where the DXF loop runs -- a
+/// single-keyspace node, or (nextgen) the SYSTEM keyspace's nodes -- and a
+/// multi-keyspace node never runs one: its keyspaces are user keyspaces,
+/// which skip the DXF loop (multi-keyspace design §5.5, §6.3).
+pub(super) fn executor_vardef() -> Arc<tidb_vardef::VardefSnapshot> {
+    tidb_vardef::snapshot::process()
+}
+
 pub(super) fn reorg_for_task(meta: &BackfillTaskMeta, table: tidb_model::TableInfo) -> AddIndexReorg {
     let physical_ids = table.get_partition_info().map_or_else(
         || vec![table.id],
@@ -106,8 +115,8 @@ pub(super) fn reorg_for_task(meta: &BackfillTaskMeta, table: tidb_model::TableIn
         index_ids: meta.ele_ids.clone().unwrap_or_default(),
         merging: meta.merge_temp_index,
         physical_ids,
-        batch_size: crate::cluster_ddl::add_index::job_batch_size(&meta.job),
-        concurrency: crate::cluster_ddl::add_index::job_concurrency(&meta.job),
+        batch_size: crate::cluster_ddl::add_index::job_batch_size(&meta.job, &executor_vardef()),
+        concurrency: crate::cluster_ddl::add_index::job_concurrency(&meta.job, &executor_vardef()),
         session_vars: tidb_ddl_build::session_pool::ReorgSessionVars::of_job(&meta.job),
         row_count: 0,
         column: None,
@@ -245,7 +254,7 @@ fn generate_read_index_plan<S: StoreClient>(
         let range = reorg_transaction(
             &ddl.opener,
             ddl.timeout,
-            &crate::job_ctx::backfill_request_source(reorg.job_id),
+            &crate::job_ctx::backfill_request_source(crate::job_ctx::JobKey::new(ddl.opener.keyspace_id(), reorg.job_id)),
             |_, snapshot, buffer, _| {
                 Ok((
                     table_range(backfiller.as_ref(), reorg, *id, snapshot, buffer)?,
@@ -940,7 +949,7 @@ impl<S: StoreClient> StepExecutor for CloudImportStepExecutor<S> {
             &self.job,
             self.indexes.iter().any(|index| index.unique),
             false,
-            crate::cluster_ddl::add_index::job_concurrency(&self.job),
+            crate::cluster_ddl::add_index::job_concurrency(&self.job, &executor_vardef()),
             concurrency,
         )?);
         Ok(())
@@ -1298,6 +1307,7 @@ fn check_duplicate_for_unique_index<S: StoreClient>(
     opener: &Arc<RealOptimisticTransactionOpener<S>>,
     reorg: &AddIndexReorg,
     job: &Job,
+    vardef: &tidb_vardef::VardefSnapshot,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ctx = Context::background();
     let mut backend = None;
@@ -1322,7 +1332,7 @@ fn check_duplicate_for_unique_index<S: StoreClient>(
                         job,
                         true,
                         true,
-                        crate::cluster_ddl::add_index::job_concurrency(job),
+                        crate::cluster_ddl::add_index::job_concurrency(job, vardef),
                         0,
                     )?);
                 }
@@ -1403,11 +1413,9 @@ impl<S: StoreClient> tidb_dxf_taskexecutor::Extension for BackfillDistExecutor<S
         }
         match task.base.step {
             BACKFILL_STEP_READ_INDEX => {
-                crate::job_ctx::attach_top_profiling_info(
-                    meta.job.id,
-                    &meta.job.query.to_utf8_lossy_go(),
-                );
-                crate::job_ctx::set_ddl_source_for_diagnosis(meta.job.id, meta.job.type_);
+                let job_key = crate::job_ctx::JobKey::new(self.ddl.opener.keyspace_id(), meta.job.id);
+                crate::job_ctx::attach_top_profiling_info(job_key, &meta.job.query.to_utf8_lossy_go());
+                crate::job_ctx::set_ddl_source_for_diagnosis(job_key, meta.job.type_);
                 Ok(Arc::new(ReadIndexStepExecutor {
                     info: FrameworkInfoSlot::default(),
                     exec_id: self.base.get_exec_id().to_owned(),
@@ -1570,6 +1578,7 @@ impl<S: StoreClient> ReadIndexStepExecutor<S> {
             reorg: Arc::new(reorg),
             physical_id: sm.physical_table_id,
             warnings: Arc::default(),
+            vardef: executor_vardef(),
         });
         let pipe = super::operators::new_write_index_to_external_storage_pipeline(
             wctx,
@@ -1642,7 +1651,7 @@ impl<S: StoreClient> StepExecutor for ReadIndexStepExecutor<S> {
                 &meta.job,
                 unique,
                 false,
-                crate::cluster_ddl::add_index::job_concurrency(&meta.job),
+                crate::cluster_ddl::add_index::job_concurrency(&meta.job, &executor_vardef()),
                 0,
             )?);
         }
@@ -1747,6 +1756,7 @@ impl<S: StoreClient> StepExecutor for ReadIndexStepExecutor<S> {
                 reorg: Arc::new(reorg.clone()),
                 physical_id: sm.physical_table_id,
                 warnings: Arc::default(),
+                vardef: executor_vardef(),
             });
             // Go `buildLocalStorePipeline`.
             let pipe = super::operators::new_add_index_ingest_pipeline(
@@ -1846,7 +1856,7 @@ fn modify_read_index_task_meta(
     if let (Some(old), Some(new)) = (meta.job.reorg_meta.as_ref(), new.job.reorg_meta.as_ref()) {
         let old = old.read();
         let new = new.read();
-        let defaults = crate::index::reorg_defaults();
+        let defaults = crate::index::reorg_defaults(&executor_vardef());
         let batch_size = new.get_batch_size(defaults);
         if old.get_batch_size(defaults) != batch_size {
             old.set_batch_size(batch_size);
@@ -1870,6 +1880,7 @@ mod cloud_storage_uri_tests {
     fn test_resolve_cloud_storage_uri() {
         let original = tidb_vardef::CLOUD_STORAGE_URI.read().unwrap().clone();
         const JOB_ID: i64 = 900001;
+        const KEY: crate::job_ctx::JobKey = crate::job_ctx::JobKey::new(u32::MAX, JOB_ID);
         let new_job = |use_cloud_storage: bool| {
             let mut meta = tidb_model::DDLReorgMeta::default();
             meta.use_cloud_storage = use_cloud_storage;
@@ -1880,21 +1891,21 @@ mod cloud_storage_uri_tests {
         };
         let set_uri = |uri: &str| *tidb_vardef::CLOUD_STORAGE_URI.write().unwrap() = uri.to_owned();
         let with_cache = |uri: &str| {
-            crate::job_ctx::remove_job_ctx(JOB_ID);
-            crate::job_ctx::with_job_ctx(JOB_ID, |jc| jc.cloud_storage_uri = uri.to_owned());
+            crate::job_ctx::remove_job_ctx(KEY);
+            crate::job_ctx::with_job_ctx(KEY, |jc| jc.cloud_storage_uri = uri.to_owned());
         };
 
         // A configured URI recovers an empty owner cache.
         set_uri("s3://bucket");
         with_cache("");
-        let uri = resolve_cloud_storage_uri(&new_job(true), false).unwrap();
+        let uri = resolve_cloud_storage_uri(KEY, &new_job(true), false).unwrap();
         assert_eq!(uri, "s3://bucket/dxf/");
-        assert_eq!(crate::job_ctx::with_job_ctx(JOB_ID, |jc| jc.cloud_storage_uri.clone()), uri);
+        assert_eq!(crate::job_ctx::with_job_ctx(KEY, |jc| jc.cloud_storage_uri.clone()), uri);
 
         // A missing configured URI is unretryable.
         set_uri("");
         with_cache("");
-        let Err(ClusterDdlError::Backfill(error)) = resolve_cloud_storage_uri(&new_job(true), false) else {
+        let Err(ClusterDdlError::Backfill(error)) = resolve_cloud_storage_uri(KEY, &new_job(true), false) else {
             panic!("an empty URI fails the job");
         };
         assert!(
@@ -1906,18 +1917,18 @@ mod cloud_storage_uri_tests {
         // The cached URI wins over a changed configuration.
         set_uri("s3://new-bucket");
         with_cache("s3://cached-bucket/dxf/");
-        assert_eq!(resolve_cloud_storage_uri(&new_job(true), false).unwrap(), "s3://cached-bucket/dxf/");
+        assert_eq!(resolve_cloud_storage_uri(KEY, &new_job(true), false).unwrap(), "s3://cached-bucket/dxf/");
 
         // Local sort permits an empty URI.
         set_uri("");
         with_cache("");
-        assert_eq!(resolve_cloud_storage_uri(&new_job(false), false).unwrap(), "");
+        assert_eq!(resolve_cloud_storage_uri(KEY, &new_job(false), false).unwrap(), "");
 
         // Merge temp index does not require cloud storage.
         with_cache("");
-        assert_eq!(resolve_cloud_storage_uri(&new_job(true), true).unwrap(), "");
+        assert_eq!(resolve_cloud_storage_uri(KEY, &new_job(true), true).unwrap(), "");
 
-        crate::job_ctx::remove_job_ctx(JOB_ID);
+        crate::job_ctx::remove_job_ctx(KEY);
         set_uri(&original);
     }
 }
@@ -2012,8 +2023,12 @@ impl tidb_dxf_execute::Collector for DistTaskRowCntCollector {
 /// in the job context, reloaded when a new DDL owner resumes the job. An
 /// empty URI fails the job: recovering needs the user to restore it, and
 /// retrying would leave the job in write reorganization.
-pub(crate) fn resolve_cloud_storage_uri(job: &Job, merge_temp_index: bool) -> Result<String, ClusterDdlError> {
-    let cached = crate::job_ctx::with_job_ctx(job.id, |jc| jc.cloud_storage_uri.clone());
+pub(crate) fn resolve_cloud_storage_uri(
+    job_key: crate::job_ctx::JobKey,
+    job: &Job,
+    merge_temp_index: bool,
+) -> Result<String, ClusterDdlError> {
+    let cached = crate::job_ctx::with_job_ctx(job_key, |jc| jc.cloud_storage_uri.clone());
     if merge_temp_index
         || !job.reorg_meta.as_ref().is_some_and(|meta| meta.read().use_cloud_storage)
         || !cached.is_empty()
@@ -2021,7 +2036,7 @@ pub(crate) fn resolve_cloud_storage_uri(job: &Job, merge_temp_index: bool) -> Re
         return Ok(cached);
     }
     let cloud_storage_uri = tidb_dxf_handle::get_cloud_storage_uri(tidb_dxf_handle::cluster_id());
-    crate::job_ctx::with_job_ctx(job.id, |jc| jc.cloud_storage_uri = cloud_storage_uri.clone());
+    crate::job_ctx::with_job_ctx(job_key, |jc| jc.cloud_storage_uri = cloud_storage_uri.clone());
     if cloud_storage_uri.is_empty() {
         return Err(ClusterDdlError::backfill(&tidb_dbterror::ERR_INGEST_FAILED.gen_with_stack_by_args(&[format!(
             "cloud storage URI is empty for add-index job {} with cloud storage enabled",
@@ -2043,10 +2058,15 @@ pub(super) fn execute_dist_task<S: StoreClient>(
     step_cancelled: &AtomicBool,
 ) -> Result<ReorgResult, ClusterDdlError> {
     let ctx = Context::background();
+    // The values of the keyspace whose DDL runs this step; the modify loop
+    // runs on a thread of its own.
+    let vardef = tidb_vardef::snapshot::current();
     let builder = crate::index::TaskKeyBuilder::new().set_merge_temp_index(reorg.merging);
+    // The task belongs to the keyspace of the store this DDL runs on.
+    let keyspace = opener.store().get_keyspace();
     let key = match &job.multi_schema_info {
-        Some(m) => builder.set_multi_schema(Some(&m.read())).build(job.id),
-        None => builder.build(job.id),
+        Some(m) => builder.set_multi_schema(Some(&m.read())).build_in_keyspace(keyspace, job.id),
+        None => builder.build_in_keyspace(keyspace, job.id),
     };
     let manager = tidb_dxf_storage::get_dxf_svc_task_mgr()
         .map_err(|e| ClusterDdlError::backfill(&e))?;
@@ -2066,7 +2086,7 @@ pub(super) fn execute_dist_task<S: StoreClient>(
             let reorg_meta = task_meta.job.reorg_meta.as_ref().expect("a backfill task's job has reorg meta").read();
             last = (
                 task.base.required_slots as i64,
-                reorg_meta.get_batch_size(crate::index::reorg_defaults()),
+                reorg_meta.get_batch_size(crate::index::reorg_defaults(&vardef)),
                 reorg_meta.get_max_write_speed(),
             );
             drop(reorg_meta);
@@ -2088,14 +2108,18 @@ pub(super) fn execute_dist_task<S: StoreClient>(
                     sess_pool,
                     reorg.table.id,
                 ) as _,
-                cloud_storage_uri: resolve_cloud_storage_uri(job, reorg.merging)?,
+                cloud_storage_uri: resolve_cloud_storage_uri(
+                    crate::job_ctx::JobKey::new(opener.keyspace_id(), job.id),
+                    job,
+                    reorg.merging,
+                )?,
                 version: crate::backfilling_dist_executor::BACKFILL_TASK_META_VERSION_1,
                 ..Default::default()
             };
             let config = job.reorg_meta.as_ref().unwrap().read();
             last = (
                 required_slots as i64,
-                config.get_batch_size(crate::index::reorg_defaults()),
+                config.get_batch_size(crate::index::reorg_defaults(&vardef)),
                 config.get_max_write_speed(),
             );
             tidb_dxf_handle::submit_task_with_extra_params(
@@ -2126,6 +2150,7 @@ pub(super) fn execute_dist_task<S: StoreClient>(
         scope.spawn(|| {
             crate::index::modify_task_param_loop(
                 &ctx,
+                &vardef,
                 &sys_tbl_mgr,
                 manager.as_ref(),
                 &done,
@@ -2136,7 +2161,7 @@ pub(super) fn execute_dist_task<S: StoreClient>(
                 last.2,
             );
         });
-        let result = wait_dist_task(opener, sess_pool, reorg, job, check_owner, step_cancelled, &ctx, &key, &manager, &task);
+        let result = wait_dist_task(opener, sess_pool, reorg, job, check_owner, step_cancelled, &ctx, &key, &manager, &task, &vardef);
         drop(done_tx);
         result
     })
@@ -2156,6 +2181,7 @@ fn wait_dist_task<S: StoreClient>(
     key: &str,
     manager: &Arc<tidb_dxf_storage::TaskManager>,
     task: &Task,
+    vardef: &tidb_vardef::VardefSnapshot,
 ) -> Result<ReorgResult, ClusterDdlError> {
     loop {
         if !reorg_runnable(step_cancelled, check_owner)? {
@@ -2205,7 +2231,7 @@ fn wait_dist_task<S: StoreClient>(
                     // remote duplicates fail the job.
                     let cloud = job.reorg_meta.as_ref().is_some_and(|m| m.read().use_cloud_storage);
                     if !cloud && !reorg.merging {
-                        if let Err(error) = check_duplicate_for_unique_index(opener, reorg, job) {
+                        if let Err(error) = check_duplicate_for_unique_index(opener, reorg, job, vardef) {
                             let mut cause = error.as_ref() as &(dyn std::error::Error + 'static);
                             while let Some(source) = cause.source() {
                                 cause = source;

@@ -17,10 +17,11 @@
 //! `ResourceManagerClient` writes `infosync.AddResourceGroup`,
 //! `ModifyResourceGroup` and `DeleteResourceGroup` make, and
 //! `resource_manager_client.go`'s `mockResourceManagerClient`, which a store
-//! without PD gets (`InfoSyncer.initResourceManagerClient(nil)`).
+//! without PD gets (`InfoSyncer.initResourceManagerClient(nil)`). The
+//! `infosync` calls over it are in [`crate::info_syncer`].
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{PoisonError, RwLock};
 
 use tidb_proto::resource_manager as rmpb;
 
@@ -41,6 +42,15 @@ pub trait ResourceManagerClient: Send + Sync {
         Err(format!(
             "the group {name} cannot be read through this client"
         ))
+    }
+    /// The group `name`, `None` when PD holds none (a client that answers
+    /// "does not exist" holds none).
+    fn lookup_resource_group(&self, name: &str) -> Result<Option<rmpb::ResourceGroup>, String> {
+        match self.get_resource_group(name) {
+            Ok(group) => Ok(Some(group)),
+            Err(error) if error.contains("does not exist") => Ok(None),
+            Err(error) => Err(error),
+        }
     }
     /// Go `ListResourceGroups`, as [`Self::get_resource_group`].
     fn list_resource_groups(&self) -> Result<Vec<rmpb::ResourceGroup>, String> {
@@ -141,50 +151,6 @@ impl ResourceManagerClient for MockResourceManagerClient {
             .remove(name);
         Ok("Success!".to_owned())
     }
-}
-
-/// The `InfoSyncer`'s `resourceManagerClient`.
-static CLIENT: Mutex<Option<Arc<dyn ResourceManagerClient>>> = Mutex::new(None);
-
-fn client() -> Arc<dyn ResourceManagerClient> {
-    Arc::clone(
-        CLIENT
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert_with(|| Arc::new(MockResourceManagerClient::new())),
-    )
-}
-
-/// Go `InfoSyncer.initResourceManagerClient`: PD's client, or the mock when
-/// there is none.
-pub fn init_resource_manager_client(client: Option<Arc<dyn ResourceManagerClient>>) {
-    *CLIENT.lock().unwrap_or_else(PoisonError::into_inner) =
-        Some(client.unwrap_or_else(|| Arc::new(MockResourceManagerClient::new())));
-}
-
-/// Go `infosync.GetResourceGroup`.
-pub fn get_resource_group(name: &str) -> Result<rmpb::ResourceGroup, String> {
-    client().get_resource_group(name)
-}
-
-/// Go `infosync.ListResourceGroups`.
-pub fn list_resource_groups() -> Result<Vec<rmpb::ResourceGroup>, String> {
-    client().list_resource_groups()
-}
-
-/// Go `infosync.AddResourceGroup`.
-pub fn add_resource_group(group: rmpb::ResourceGroup) -> Result<(), String> {
-    client().add_resource_group(group).map(|_| ())
-}
-
-/// Go `infosync.ModifyResourceGroup`.
-pub fn modify_resource_group(group: rmpb::ResourceGroup) -> Result<(), String> {
-    client().modify_resource_group(group).map(|_| ())
-}
-
-/// Go `infosync.DeleteResourceGroup`.
-pub fn delete_resource_group(name: &str) -> Result<(), String> {
-    client().delete_resource_group(name).map(|_| ())
 }
 
 #[cfg(test)]

@@ -461,14 +461,14 @@ pub(crate) fn tiflash_replica_rows(catalog: &SessionExtendedInfoSchema, visibili
             } else {
                 ids.iter()
                     .map(|id| {
-                        tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(*id)
+                        tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(*id)
                             .unwrap_or(fallback)
                     })
                     .sum::<f64>()
                     / ids.len() as f64
             }
         } else {
-            tidb_domain_infosync::tiflash_manager::get_tiflash_progress_from_cache(table.table_id())
+            tidb_domain_infosync::info_syncer::get_tiflash_progress_from_cache(table.table_id())
                 .unwrap_or(fallback)
         };
         let progress = tidb_datatype::truncate(progress, 2);
@@ -1178,15 +1178,19 @@ fn information_schema_tables_rows(zone: &tidb_datatype::SessionTimeZone) -> Vec<
 
 /// Go `memtableRetriever.setDataForAttributes`: each label rule naming a
 /// table or partition that still exists, and whose table the session may
-/// SELECT from. A malformed rule is skipped (Go logs it).
+/// SELECT from. A malformed rule is skipped (Go logs it). The rules are
+/// those of the session's domain's `info_syncer` (design §6.2).
 pub fn set_data_for_attributes(
     catalog: &SessionExtendedInfoSchema,
     visibility: &SchemaVisibility,
+    info_syncer: &tidb_domain_infosync::info_syncer::InfoSyncer,
 ) -> Result<Vec<Vec<Datum>>, crate::DriverError> {
     use tidb_ddl_label as ddl_label;
-    // Go `infosync.GetAllLabelRules`: the node's label-rule manager.
-    let rules = tidb_domain_infosync::label_manager::label_rule_manager()
-        .get_all_label_rules(&ddl_label::CodecV1)
+    // Go `infosync.GetAllLabelRules`: the domain's label-rule manager, whose
+    // rules of the domain's keyspace it lists.
+    let rules = info_syncer
+        .label_rule_manager()
+        .get_all_label_rules(info_syncer.label_codec())
         .map_err(|error| {
             crate::DriverError::unsupported(format!("get the label rules failed: {error}"))
         })?;

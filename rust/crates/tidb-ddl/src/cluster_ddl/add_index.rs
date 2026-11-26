@@ -842,8 +842,8 @@ pub(super) fn reorg_sub_job(job: &Job) -> Option<i32> {
 use tidb_ddl_build::session_pool::ReorgSessionVars;
 
 
-pub(crate) fn job_batch_size(job: &Job) -> usize {
-    let defaults = crate::index::reorg_defaults();
+pub(crate) fn job_batch_size(job: &Job, vardef: &tidb_vardef::VardefSnapshot) -> usize {
+    let defaults = crate::index::reorg_defaults(vardef);
     job.reorg_meta
         .as_ref()
         .map_or(
@@ -854,8 +854,8 @@ pub(crate) fn job_batch_size(job: &Job) -> usize {
 }
 
 /// Go `ReorgMeta.GetConcurrency`.
-pub(crate) fn job_concurrency(job: &Job) -> usize {
-    let defaults = crate::index::reorg_defaults();
+pub(crate) fn job_concurrency(job: &Job, vardef: &tidb_vardef::VardefSnapshot) -> usize {
+    let defaults = crate::index::reorg_defaults(vardef);
     job.reorg_meta
         .as_ref()
         .map_or(
@@ -909,12 +909,12 @@ fn merge_physical_ids(table: &TableInfo, indexes: &[GoShared<IndexInfo>]) -> Vec
 /// Go `loadCloudStorageURI`: a distributed reorganization sorts in cloud
 /// storage when `tidb_cloud_storage_uri` is set; the owner's job context
 /// keeps the URI for the task (`resolve_cloud_storage_uri`).
-pub(super) fn load_cloud_storage_uri(job: &Job) {
+pub(super) fn load_cloud_storage_uri(job_key: crate::job_ctx::JobKey, job: &Job) {
     let Some(meta) = job.reorg_meta.as_ref() else {
         return;
     };
     let cloud_storage_uri = tidb_dxf_handle::get_cloud_storage_uri(tidb_dxf_handle::cluster_id());
-    crate::job_ctx::with_job_ctx(job.id, |jc| jc.cloud_storage_uri = cloud_storage_uri.clone());
+    crate::job_ctx::with_job_ctx(job_key, |jc| jc.cloud_storage_uri = cloud_storage_uri.clone());
     let mut meta = meta.write();
     meta.use_cloud_storage = !cloud_storage_uri.is_empty() && meta.is_dist_reorg;
     drop(meta);
@@ -1324,7 +1324,7 @@ pub(super) fn plan_persisted_add_index_job_step(
     match original_state {
         SchemaState::NONE => {
             // Go `initForReorgIndexes`.
-            load_cloud_storage_uri(&active.job);
+            load_cloud_storage_uri(txn.job_key(active.job.id), &active.job);
             let reorg_type = match pick_backfill_type(&active.job) {
                 Ok(reorg_type) => reorg_type,
                 Err(error) => return Err(cancel_ddl_job(active, error)),
@@ -1466,14 +1466,24 @@ pub(super) fn on_create_columnar_index(
             }
             // Send sync schema notification to TiFlash.
             if active.job.snapshot_version == 0 {
-                tidb_domain_infosync::tiflash_manager::sync_tiflash_table_schema(info.id)
-                    .map_err(DdlPlanError::Encode)?;
+                if super::step_pd_write("COLUMNAR INDEX")? {
+                    tidb_domain_infosync::info_syncer::sync_tiflash_table_schema(info.id)
+                        .map_err(DdlPlanError::Encode)?;
+                }
                 // Go `getValidCurrentVersion`; the step's start timestamp
                 // is a version the store has reached.
                 active.job.snapshot_version = start_ts;
                 return Ok(action_step(super::job_only_write(active.job.id, Vec::new())));
             }
-            // Check the progress of the TiFlash backfill index.
+            // Check the progress of the TiFlash backfill index. The TiKV and
+            // TiFlash progress requests name only the table and index IDs,
+            // which another tenant on a multi-keyspace node may also use
+            // (design §10 phase 2): a step that can be cancelled is refused,
+            // and one that cannot rolls back rather than trust them.
+            if !super::step_pd_write("COLUMNAR INDEX")? {
+                let error = super::multi_keyspace_refusal("COLUMNAR INDEX");
+                return columnar_index_rollback_step(txn, active, &mut info, &indexes, error, start_ts);
+            }
             let index_id = indexes[0].read().id;
             match check_columnar_index_process(txn, &mut active.job, info.id, index_id) {
                 Ok(true) => {}
@@ -1567,14 +1577,14 @@ fn check_columnar_index_process(
 /// Go `checkColumnarIndexProcessFromTiKV` checks the backfill process of a
 /// columnar index from TiKV.
 pub(crate) fn check_columnar_index_process_from_tikv(table_id: i64, index_id: i64) -> Result<bool, DdlPlanError> {
-    use tidb_domain_infosync::tiflash_manager;
-    let tikv_stats = tiflash_manager::get_tiflash_stores_stat().map_err(DdlPlanError::Encode)?;
+    use tidb_domain_infosync::{info_syncer, tiflash_manager};
+    let tikv_stats = info_syncer::get_tiflash_stores_stat().map_err(DdlPlanError::Encode)?;
     let tikv_stores: Vec<_> = tikv_stats
         .stores
         .into_iter()
         .filter(|store| !tiflash_manager::is_tiflash_http_resp(&store.store))
         .collect();
-    let progress = tiflash_manager::calculate_columnar_index_progress(table_id, index_id, &tikv_stores)
+    let progress = info_syncer::calculate_columnar_index_progress(table_id, index_id, &tikv_stores)
         .map_err(DdlPlanError::Encode)?;
     Ok(progress >= 1.0)
 }
@@ -1842,8 +1852,8 @@ pub(super) fn do_reorg_work_for_create_index(
             index_ids: indexes.iter().map(|index| index.read().id).collect(),
             merging,
             physical_ids: if merging { merge_physical_ids(info, indexes) } else { physical_ids(info) },
-            batch_size: job_batch_size(&active.job),
-            concurrency: job_concurrency(&active.job),
+            batch_size: job_batch_size(&active.job, &tidb_vardef::snapshot::current()),
+            concurrency: job_concurrency(&active.job, &tidb_vardef::snapshot::current()),
             session_vars: ReorgSessionVars::of_job(&active.job),
             row_count: active.job.row_count,
             column: None,

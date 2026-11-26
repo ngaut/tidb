@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use crate::cluster_stack::{cluster_session_stack, ClusterStack};
+use crate::keyspace_runtime::KeyspaceRuntime;
 use tidb_domain_core::node_config::NodeConfig;
 use crate::process_shutdown::run_with_process_shutdown;
 use tidb_session::domain::real_tikv_node::RunConfiguredNodeError;
@@ -52,7 +53,7 @@ pub fn realtikv_test_stack(
     let spill_storage = crate::open_spill_storage(config)?;
     let global_vars = tidb_domain::global_sysvars::GlobalSysvars::before_domain();
     crate::set_global_vars::set_global_vars(config, &global_vars);
-    let (mut stack, authority) = cluster_session_stack(config, global_vars, spill_storage, None)?;
+    let (mut stack, authority) = cluster_session_stack(config, global_vars, spill_storage, None, None)?;
     install_brie_node(&stack, &authority);
     let dist_task_loop = stack
         .factory
@@ -64,7 +65,7 @@ pub fn realtikv_test_stack(
 
 /// Go `tidbGlue`: a BRIE statement's tasks back up and restore this node's
 /// TiKV store, through its domain and sessions.
-fn install_brie_node(
+pub(crate) fn install_brie_node(
     stack: &ClusterStack,
     authority: &tidb_store_driver::real_tikv_read::ProductionReadProcessAuthority,
 ) {
@@ -80,7 +81,7 @@ fn install_brie_node(
 /// campaigning for its leader key through the store's (keyspace-prefixed)
 /// etcd client with `AdvertiseAddress:StatusPort` as its ID. Go logs and
 /// serves without it when the store has no etcd.
-fn setup_auto_id_service(
+pub(crate) fn setup_auto_id_service(
     config: &NodeConfig,
     stack: &ClusterStack,
     authority: &tidb_store_driver::real_tikv_read::ProductionReadProcessAuthority,
@@ -123,73 +124,39 @@ pub(crate) fn run_cluster_session_node_with_spill(
     spill_storage: Arc<tidb_spill_storage::SpillStorage>,
     memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
 ) -> Result<(), RunConfiguredNodeError> {
-    // Go `setGlobalVars`, before the store and the domain are created.
-    let global_vars = tidb_domain::global_sysvars::GlobalSysvars::before_domain();
-    crate::set_global_vars::set_global_vars(&config, &global_vars);
-    let (mut stack, authority) =
-        cluster_session_stack(&config, global_vars, spill_storage, memory_arbitrator)?;
-    // Go `store/driver` -> `gcworker.NewGCWorker` + `Start`: the GC leader
-    // lease, safe points, lock resolution and delete ranges on TiKV. It
-    // retires with the stack's workers, right after the replica-read checker.
-    let gc_worker = tidb_gcworker::node::start_gc_worker(
-        &stack.factory,
-        authority.tikv_store(),
-        Arc::new(authority.transaction_opener()),
-    )
-    .map_err(|error| {
-        RunConfiguredNodeError::Engine(SqlQueryError::unknown(format!(
-            "start gc worker failed: {error}"
-        )))
-    })?;
-    stack.workers.insert(1, Box::new(gc_worker));
-    // Go `importinto`'s `init` registers the IMPORT INTO task type; its
-    // tasks import into this node's TiKV store.
-    tidb_dxf_importinto::register();
-    // Go `executor.RunImportQuery`, which the query step's workers call.
-    tidb_session::import_query::register_import_query_runner();
-    // Go `handle.GetCloudStorageURI` reads the cluster ID from the store.
-    tidb_dxf_handle::set_cluster_id(authority.tikv_store().cluster_id());
-    tidb_dxf_importinto::set_import_store(Some(Arc::new(crate::import_store::TikvImportStore::new(
-        authority.tikv_store().clone(),
-        Arc::clone(&stack.factory),
-    ))));
-    install_brie_node(&stack, &authority);
+    let multi_keyspace = crate::keyspace_registry::MultiKeyspaceDev::for_node(&config)
+        .map(|dev| (dev, Arc::clone(&spill_storage), memory_arbitrator.clone()));
+    // Before the first runtime opens: each runtime's username policy then
+    // prefixes its tenant's accounts (design §6.1).
+    tidb_keyspace::set_multi_keyspace_mode(multi_keyspace.is_some());
+    // A thread that reads the vardef snapshot must carry its keyspace's
+    // (design §6.3); debug builds assert it on a multi-keyspace node.
+    tidb_vardef::snapshot::require_entered_scope(multi_keyspace.is_some());
+    // On a multi-keyspace node the configured keyspace's open is that
+    // tenant's (design §6.1).
+    let tenant = multi_keyspace
+        .is_some()
+        .then(|| tidb_logutil::enter_tenant(&config.global_config.keyspace_name));
+    // One server ID and connection-ID allocator for every runtime of a
+    // multi-keyspace node, reserved in SYSTEM first (design §6.6).
+    let process_id = multi_keyspace
+        .is_some()
+        .then(|| crate::keyspace_runtime::ProcessServerId::reserve(&config).map(Arc::new))
+        .transpose()?;
+    // The configured keyspace reads the process statics (design §6.3).
+    let (runtime, authority) =
+        KeyspaceRuntime::open(&config, spill_storage, memory_arbitrator, false, process_id.as_deref())?;
+    drop(tenant);
     // Go `main`: `if deploymode.IsStarter() { externalWorkloadManager :=
     // initExternalWorkloadManager(ctx, storage); defer close... }`.
     let _external_workload_manager = tidb_config_deploymode::is_starter()
         .then(|| crate::standby_node::init_external_workload_manager(authority.tikv_store().store().keyspace_meta()))
         .flatten()
         .map(crate::standby_node::ExternalWorkloadManagerGuard);
-    // Go `BootstrapSession` ends with `dom.InitDistTaskLoop()`; the loop
-    // retires before the GC worker, as Go's `Domain.Close` stops it before
-    // the store closes.
-    let dist_task_loop = stack
-        .factory
-        .init_dist_task_loop()
-        .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?;
-    stack.workers.insert(1, Box::new(dist_task_loop));
-    // Go `TestHandler`'s `gcworker.RunResolveLocks(ctx, h.Store,
-    // h.RegionCache.PDClient(), safePoint, "testGCWorker", 3)`.
-    let gc_deps = tidb_gcworker::node::gc_worker_deps(
-        &stack.factory,
-        authority.tikv_store(),
-        Arc::new(authority.transaction_opener()),
-    );
-    let gc_resolve_locks: Option<crate::http_status::GcResolveLocks> = Some(Arc::new(move |safe_point| {
-        tidb_gcworker::run_resolve_locks(gc_deps.clone(), safe_point, "testGCWorker", 3).map_err(|error| error.to_string())
-    }));
-    // Go `repository.SetupRepository(dom)` in the server's main; the worker
-    // retires last of the workers, and `StopRepository` stops it first.
-    let workload_repository = tidb_workloadrepo::node::setup_repository(&stack.factory);
-    stack.workers.push(Box::new(Arc::clone(&workload_repository)));
-    // Go `startStatusServerAndRPCServer`'s `setupAutoIDService`: a TiKV
-    // node with a status port serves the AutoID service.
-    let auto_id = if config.report_status {
-        setup_auto_id_service(&config, &stack, &authority)
-    } else {
-        None
-    };
-    run_with_process_shutdown(stack, authority, move |mut stack: ClusterStack| {
+    run_with_process_shutdown(runtime, authority, move |mut runtime: KeyspaceRuntime| {
+        let stack = &runtime.stack;
+        let auto_id = runtime.auto_id.clone();
+        let gc_resolve_locks = runtime.gc_resolve_locks.clone();
         let factory = Arc::clone(&stack.factory);
         let users = Arc::clone(&stack.users);
         let settings = crate::node_status::status_settings(&factory);
@@ -216,12 +183,29 @@ pub(crate) fn run_cluster_session_node_with_spill(
         let metrics_profile = Some(crate::node_status::metrics_profile_session(&factory));
         crate::node_status::setup_top_profiling(&factory);
         let keyspace_domain = Some(Arc::clone(&factory));
-        let node =
+        // Development multi-keyspace serving: the other allowed keyspaces
+        // open on their first connection (`crate::keyspace_registry`).
+        let registry = multi_keyspace.map(|(dev, spill_storage, memory_arbitrator)| {
+            Arc::new(crate::keyspace_registry::KeyspaceRegistry::new(
+                config.clone(),
+                (Arc::clone(&factory), Arc::clone(&users)),
+                spill_storage,
+                memory_arbitrator,
+                process_id.clone(),
+                dev,
+            ))
+        });
+        let mut node =
             ConcurrentSqlNode::bind(&config, factory, Arc::clone(&users)).map_err(|error| {
                 tidb_session::domain::real_tikv_node::emit_connections_startup_failure(&error);
                 RunConfiguredNodeError::Node(Box::new(error))
             })?
             .with_auto_id_service(auto_id.clone());
+        if let Some(registry) = &registry {
+            let tls = node.tls_manager();
+            registry.set_tls(tls.clone(), tls.variables());
+            node = node.with_router(Arc::clone(registry) as Arc<dyn crate::keyspace_registry::ConnectionRouter<_>>);
+        }
         let _status_server = start_cluster_status(
             &config,
             node.tracker(),
@@ -270,34 +254,18 @@ pub(crate) fn run_cluster_session_node_with_spill(
             stack.stats_receipt.pseudo,
         );
         let outcome = node.run().map_err(|error| RunConfiguredNodeError::Node(Box::new(error)));
-        // Go `Server.closeListener`: `if !deploymode.IsStarter() ||
-        // s.StandbyController == nil { s.AutoIDServiceClose() }` -- the
-        // standby shutdown closed it already.
-        if !tidb_config_deploymode::is_starter()
-            || crate::standby_node::server_standby_controller().is_none()
-        {
-            if let Some(service) = &auto_id {
-                service.close();
-            }
+        if let Some(registry) = &registry {
+            registry.close_extra_keyspaces();
         }
-        workload_repository.stop();
-        // The reload threads hold their own transaction openers; joining
-        // them here releases those PD handles before the authority's
-        // shutdown drain.
-        for worker in stack.workers.drain(..) {
-            drop(worker);
-        }
-        // Go `closeDomainAndStorage`'s `dom.Close()`: the DDL stops and its
-        // owner lease is revoked now, whoever still holds the domain.
-        stack.factory.close();
+        runtime.retire();
         // The status callback retains the factory. Its final drop joins
         // internal workers and flushes statistics while timestamp and
         // identity leases still protect those storage transactions.
         drop(_status_server);
-        stack.stop_resource_groups();
-        for lease in stack.leases.drain(..) {
-            drop(lease);
-        }
+        drop(registry);
+        runtime.release();
+        // The SYSTEM reservation outlives every runtime's.
+        drop(process_id);
         outcome
     })
 }

@@ -14,9 +14,9 @@
 
 //! Go `infosync`'s label-rule manager (`pkg/domain/infosync/label_manager.go`):
 //! the `LabelRuleManager` seam, `mockLabelManager` (the manager a store
-//! without PD gets), and the package-level `PutLabelRule`, `UpdateLabelRules`,
-//! `GetAllLabelRules` and `GetLabelRules` over the node's manager, which
-//! `InfoSyncer.initLabelRuleManager` installs. `PDLabelManager` lives with the
+//! without PD gets). The package-level calls reach the manager
+//! `InfoSyncer.initLabelRuleManager` installs through
+//! [`crate::info_syncer::label_rule_manager`]. `PDLabelManager` lives with the
 //! node's PD HTTP client (`crate::label_delivery`).
 //!
 //! The in-process catalog owns a mock of its own, shared by every snapshot of
@@ -108,28 +108,6 @@ impl LabelRuleManager for MockLabelManager {
         }
         Ok(rules)
     }
-}
-
-/// The `InfoSyncer`'s `labelRuleManager`.
-static LABEL_RULE_MANAGER: Mutex<Option<Arc<dyn LabelRuleManager>>> = Mutex::new(None);
-
-/// Go `InfoSyncer.initLabelRuleManager`: PD's manager, or a fresh mock when
-/// the node has no PD.
-pub fn init_label_rule_manager(manager: Option<Arc<dyn LabelRuleManager>>) {
-    *LABEL_RULE_MANAGER
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) =
-        Some(manager.unwrap_or_else(|| Arc::new(MockLabelManager::default())));
-}
-
-/// The node's label-rule manager; a node that installed none gets a mock.
-pub fn label_rule_manager() -> Arc<dyn LabelRuleManager> {
-    Arc::clone(
-        LABEL_RULE_MANAGER
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert_with(|| Arc::new(MockLabelManager::default())),
-    )
 }
 
 /// A job step's view of the label rules while its writes are still pending:

@@ -149,7 +149,9 @@ impl<S: PdClient> TikvTxn<S> {
             sql_staging: false,
             check_existence: false,
             start_ts,
-            _start_ts_guard: tidb_txnkv::inner_txn::ACTIVE_START_TS.hold(start_ts),
+            _start_ts_guard: tidb_txnkv::inner_txn::ACTIVE_START_TS
+                .of(tidb_keyspace::KeyspaceCodec::keyspace_id(store))
+                .hold(start_ts),
             authority_id,
             snapshot_stats,
             reader_snapshot_stats: None,
@@ -223,6 +225,10 @@ impl tikv_client::KvFilter for TidbKvFilter {
     }
 }
 impl<S: PdClient> TikvTxn<S> {
+    /// The keyspace of the transaction's store (empty for an API-v1 store).
+    pub fn store_keyspace(&self) -> &str {
+        self.store.get_keyspace()
+    }
     /// The immutable transaction start timestamp.
     pub const fn start_ts(&self) -> u64 {
         self.start_ts

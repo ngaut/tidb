@@ -1015,6 +1015,9 @@ pub struct Session {
     pub(crate) cross_ks: bool,
     /// Go `session.store.GetCodec().GetKeyspaceID`, immutable while NodeConn is borrowed.
     store_keyspace_id: u32,
+    /// The keyspace identity of the session's domain (design §6.1), read
+    /// once like `store_keyspace_id`; `None` follows the process's settings.
+    keyspace: Option<Arc<tidb_keyspace::KeyspaceContext>>,
 }
 
 use tidb_sessmgr::normalize_statement_digest;
@@ -1242,6 +1245,7 @@ impl Session {
             current_plan_nil: false,
             pending_explain_analyze: None,
             store_keyspace_id: node.keyspace_id(),
+            keyspace: node.keyspace_context(),
             node: Some(node),
             cross_ks: false,
         }
@@ -1484,6 +1488,17 @@ impl tikv_client::kv::KillSignalHandler for SqlKillerSignalHandler {
 }
 
 impl Session {
+    /// The keyspace this session acts for (design §6.1): its domain's
+    /// runtime identity, or the process's configured keyspace for a session
+    /// whose domain bound none. Its slow-log and statement-summary keyspace,
+    /// resource-group tags, username policy and IMPORT INTO keys read it.
+    #[must_use]
+    pub fn keyspace_context(&self) -> Arc<tidb_keyspace::KeyspaceContext> {
+        self.keyspace
+            .clone()
+            .unwrap_or_else(|| Arc::new(tidb_keyspace::KeyspaceContext::unbound()))
+    }
+
     /// The session's SQL killer (Go `SessionVars.SQLKiller`), where the
     /// connection installs its liveness probe.
     #[must_use]
@@ -3836,6 +3851,8 @@ mod tests_fix_control;
 #[cfg(test)]
 mod tests_foreign_key;
 #[cfg(test)]
+mod tests_keyspace_vardef;
+#[cfg(test)]
 mod tests_generated_columns;
 #[cfg(test)]
 mod tests_global_vars;
@@ -4104,6 +4121,12 @@ impl tidb_executor::sessionctx::SessionContext for Session {
 impl tidb_planner::plan_builder::stmt_build::SessionPlanContext for Session {
     fn snapshot_ts(&self) -> u64 { self.vars.snapshot_ts() }
 
+    fn keyspace_name(&self) -> String { self.keyspace_context().name().to_owned() }
+
+    fn resource_control_strict_mode(&self) -> bool {
+        self.vars.vardef().enable_resource_control_strict_mode().load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn refresh_snapshot_info_schema(
         &self,
         ts: u64,
@@ -4175,10 +4198,14 @@ impl tidb_planner::plan_builder::stmt_build::SessionPlanContext for Session {
                 .map(|value| tidb_variable::varsutil::parse_analyze_skip_column_types(&value))
                 .unwrap_or_default(),
             // Go `vardef.PersistAnalyzeOptions` / `vardef.AnalyzeColumnOptions`:
-            // process-wide, set by the global variables' hooks.
-            persist_analyze_options: tidb_vardef::PERSIST_ANALYZE_OPTIONS.load(std::sync::atomic::Ordering::SeqCst),
+            // the session's keyspace's, set by the global variables' hooks.
+            persist_analyze_options: vars.vardef().persist_analyze_options().load(std::sync::atomic::Ordering::SeqCst),
+            default_num_buckets: vars.vardef().analyze_default_num_buckets().load(std::sync::atomic::Ordering::SeqCst),
+            default_num_topn: vars.vardef().analyze_default_num_top_n().load(std::sync::atomic::Ordering::SeqCst),
             analyze_column_options: {
-                let value = tidb_vardef::ANALYZE_COLUMN_OPTIONS
+                let value = vars
+                    .vardef()
+                    .analyze_column_options()
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();

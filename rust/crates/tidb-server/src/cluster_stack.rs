@@ -105,6 +105,7 @@ pub fn cluster_session_stack(
     global_vars: tidb_domain::global_sysvars::GlobalSysvars,
     spill_storage: Arc<tidb_spill_storage::SpillStorage>,
     memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
+    process_id: Option<&crate::keyspace_runtime::ProcessServerId>,
 ) -> Result<(ClusterStack, ProductionReadProcessAuthority), RunConfiguredNodeError> {
     // Go `tikv.NewKVStore` in `driver.TiKVDriver.Open`: the node's one
     // client-rust store, which loads the txn safe point before serving.
@@ -119,16 +120,26 @@ pub fn cluster_session_stack(
         store_config,
     )
     .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?;
+    // Go `InfoSyncer`: this runtime's PD managers (design §6.2), which its
+    // domains (the bootstrap's and the serving one) and their DDL use. The
+    // configured keyspace's is also the process's, which a thread that
+    // entered none reads.
+    let info_syncer = Arc::new(tidb_domain_infosync::info_syncer::InfoSyncer::new(
+        tidb_keyspace::KeyspaceCodec::keyspace_id(&tikv_store),
+    ));
+    if !global_vars.vardef().is_per_keyspace() {
+        tidb_domain_infosync::info_syncer::set_global_info_syncer(Arc::clone(&info_syncer));
+    }
     // Go `InfoSyncer.initResourceManagerClient(pdCli)`, which
     // `domain.Init` runs before `BootstrapSession` reaches `bootstrap`: the
     // resource-group jobs -- the bootstrap's own `ALTER RESOURCE GROUP
-    // default` among them -- write PD's resource manager through it.
-    tidb_domain_infosync::resource_manager_client::init_resource_manager_client(Some(Arc::new(
-        PdResourceManagerClient {
-            store: tikv_store.clone(),
-        },
-    )
-        as Arc<dyn tidb_domain_infosync::resource_manager_client::ResourceManagerClient>));
+    // default` among them -- write PD's resource manager through it, in the
+    // keyspace of the store's PD client.
+    info_syncer.init_resource_manager_client(Some(Arc::new(PdResourceManagerClient {
+        pd: tikv_store.store().pd_client(),
+        store: tikv_store.clone(),
+    })));
+    let _info_syncer = tidb_domain_infosync::info_syncer::enter(Arc::clone(&info_syncer));
     // Go `initDomainSysVars` and `LoadSysVarCacheLoop`: the domain owns the
     // sysvar cache from here, and the SetGlobal hooks run.
     global_vars.arm_domain_hooks();
@@ -193,6 +204,8 @@ pub fn cluster_session_stack(
         ddl_id: ddl_owner.id().to_owned(),
         spill_storage,
         memory_arbitrator,
+        process_id,
+        info_syncer,
     };
     // Go `bootstrapSessionImpl`: the DDL tables, then the bootstrap or the
     // upgrade in a bootstrap domain that is closed again, then the persisted
@@ -281,6 +294,7 @@ pub fn cluster_session_stack(
         Arc::clone(&factory.catalog),
         config.stats_lease,
         factory.advanced_sys_session_pool(),
+        factory.load_workers(),
     )
     .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error.to_string())))?;
     factory.attach_login_storage(&users);
@@ -291,7 +305,9 @@ pub fn cluster_session_stack(
         let info_cache = InfoCacheMinTs(Arc::clone(&factory.catalog));
         runner
             .start_min_start_ts_reporter(move || {
-                let active = tidb_txnkv::ACTIVE_START_TS.snapshot();
+                // This keyspace's transactions only (design §6.5).
+                let keyspace_id = opener.keyspace_id();
+                let active = tidb_txnkv::ACTIVE_START_TS.snapshot_for(keyspace_id);
                 let pl = tidb_sessmgr::processinfo::SessionManager::show_process_list(&processes);
                 let internal = processes.internal_session_start_ts(|id| tidb_stats_handle_util::GLOBAL_AUTO_ANALYZE_PROCESS_LIST.contains(id));
                 // Go `ReportMinStartTS`: `store.CurrentVersion(kv.GlobalTxnScope)`.
@@ -308,7 +324,7 @@ pub fn cluster_session_stack(
                     version,
                     max_wait,
                     &info_cache,
-                    &tidb_txnkv::GLOBAL_INNER_TXN_START_TS,
+                    &tidb_txnkv::GLOBAL_INNER_TXN_START_TS.of(keyspace_id),
                 ))
             })
             .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?;
@@ -454,6 +470,10 @@ struct NodeProcess<'a> {
     ddl_id: String,
     spill_storage: Arc<tidb_spill_storage::SpillStorage>,
     memory_arbitrator: Option<Arc<tidb_memory::MemArbitrator>>,
+    /// A multi-keyspace process's server ID and connection-ID allocator.
+    process_id: Option<&'a crate::keyspace_runtime::ProcessServerId>,
+    /// The runtime's PD managers, which each domain installs.
+    info_syncer: Arc<tidb_domain_infosync::info_syncer::InfoSyncer>,
 }
 
 /// Go `domain.Domain` after `NewDomain`, `Init` and `Start(startMode)`, as
@@ -745,6 +765,15 @@ fn bootstrap(
 /// session factory with its services. [`run_in_bootstrap_session`] builds
 /// one to bootstrap or upgrade the store and closes it; the serving domain is
 /// the second, started in normal mode.
+/// The identity of the keyspace `config` names, over its opened store.
+fn runtime_keyspace_context(
+    config: &NodeConfig,
+    store: &dyn tidb_keyspace::KeyspaceCodec,
+) -> tidb_keyspace::KeyspaceContext {
+    let id = (!store.is_api_v1()).then(|| store.keyspace_id());
+    tidb_keyspace::KeyspaceContext::new(config.global_config.keyspace_name.clone(), id)
+}
+
 fn new_cluster_domain(
     process: &NodeProcess<'_>,
     start_mode: tidb_ddl::StartMode,
@@ -759,6 +788,8 @@ fn new_cluster_domain(
         ddl_id,
         spill_storage,
         memory_arbitrator,
+        process_id,
+        info_syncer,
     } = process;
     let (startup, startup_lease_grant_ts) =
         load_catalog_from_cluster_at(&authority.transaction_opener(), COPROCESSOR_QUERY_TIMEOUT)
@@ -795,6 +826,9 @@ fn new_cluster_domain(
         Arc::clone(&node_auto_ids),
     )
     .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error.to_string())))?;
+    // The schema validator keeps as many deltas as its keyspace's
+    // `tidb_max_delta_schema_count` says (multi-keyspace design §6.3).
+    schema_validator.set_vardef(users.global_vars().vardef());
     // Statistics always resolve targets from this published catalog, so the
     // reload loop follows DDL-added tables and changed column types instead of
     // freezing the boot image.
@@ -838,11 +872,17 @@ fn new_cluster_domain(
             "cluster server identity requires its configured etcd client",
         )));
     }
-    let server_identity = config.global_config.enable_global_kill.then(|| {
-        tidb_domain::server_id::ServerIdAuthority::new(
+    // A multi-keyspace runtime reserves the process's server ID in its
+    // keyspace instead of proposing one (design §6.6).
+    let process_identity = process_id.and_then(|process| process.authority.clone());
+    let server_identity = config.global_config.enable_global_kill.then(|| match (&process_identity, &server_etcd) {
+        (Some(process), Some(etcd)) => {
+            tidb_domain::server_id::ServerIdAuthority::new_tenant_reservation(Arc::clone(etcd), Arc::clone(process))
+        }
+        _ => tidb_domain::server_id::ServerIdAuthority::new(
             server_etcd.clone(),
             config.global_config.enable_32bits_connection_id,
-        )
+        ),
     });
     // Go `Domain.ServerID`: the acquired global server ID, 0 without one.
     let server_id: Arc<dyn Fn() -> u64 + Send + Sync> = match &server_identity {
@@ -871,6 +911,19 @@ fn new_cluster_domain(
             unprefixed_etcd.clone().map(|client| Arc::new(tidb_ddl::etcd_ops::EtcdClientOps::new(client)) as _)
         }),
     );
+    // Only once the reservation holds does the server info publish the ID:
+    // a collision fails the open before anything is published.
+    let reserved_keeper = match (&process_identity, &server_identity) {
+        (Some(_), Some(identity)) => Some(
+            tidb_domain::server_id::ServerIdKeeper::start_reserved(
+                Arc::clone(identity),
+                Arc::clone(&server_info),
+                Default::default(),
+            )
+            .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?,
+        ),
+        _ => None,
+    };
     let mut server_info_runner = match tidb_domain_serverinfo::serverinfo_syncer::SyncerRunner::start(
         Arc::clone(&server_info),
         tidb_domain_serverinfo::serverinfo_syncer::SyncIntervals::default(),
@@ -884,7 +937,9 @@ fn new_cluster_domain(
             )));
         }
     };
-    let server_id_keeper = server_identity
+    let server_id_keeper = match reserved_keeper {
+        Some(keeper) => Some(keeper),
+        None => server_identity
         .as_ref()
         .map(|identity| {
             tidb_domain::server_id::ServerIdKeeper::start(
@@ -894,7 +949,8 @@ fn new_cluster_domain(
             )
         })
         .transpose()
-        .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?;
+        .map_err(|error| RunConfiguredNodeError::Engine(SqlQueryError::unknown(error)))?,
+    };
     // Go `initResourceGroupsController`, after the server ID is fetched.
     let resource_groups_controller = tidb_session::domain::resource_groups_controller::init_resource_groups_controller(
         authority.tikv_store(),
@@ -1031,17 +1087,21 @@ fn new_cluster_domain(
     }));
     // Go `InfoSyncer.initLabelRuleManager`: PD's region-label rules, which
     // the DDL job workers write and `information_schema.attributes` reads.
-    tidb_domain_infosync::label_manager::init_label_rule_manager(pd_http_client.as_ref().map(|client| {
+    info_syncer.init_label_rule_manager(pd_http_client.as_ref().map(|client| {
         Arc::new(tidb_domain_infosync::label_delivery::PdLabelManager::new(client))
             as Arc<dyn tidb_domain_infosync::label_manager::LabelRuleManager>
     }));
     // Go `GlobalInfoSyncerInit`'s `pdHTTPCli`.
-    tidb_domain_infosync::region::init_pd_http_cli(pd_http_client.as_ref());
+    info_syncer.init_pd_http_cli(tidb_domain_infosync::pd_http::pd_http_cli_of(pd_http_client.as_ref()));
     // Go `InfoSyncer.initPlacementManager`: PD's placement rule bundles.
-    tidb_domain_infosync::placement_manager::init_placement_manager(pd_http_client.as_ref().map(|client| {
+    info_syncer.init_placement_manager(pd_http_client.as_ref().map(|client| {
         Arc::new(tidb_domain_infosync::placement_manager::PdPlacementManager::new(client))
             as Arc<dyn tidb_domain_infosync::placement_manager::PlacementManager>
     }));
+    // The upgrade check of keyspace-qualified placement (design §6.2): an
+    // unqualified `TiDB_GLOBAL` bundle a Go or older node left still places
+    // every keyspace's keys until the operator removes it.
+    warn_of_a_legacy_global_bundle(info_syncer);
     // Go `GlobalInfoSyncerInit`'s `etcdCli`, which `GetPrometheusAddr` finds
     // the `metrics_schema` tables' Prometheus through.
     tidb_domain_infosync::prometheus_addr::init_prometheus_addr(
@@ -1050,13 +1110,13 @@ fn new_cluster_domain(
     );
     // Go `InfoSyncer.initScheduleManager`: PD's schedule configuration, which
     // FLASHBACK CLUSTER closes and restores.
-    tidb_domain_infosync::schedule_manager::init_schedule_manager(pd_http_client.as_ref().map(|client| {
+    info_syncer.init_schedule_manager(pd_http_client.as_ref().map(|client| {
         Arc::new(tidb_domain_infosync::schedule_manager::PdScheduleManager::new(client))
             as Arc<dyn tidb_domain_infosync::schedule_manager::ScheduleManager>
     }));
     // Go `InfoSyncer.initTiFlashReplicaManager`: the TiFlash placement rules
     // DDL jobs set and the GC worker deletes.
-    tidb_domain_infosync::tiflash_manager::init_tiflash_replica_manager(pd_http_client.as_ref().map(|client| {
+    info_syncer.init_tiflash_replica_manager(pd_http_client.as_ref().map(|client| {
         Arc::new(tidb_domain_infosync::tiflash_manager::TiFlashReplicaManagerCtx::new(
             client,
             &config.cluster_security,
@@ -1127,10 +1187,13 @@ fn new_cluster_domain(
     )))
     .with_region_store(Arc::clone(region_store))
     .with_server_info(Arc::clone(&server_info))
-    .with_connection_ids(tidb_domain_core::connection_ids::new_connection_id_allocator(
-        &config.global_config,
-        server_identity.clone(),
-    ))
+    .with_connection_ids(match process_id {
+        Some(process) => Arc::clone(&process.connection_ids),
+        None => tidb_domain_core::connection_ids::new_connection_id_allocator(
+            &config.global_config,
+            server_identity.clone(),
+        ),
+    })
     .with_server_identity(server_identity)
     .with_cluster_topology(cluster_topology)
     .with_stats_owner(stats_owner)
@@ -1142,6 +1205,10 @@ fn new_cluster_domain(
         None => factory,
     };
     factory.install_store_keyspace(authority.tikv_store().get_keyspace().to_owned());
+    factory.install_info_syncer(Arc::clone(info_syncer));
+    // The keyspace this runtime serves (design §6.1): its configured name,
+    // which is the process's on a single-keyspace node.
+    factory.install_keyspace_context(runtime_keyspace_context(config, authority.tikv_store()));
     if let Some(client) = &unprefixed_etcd {
         factory.install_unprefixed_etcd_client(Arc::clone(client));
     }
@@ -1268,6 +1335,9 @@ impl tidb_variable::vars::PdRegionPolicy for ProcessPdRegionPolicy {
 /// PD's `ResourceManagerClient` through the store's PD client, for the
 /// keyspace the store serves.
 struct PdResourceManagerClient {
+    /// The store's PD client, whose requests name the store's keyspace.
+    pd: Arc<tikv_client::PdRpcClient>,
+    /// The store whose runtime drives the requests.
     store: tidb_txnkv::driver::tikv_store::TikvStore,
 }
 
@@ -1276,7 +1346,7 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Pd
         &self,
         group: tidb_proto::resource_manager::ResourceGroup,
     ) -> Result<String, String> {
-        let pd = self.store.store().pd_client();
+        let pd = Arc::clone(&self.pd);
         self.store
             .block_on(async move { pd.add_resource_group(group).await })
             .map_err(|error| error.to_string())
@@ -1286,19 +1356,58 @@ impl tidb_domain_infosync::resource_manager_client::ResourceManagerClient for Pd
         &self,
         group: tidb_proto::resource_manager::ResourceGroup,
     ) -> Result<String, String> {
-        let pd = self.store.store().pd_client();
+        let pd = Arc::clone(&self.pd);
         self.store
             .block_on(async move { pd.modify_resource_group(group).await })
             .map_err(|error| error.to_string())
     }
 
     fn delete_resource_group(&self, name: &str) -> Result<String, String> {
-        let pd = self.store.store().pd_client();
+        let pd = Arc::clone(&self.pd);
         let name = name.to_owned();
         self.store
             .block_on(async move { pd.delete_resource_group(&name).await })
             .map_err(|error| error.to_string())
     }
+
+    fn lookup_resource_group(
+        &self,
+        name: &str,
+    ) -> Result<Option<tidb_proto::resource_manager::ResourceGroup>, String> {
+        let pd = Arc::clone(&self.pd);
+        let name = name.to_owned();
+        match self.store.block_on(async move { pd.get_resource_group(&name, false).await }) {
+            Ok(group) => Ok(group),
+            // PD answers a missing group with an error, not an empty answer.
+            Err(error) if is_group_not_exists(&error.to_string()) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+/// Logs the unqualified `TiDB_GLOBAL` bundle of `info_syncer`'s PD, if any:
+/// its policy places every keyspace's keys, `SHOW PLACEMENT` lists it, and a
+/// policy of its name cannot be dropped until the operator removes it from
+/// PD (`pd-ctl config placement-rules rule-bundle delete TiDB_GLOBAL`).
+fn warn_of_a_legacy_global_bundle(info_syncer: &Arc<tidb_domain_infosync::info_syncer::InfoSyncer>) {
+    let _entered = tidb_domain_infosync::info_syncer::enter(Arc::clone(info_syncer));
+    match tidb_ddl::cluster_ddl::placement_policy::get_legacy_global_placement_policy_name() {
+        Ok(policy) if !policy.is_empty() => tidb_logutil::bg_logger().warn(
+            "an unqualified TiDB_GLOBAL placement bundle places every keyspace; remove it from PD once each keyspace set its own ALTER RANGE global",
+            &[tidb_log::Field::new("policy", tidb_log::Value::Str(policy))],
+        ),
+        Ok(_) => {}
+        Err(error) => tidb_logutil::bg_logger().warn(
+            "cannot check PD for an unqualified TiDB_GLOBAL placement bundle",
+            &[tidb_log::Field::new("error", tidb_log::Value::Str(error))],
+        ),
+    }
+}
+
+/// Whether PD's resource manager answered that the group does not exist
+/// (`ErrGroupNotExists`).
+fn is_group_not_exists(message: &str) -> bool {
+    message.contains("ErrGroupNotExists") || message.contains("resource group does not exist")
 }
 
 /// Go `copr.MPPClient` over the node's `KVStore`.
@@ -1322,3 +1431,17 @@ impl tidb_domain_infosync::min_start_ts::InfoschemaMinTs for InfoCacheMinTs {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    /// PD's resource manager answers a missing group with
+    /// `ErrGroupNotExists`; the step's lookup reads it as no group, so a
+    /// CREATE RESOURCE GROUP proceeds (it retried forever on the error).
+    #[test]
+    fn a_missing_resource_group_is_none() {
+        assert!(super::is_group_not_exists(
+            "get resource group rg1 failed, rpc error: code = Unknown desc = [PD:resourcemanager:ErrGroupNotExists]the rg1 resource group does not exist"
+        ));
+        assert!(!super::is_group_not_exists("rpc error: code = Unavailable desc = connection refused"));
+    }
+}

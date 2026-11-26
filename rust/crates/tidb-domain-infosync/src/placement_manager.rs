@@ -14,15 +14,27 @@
 
 //! Go `pkg/domain/infosync/placement_manager.go`: the `InfoSyncer`'s
 //! `placementManager`, PD's placement rule bundles or, without PD, an
-//! in-memory mock; and `info.go`'s `PutRuleBundlesWithDefaultRetry`.
+//! in-memory mock. `info.go`'s `GetRuleBundle` and `PutRuleBundles*` are in
+//! [`crate::info_syncer`].
+//!
+//! PD keeps one namespace of rule groups for the whole cluster, while table
+//! IDs repeat across keyspaces. On a next-generation kernel a keyspace's
+//! bundles are therefore keyed and ranged by its keyspace where they meet PD
+//! ([`encode_bundle`], [`decode_bundle`]; multi-keyspace design §6.2): the
+//! group ID gains the keyspace prefix Go's TiFlash manager gives its
+//! placement rule IDs (`encodeRuleID`: `keyspace-<keyspace ID>-<ID>`), and
+//! each rule's key range is encoded by the keyspace's codec
+//! (`EncodeRegionRange`), as the keyspace's label rules and TiFlash rules
+//! are. Go's own bundles carry neither, so the bundles a Go or an older node
+//! wrote for a keyspace cover keyspace-less ranges and are not read back.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::{Mutex, PoisonError};
 
 use tidb_placement::pd::PeerRoleType;
 use tidb_placement::Bundle;
 use tikv_client::pd_http;
+use tikv_client::request::ApiV2Codec;
 
 /// Go `PlacementManager` (the methods TiDB calls).
 pub trait PlacementManager: Send + Sync + std::fmt::Debug {
@@ -150,88 +162,74 @@ fn check_bundles(bundles: &BTreeMap<String, Bundle>) -> Result<(), String> {
     bundles.values().try_for_each(check_bundle)
 }
 
-/// The `InfoSyncer`'s `placementManager`.
-static PLACEMENT_MANAGER: Mutex<Option<Arc<dyn PlacementManager>>> = Mutex::new(None);
-
-/// Go `InfoSyncer.initPlacementManager`: PD's manager, or a fresh mock when
-/// the node has no PD.
-pub fn init_placement_manager(manager: Option<Arc<dyn PlacementManager>>) {
-    *PLACEMENT_MANAGER.lock().unwrap_or_else(PoisonError::into_inner) =
-        Some(manager.unwrap_or_else(|| Arc::new(MockPlacementManager::default())));
+/// The keyspace codec PD keys and ranges a bundle by: the store's, on a
+/// next-generation kernel.
+fn keyspace_codec(codec: Option<&ApiV2Codec>) -> Option<&ApiV2Codec> {
+    codec.filter(|_| tidb_config_kerneltype::is_next_gen())
 }
 
-/// The node's placement manager; a node that installed none gets a mock.
-pub fn placement_manager() -> Arc<dyn PlacementManager> {
-    Arc::clone(
-        PLACEMENT_MANAGER
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert_with(|| Arc::new(MockPlacementManager::default())),
-    )
-}
-
-/// Go `GetRuleBundle`.
-///
-/// # Errors
-/// The placement manager's.
-pub fn get_rule_bundle(name: &str) -> Result<Bundle, String> {
-    placement_manager().get_rule_bundle(name)
-}
-
-/// Go `RequestPDMaxRetry`.
-const REQUEST_PD_MAX_RETRY: usize = 3;
-/// Go `RequestRetryInterval`.
-const REQUEST_RETRY_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Go `PutRuleBundles`.
-///
-/// # Errors
-/// The placement manager's.
-pub fn put_rule_bundles(bundles: &[Bundle]) -> Result<(), String> {
-    if let Some(value) = tidb_failpoint::eval("github.com/pingcap/tidb/pkg/domain/infosync/putRuleBundlesError") {
-        return Err(if value.bool() {
-            crate::infosync_errors::ERR_HTTP_SERVICE_ERROR.fast_gen("mock service error", &[]).to_string()
-        } else {
-            "mock other error".to_owned()
-        });
+/// The group ID PD keeps the bundle `id` of the keyspace of `codec` under:
+/// `keyspace-<keyspace ID>-<id>` on a next-generation kernel, `id` itself
+/// otherwise.
+#[must_use]
+pub fn keyspace_bundle_id(codec: Option<&ApiV2Codec>, id: &str) -> String {
+    match keyspace_codec(codec) {
+        Some(codec) => format!("keyspace-{}-{id}", codec.keyspace_id()),
+        None => id.to_owned(),
     }
-    placement_manager().put_rule_bundles(bundles)
 }
 
-/// Go `PutRuleBundlesWithRetry`: retries a failure other than PD's own
-/// answer (`ErrHTTPServiceError`).
+fn hex_key(key_hex: &str) -> Result<Vec<u8>, String> {
+    hex::decode(key_hex).map_err(|error| format!("invalid placement rule key {key_hex}: {error}"))
+}
+
+/// `bundle` as PD keeps it for the keyspace of `codec`: its group ID
+/// [`keyspace_bundle_id`], and each rule's range (`codec.EncodeBytes` of a
+/// key in the keyspace, or empty for the whole keyspace) encoded into the
+/// keyspace (`EncodeRegionRange`). Unchanged without a keyspace codec.
 ///
 /// # Errors
-/// The last attempt's.
-pub fn put_rule_bundles_with_retry(
-    bundles: &[Bundle],
-    max_retry: usize,
-    interval: Duration,
-) -> Result<(), String> {
-    let mut result = Ok(());
-    for i in 0..=max_retry {
-        result = put_rule_bundles(bundles);
-        match &result {
-            Ok(()) => return result,
-            Err(error) if crate::pd_http::is_http_service_error(error) => return result,
-            Err(error) => {
-                if i != max_retry {
-                    tidb_logutil::bg_logger().warn(
-                        "Error occurs when PutRuleBundles, retry",
-                        &[tidb_logutil::zap_error(error)],
-                    );
-                    std::thread::sleep(interval);
-                }
-            }
+/// A rule key that is not a hex `codec.EncodeBytes` key.
+pub fn encode_bundle(codec: Option<&ApiV2Codec>, bundle: &Bundle) -> Result<Bundle, String> {
+    let Some(codec) = keyspace_codec(codec) else {
+        return Ok(bundle.clone());
+    };
+    let raw = |key_hex: &str| -> Result<Vec<u8>, String> {
+        let key = hex_key(key_hex)?;
+        if key.is_empty() {
+            return Ok(key);
         }
-    }
-    result
+        tidb_codec::decode_bytes(&key)
+            .map(|(_, raw)| raw)
+            .map_err(|error| format!("invalid placement rule key {key_hex}: {error}"))
+    };
+    bundle.regroup(|id| keyspace_bundle_id(Some(codec), id), |start, end| {
+        let (start, end) = codec.encode_region_range(&raw(start)?, &raw(end)?);
+        Ok((hex::encode(start), hex::encode(end)))
+    })
 }
 
-/// Go `PutRuleBundlesWithDefaultRetry`.
+/// The bundle `id` back from the group PD keeps it under for the keyspace of
+/// `codec` ([`encode_bundle`]'s inverse).
 ///
 /// # Errors
-/// The last attempt's.
-pub fn put_rule_bundles_with_default_retry(bundles: &[Bundle]) -> Result<(), String> {
-    put_rule_bundles_with_retry(bundles, REQUEST_PD_MAX_RETRY, REQUEST_RETRY_INTERVAL)
+/// A rule key outside the keyspace, or not a hex region key.
+pub fn decode_bundle(codec: Option<&ApiV2Codec>, id: &str, bundle: Bundle) -> Result<Bundle, String> {
+    let Some(codec) = keyspace_codec(codec) else {
+        return Ok(bundle);
+    };
+    let encode = |key: &[u8]| {
+        if key.is_empty() {
+            return String::new();
+        }
+        let mut encoded = Vec::new();
+        tidb_codec::encode_bytes(&mut encoded, key);
+        hex::encode(encoded)
+    };
+    bundle.regroup(|_| id.to_owned(), |start, end| {
+        let (start, end) = codec
+            .decode_region_range(&hex_key(start)?, &hex_key(end)?)
+            .map_err(|error| error.to_string())?;
+        Ok((encode(&start), encode(&end)))
+    })
 }

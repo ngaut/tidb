@@ -876,7 +876,9 @@ pub(crate) fn alter_table_attributes<S: MetaSnapshot>(
         };
         let (_, stored) = locate_table(catalog, schema, table)?;
         let stored = stored.read();
+        // Go `e.store.GetCodec()`: the session's keyspace.
         let rule = label_rules::table_attributes_rule(
+            tidb_domain_infosync::info_syncer::get().label_codec(),
             attributes,
             database.read().name.lowercase(),
             &LabelRuleTable::from_table_info(&stored),
@@ -931,6 +933,7 @@ pub(crate) fn alter_table_partition_attributes<S: MetaSnapshot>(
         let stored = stored.read();
         let partition_id = find_partition_id(&stored, partition)?;
         let rule = label_rules::partition_attributes_rule(
+            tidb_domain_infosync::info_syncer::get().label_codec(),
             attributes,
             database.read().name.lowercase(),
             stored.name.lowercase(),
@@ -2191,9 +2194,11 @@ pub(super) fn plan_persisted_alter_table_job_step(
                 replica.available = available;
                 info.tiflash_replica = Some(GoShared::new(replica));
             } else {
-                if info.tiflash_replica.is_some() {
+                // A multi-keyspace node leaves the process-wide progress
+                // cache, named by bare table IDs, alone.
+                if info.tiflash_replica.is_some() && super::step_pd_write("TIFLASH REPLICA")? {
                     // Go `infosync.DeleteTiFlashTableSyncProgress`.
-                    tidb_domain_infosync::tiflash_manager::delete_tiflash_table_sync_progress(
+                    tidb_domain_infosync::info_syncer::delete_tiflash_table_sync_progress(
                         &info,
                     );
                 }

@@ -1931,7 +1931,7 @@ fn adjust_foreign_key_children(
     new: &tidb_model::ColumnInfo,
     old: &tidb_model::ColumnInfo,
 ) -> Result<Vec<(i64, TableInfo)>, DdlPlanError> {
-    if !tidb_vardef::ENABLE_FOREIGN_KEY.load(std::sync::atomic::Ordering::SeqCst)
+    if !tidb_vardef::snapshot::current().enable_foreign_key().load(std::sync::atomic::Ordering::SeqCst)
         || new.name.lowercase() == old.name.lowercase()
     {
         return Ok(Vec::new());
@@ -2499,11 +2499,15 @@ fn update_object_state(
 
 /// Go `initForReorgIndexes`: a merge reorganization starts its indexes in
 /// the running backfill state; a partial index needs fast reorg.
-fn init_for_reorg_indexes(job: &Job, indexes: &[GoShared<IndexInfo>]) -> Result<(), DdlPlanError> {
+fn init_for_reorg_indexes(
+    job_key: crate::job_ctx::JobKey,
+    job: &Job,
+    indexes: &[GoShared<IndexInfo>],
+) -> Result<(), DdlPlanError> {
     if indexes.is_empty() {
         return Ok(());
     }
-    add_index::load_cloud_storage_uri(job);
+    add_index::load_cloud_storage_uri(job_key, job);
     let reorg_type = add_index::pick_backfill_type(job)?;
     if matches!(
         reorg_type,
@@ -2820,7 +2824,7 @@ fn do_modify_column_index_reorg(
                 &active.job,
                 tidb_model::reorg::ReorgStage::MODIFY_COLUMN_UPDATE_COLUMN,
             );
-            if let Err(error) = init_for_reorg_indexes(&active.job, &changing_indexes) {
+            if let Err(error) = init_for_reorg_indexes(txn.job_key(active.job.id), &active.job, &changing_indexes) {
                 active.job.state = JobState::ROLLINGBACK;
                 return Err(error);
             }
@@ -3080,7 +3084,7 @@ fn do_modify_column_type_with_data(
                 &active.job,
                 tidb_model::reorg::ReorgStage::MODIFY_COLUMN_UPDATE_COLUMN,
             );
-            if let Err(error) = init_for_reorg_indexes(&active.job, &changing_indexes) {
+            if let Err(error) = init_for_reorg_indexes(txn.job_key(active.job.id), &active.job, &changing_indexes) {
                 active.job.state = JobState::ROLLINGBACK;
                 return Err(error);
             }
@@ -3356,8 +3360,8 @@ fn do_reorg_work_for_modify_column(
             index_ids: Vec::new(),
             merging: false,
             physical_ids: add_index::physical_ids(&target.info),
-            batch_size: add_index::job_batch_size(&active.job),
-            concurrency: add_index::job_concurrency(&active.job),
+            batch_size: add_index::job_batch_size(&active.job, &tidb_vardef::snapshot::current()),
+            concurrency: add_index::job_concurrency(&active.job, &tidb_vardef::snapshot::current()),
             session_vars: tidb_ddl_build::session_pool::ReorgSessionVars::of_job(&active.job),
             row_count: active.job.row_count,
             column: Some(spec.clone()),

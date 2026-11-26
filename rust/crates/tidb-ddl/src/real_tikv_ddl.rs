@@ -40,7 +40,7 @@ use tidb_txnkv::transaction::OptimisticCoordinatorError;
 use tidb_store_driver_txn::transaction::RealOptimisticTransactionOpener;
 
 use tidb_infoschema::cluster_catalog::{load_info_schema, MetaSnapshot};
-use crate::cluster_ddl::{plan_persisted_ddl_job_failure, plan_persisted_ddl_job_step, recover_ddl_action, CheckConstraintValidation, DdlWrite, ExchangePartitionValidation, MdlInfoUpdate, PersistedDdlJobFailure, PersistedDdlJobPlan};
+use crate::cluster_ddl::{plan_persisted_ddl_job_failure, plan_persisted_ddl_job_step, recover_ddl_action, CheckConstraintValidation, ExchangePartitionValidation, MdlInfoUpdate, PersistedDdlJobFailure, PersistedDdlJobPlan};
 use tidb_ddl_build::plan_error::DdlPlanError;
 
 use tidb_store_driver_txn::cluster_table_storage::{LockKeysOutcome, SessionTransaction};
@@ -54,140 +54,7 @@ pub use add_index_reorg::ingest::PipelineError;
 pub use add_index_reorg::operators as backfilling_operators;
 mod backfilling;
 pub mod delete_range;
-
-/// What undoes a delivered label step: the rules its IDs held before it.
-struct LabelDeliveryReceipt {
-    manager: std::sync::Arc<dyn tidb_domain_infosync::label_manager::LabelRuleManager>,
-    original: Vec<tidb_ddl_label::Rule>,
-    rule_ids: Vec<String>,
-}
-
-struct PlacementDeliveryReceipt {
-    pd_http_client: tikv_client::pd_http::Client,
-    rollback: Vec<tidb_placement::Bundle>,
-}
-
-fn deliver_placement_bundles(
-    pd_http_client: &tikv_client::pd_http::Client,
-    bundles: &[tidb_placement::Bundle],
-    timeout: Duration,
-) -> Result<Option<PlacementDeliveryReceipt>, ClusterDdlError> {
-    if bundles.is_empty() {
-        return Ok(None);
-    }
-    crate::placement_delivery::put_rule_bundles(pd_http_client, bundles, timeout).map_err(
-        |error| {
-            ClusterDdlError::NotCommitted(format!(
-                "failed to notify PD the placement rules: {error}"
-            ))
-        },
-    )?;
-    // IDs allocated by an optimistic attempt are withdrawn if the catalog
-    // transaction loses its race.
-    let rollback = bundles
-        .iter()
-        .map(|bundle| tidb_placement::Bundle {
-            id: bundle.id.clone(),
-            ..tidb_placement::Bundle::default()
-        })
-        .collect();
-    Ok(Some(PlacementDeliveryReceipt {
-        pd_http_client: pd_http_client.clone(),
-        rollback,
-    }))
-}
-
-/// Go's job step makes its label-rule calls before the version is
-/// published and fails the job when one fails. The step's calls go to the
-/// node's label manager here, before the catalog transaction commits; the
-/// rules they touch are read first, so a transaction that loses its commit
-/// race (or a later call that fails) puts them back.
-fn deliver_label_rules(write: &DdlWrite) -> Result<Option<LabelDeliveryReceipt>, ClusterDdlError> {
-    if write.label_rules.is_empty() {
-        return Ok(None);
-    }
-    let manager = tidb_domain_infosync::label_manager::label_rule_manager();
-    let mut rule_ids = write
-        .label_rules
-        .iter()
-        .flat_map(|step| step.write.rule_ids())
-        .collect::<Vec<_>>();
-    rule_ids.sort();
-    rule_ids.dedup();
-    let original = manager
-        .get_label_rules(&rule_ids)
-        .map_err(|error| {
-            ClusterDdlError::NotCommitted(format!("failed to get PD the label rules: {error}"))
-        })?
-        .into_values()
-        .collect();
-    let receipt = LabelDeliveryReceipt {
-        manager,
-        original,
-        rule_ids,
-    };
-    for step in &write.label_rules {
-        if let Err(error) = step.write.apply(receipt.manager.as_ref()) {
-            let mut cause = ClusterDdlError::NotCommitted(match step.error_context {
-                Some(context) => format!("{context}: {error}"),
-                None => error,
-            });
-            if let Err(error) = restore_label_rules(&receipt) {
-                cause = ClusterDdlError::NotCommitted(format!(
-                    "{cause}; and restoring the attempt's label rules failed: {error}"
-                ));
-            }
-            return Err(cause);
-        }
-    }
-    Ok(Some(receipt))
-}
-
-fn restore_label_rules(receipt: &LabelDeliveryReceipt) -> Result<(), String> {
-    let present = receipt
-        .original
-        .iter()
-        .map(|rule| rule.id.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let delete_rules = receipt
-        .rule_ids
-        .iter()
-        .filter(|id| !present.contains(id.as_str()))
-        .cloned()
-        .collect();
-    let patch = tidb_ddl_label::new_rule_patch(receipt.original.clone(), delete_rules);
-    receipt.manager.update_label_rules(&patch)
-}
-
-fn restore_placement(
-    receipt: &PlacementDeliveryReceipt,
-    timeout: Duration,
-) -> Result<(), crate::placement_delivery::PlacementDeliveryError> {
-    crate::placement_delivery::put_rule_bundles(&receipt.pd_http_client, &receipt.rollback, timeout)
-}
-
-fn compensate_external_delivery(
-    mut cause: ClusterDdlError,
-    placement_receipt: Option<&PlacementDeliveryReceipt>,
-    label_receipt: Option<&LabelDeliveryReceipt>,
-    timeout: Duration,
-) -> ClusterDdlError {
-    if let Some(receipt) = label_receipt {
-        if let Err(error) = restore_label_rules(receipt) {
-            cause = ClusterDdlError::NotCommitted(format!(
-                "{cause}; and restoring the attempt's label rules failed: {error}"
-            ));
-        }
-    }
-    if let Some(receipt) = placement_receipt {
-        if let Err(error) = restore_placement(receipt, timeout) {
-            cause = ClusterDdlError::NotCommitted(format!(
-                "{cause}; and restoring the attempt's placement bundles failed: {error}"
-            ));
-        }
-    }
-    cause
-}
+mod external_delivery;
 
 /// Why a catalog change did not happen.
 #[derive(Clone, Debug)]
@@ -1002,6 +869,15 @@ pub fn run_persisted_ddl_job<S: StoreClient>(
     }
     let sess_pool = backfiller.session_pool().ok_or_else(||
         ClusterDdlError::NotCommitted("the DDL worker has no session pool".to_owned()))?;
+    let vardef = sess_pool.vardef();
+    // The whole job -- its schema steps and the reorganization they hand
+    // back (`run_add_index_reorg`, which also spawns threads that inherit
+    // it) -- reads its keyspace's vardef values (multi-keyspace design
+    // §6.3).
+    let _vardef = tidb_vardef::snapshot::enter(vardef.clone().unwrap_or_else(tidb_vardef::snapshot::process));
+    // Its PD calls -- label rules, placement, resource groups -- go to its
+    // keyspace's managers (design §6.2).
+    let _info_syncer = sess_pool.info_syncer().map(tidb_domain_infosync::info_syncer::enter);
     let worker = crate::cluster_ddl::DdlStepWorker {
         sess_pool,
         step_buffer: MutationBuffer::new(),
@@ -1017,6 +893,7 @@ pub fn run_persisted_ddl_job<S: StoreClient>(
         tidb_vardef::is_mdl_enabled(tidb_config_kerneltype::is_next_gen()), job_w.clone(), worker,
     );
     schema_state.info_cache = schema_sync.info_cache();
+    schema_state.vardef = vardef;
     let reorg_slot = add_index_reorg::ReorgSlot::default();
     let outcome = (|| loop {
         let result = transit_one_job_step_and_wait_sync(
@@ -1168,7 +1045,7 @@ fn transit_one_job_step_and_wait_sync<S: StoreClient>(
                 // session notified (`jobCtx.notifyDone`); `cleanMDLInfo`
                 // follows in `transitOneJobStepAndWaitSync`.
                 // Go `removeJobCtx`: the job context goes with the job.
-                crate::job_ctx::remove_job_ctx(ddl_job_id);
+                crate::job_ctx::remove_job_ctx(schema_state.worker.job_key(ddl_job_id));
                 if let Err(error) = add_index_reorg::clean_ddl_reorg_handles(
                     schema_state.worker.sess_pool.as_ref(),
                     ddl_job_id,
@@ -1576,6 +1453,11 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
     owner_id: &str,
 ) -> Result<DdlPhaseOutcome, ClusterDdlError> {
     (phase.check_owner)().map_err(ClusterDdlError::SchemaSync)?;
+    // The step reads its DDL's keyspace vardef values (multi-keyspace design
+    // §6.3), which its domain handed the DDL's session pool.
+    let _vardef = tidb_vardef::snapshot::enter(
+        phase.schema_state.vardef.clone().unwrap_or_else(tidb_vardef::snapshot::process),
+    );
     // Go `transitOneJobStepAndWaitSync` checks the previous schema barrier
     // before `transitOneJobStep`'s hook and prepareTxn. A cancellation in
     // beforeTransitOneJobStep must be visible at the new transaction's TSO.
@@ -1615,6 +1497,10 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
     let mut buffer = MutationBuffer::new();
     let mut schema_state = phase.schema_state.clone();
     schema_state.step_kv_context = Some(step_kv_context);
+    schema_state.keyspace = Some(std::sync::Arc::new(tidb_keyspace::KeyspaceContext::new(
+        opener.store().get_keyspace(),
+        None,
+    )));
     // Go `w.sess` for this step, kept until the step commits: the MDL row
     // below runs on it too.
     let mut step_sql: crate::job_txn::StepSqlSlot = Default::default();
@@ -1744,60 +1630,46 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
                 .map(|error| (error, checkpoint.error_count));
         }
     }
-    let placement_receipt = if let Some(pd_http_client) = opener.store().pd_http_client() {
-        match deliver_placement_bundles(&pd_http_client, &write.placement_bundles, timeout) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                let _ = transaction.rollback();
-                return Err(error);
-            }
+    // The step's PD writes, before its catalog change commits; every
+    // definite abort from here undoes them ([`ExternalDelivery::compensate`]).
+    let mut delivery = external_delivery::ExternalDelivery::default();
+    let abort = |delivery: &external_delivery::ExternalDelivery, cause: ClusterDdlError| {
+        match delivery.compensate(phase.check_owner, timeout) {
+            Ok(()) => cause,
+            Err(note) => ClusterDdlError::NotCommitted(format!("{cause}; and {note}")),
         }
-    } else {
+    };
+    let placement_target = match opener.store().pd_http_client() {
+        Some(pd_http_client) => external_delivery::PlacementTarget::Pd {
+            pd_http_client,
+            codec: tidb_domain_infosync::info_syncer::store_codec(sess_pool.keyspace_id()),
+        },
         // Go `infosync.PutRuleBundlesWithDefaultRetry` on a node without
         // PD: the info syncer's `mockPlacementManager`.
-        if !write.placement_bundles.is_empty() {
-            if let Err(error) = tidb_domain_infosync::placement_manager::put_rule_bundles_with_default_retry(
-                &write.placement_bundles,
-            ) {
-                let _ = transaction.rollback();
-                return Err(ClusterDdlError::NotCommitted(format!(
-                    "failed to notify PD the placement rules: {error}"
-                )));
-            }
-        }
-        None
+        None => external_delivery::PlacementTarget::InfoSyncer,
     };
-    let label_receipt = match deliver_label_rules(&write) {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            let _ = transaction.rollback();
-            return Err(compensate_external_delivery(
-                error,
-                placement_receipt.as_ref(),
-                None,
-                timeout,
-            ));
-        }
-    };
+    if let Err(error) = delivery.deliver_placement(placement_target, &write.placement_bundles, timeout) {
+        let _ = transaction.rollback();
+        return Err(ClusterDdlError::NotCommitted(error));
+    }
+    let label_steps = write
+        .label_rules
+        .iter()
+        .map(|step| (&step.write, step.error_context))
+        .collect::<Vec<_>>();
+    if let Err(error) = delivery.deliver_label_rules(&label_steps) {
+        let _ = transaction.rollback();
+        return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
+    }
     // Go `createTableAffinityGroupsInPD`, as in the single-phase path.
     if let Err(error) = write.affinity_groups.apply_create() {
         let _ = transaction.rollback();
-        return Err(compensate_external_delivery(
-            ClusterDdlError::NotCommitted(error),
-            placement_receipt.as_ref(),
-            label_receipt.as_ref(),
-            timeout,
-        ));
+        return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
     }
     if let Some(update) = &write.resource_group_update {
-        if let Err(error) = update.apply() {
+        if let Err(error) = delivery.deliver_resource_group(update.name(), || update.apply()) {
             let _ = transaction.rollback();
-            return Err(compensate_external_delivery(
-                ClusterDdlError::NotCommitted(error),
-                placement_receipt.as_ref(),
-                label_receipt.as_ref(),
-                timeout,
-            ));
+            return Err(abort(&delivery, ClusterDdlError::NotCommitted(error)));
         }
     }
     if let Some(mdl_info) = &write.mdl_info_update {
@@ -1810,7 +1682,7 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
         );
         if let Err(error) = registered {
             let _ = transaction.rollback();
-            return Err(error.into());
+            return Err(abort(&delivery, error.into()));
         }
     }
     // The step's session ends; its writes stay in the step's buffer.
@@ -1822,12 +1694,7 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
     );
     if let Err(error) = (phase.check_owner)() {
         let _ = transaction.rollback();
-        return Err(compensate_external_delivery(
-            ClusterDdlError::SchemaSync(error),
-            placement_receipt.as_ref(),
-            label_receipt.as_ref(),
-            timeout,
-        ));
+        return Err(abort(&delivery, ClusterDdlError::SchemaSync(error)));
     }
     let planned_version = write.schema_version;
     match transaction.commit_with(&buffer, write.mutations) {
@@ -1860,15 +1727,12 @@ fn commit_cluster_ddl_phase<S: StoreClient>(
         }
         Err(error) => {
             let cause = classify_session_ddl_commit_error(planned_version, error);
+            // An undetermined commit may have published the change, whose
+            // PD writes must then stay.
             if matches!(cause, ClusterDdlError::Undetermined(_)) {
                 Err(cause)
             } else {
-                Err(compensate_external_delivery(
-                    cause,
-                    placement_receipt.as_ref(),
-                    label_receipt.as_ref(),
-                    timeout,
-                ))
+                Err(abort(&delivery, cause))
             }
         }
     }

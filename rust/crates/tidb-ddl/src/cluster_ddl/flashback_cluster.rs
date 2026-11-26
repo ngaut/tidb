@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tidb_ddl_build::cluster::{merge_continuous_key_ranges, KeyRangeMayExclude};
 use tidb_ddl_build::session_pool::DdlSessionPool;
 use tidb_gcutil::Context as _;
-use tidb_model::FlashbackClusterArgs;
+use tidb_model::{FlashbackClusterArgs, PD_SCHEDULE_CLOSED, PD_SCHEDULE_CLOSING, PD_SCHEDULE_SAVED};
 
 /// Go `pdScheduleKey`.
 const PD_SCHEDULE_KEY: [&str; 1] = ["merge-schedule-limit"];
@@ -73,18 +73,29 @@ fn flashback_get_min_safe_time_timeout() -> Duration {
     }
 }
 
-/// Go `closePDSchedule`.
-fn close_pd_schedule() -> Result<(), DdlPlanError> {
+/// Go `closePDSchedule`. The limits are PD's, for every keyspace: a
+/// multi-keyspace node's step neither saves nor closes them (design §10
+/// phase 2). Only a job whose arguments say it is closing them gets here
+/// ([`PD_SCHEDULE_CLOSING`]); `closed` runs once PD has answered.
+fn close_pd_schedule(state: &str, closed: impl FnOnce()) -> Result<(), DdlPlanError> {
+    if state != PD_SCHEDULE_CLOSING || !super::step_pd_write("FLASHBACK CLUSTER")? {
+        return Ok(());
+    }
     let close_map: HashMap<String, serde_json::Value> = PD_SCHEDULE_KEY
         .iter()
         .map(|key| ((*key).to_owned(), serde_json::json!(0)))
         .collect();
-    tidb_domain_infosync::schedule_manager::set_pd_schedule_config(&close_map).map_err(unknown)
+    tidb_domain_infosync::info_syncer::set_pd_schedule_config(&close_map).map_err(unknown)?;
+    closed();
+    Ok(())
 }
 
 /// Go `savePDSchedule`.
 fn save_pd_schedule(args: &mut FlashbackClusterArgs) -> Result<(), DdlPlanError> {
-    let ret_value = tidb_domain_infosync::schedule_manager::get_pd_schedule_config().map_err(unknown)?;
+    if !super::step_pd_write("FLASHBACK CLUSTER")? {
+        return Ok(());
+    }
+    let ret_value = tidb_domain_infosync::info_syncer::get_pd_schedule_config().map_err(unknown)?;
     args.pd_schedule_value = Some(
         PD_SCHEDULE_KEY
             .iter()
@@ -96,7 +107,90 @@ fn save_pd_schedule(args: &mut FlashbackClusterArgs) -> Result<(), DdlPlanError>
             })
             .collect(),
     );
+    PD_SCHEDULE_SAVED.clone_into(&mut args.pd_schedule_state);
     Ok(())
+}
+
+/// Go `job.FillArgs(args)`, with the raw arguments refreshed too: a step
+/// that fails after this point cancels the job, and the cancellation's
+/// `finish_flashback_cluster` (which decodes a version-1 job's raw
+/// arguments) and its persisted job then carry these arguments.
+fn fill_args(job: &mut Job, args: &tidb_model::GoShared<FlashbackClusterArgs>) -> Result<(), DdlPlanError> {
+    job.fill_args(Some(args.clone()));
+    job.encode(true).map(drop).map_err(|error| DdlPlanError::Encode(error.to_string()))
+}
+
+/// Whether the job's closed PD schedule limits are its own to restore.
+#[derive(Debug, PartialEq, Eq)]
+enum PdScheduleOwnership {
+    /// The job never closed them, or saved nothing to restore.
+    Untouched,
+    /// The job closed them: restore the saved value.
+    Closed,
+    /// The job may have closed them, or an operator may have set the
+    /// limits since: leave them and hand off to the operator.
+    Ambiguous,
+}
+
+/// [`PdScheduleOwnership`] of a finishing job in `schema_state`.
+///
+/// A job of this port records how far it got (`pd_schedule_state`): its
+/// intent is persisted before it asks PD to close the limits, and the close
+/// right after PD answers. Intent without the close is a job that stopped
+/// between the two, so whether PD took the close is unknown. A job with no
+/// record (started by a Go node or before the field) closed the limits in
+/// the step that left `DELETE_ONLY`, so a later state proves the close and
+/// `DELETE_ONLY` proves nothing; a current limit of zero does not tell the
+/// job's close from an operator's. This port never advances such a job past
+/// `DELETE_ONLY` (`on_flashback_cluster` cancels it there), so a later state
+/// with no record is still a Go node's close.
+fn pd_schedule_ownership(schema_state: SchemaState, args: &FlashbackClusterArgs) -> PdScheduleOwnership {
+    match args.pd_schedule_state.as_str() {
+        PD_SCHEDULE_CLOSED => PdScheduleOwnership::Closed,
+        PD_SCHEDULE_CLOSING => PdScheduleOwnership::Ambiguous,
+        PD_SCHEDULE_SAVED => PdScheduleOwnership::Untouched,
+        _ if args.pd_schedule_value.as_ref().is_none_or(BTreeMap::is_empty) => PdScheduleOwnership::Untouched,
+        _ if schema_state == SchemaState::DELETE_ONLY => PdScheduleOwnership::Ambiguous,
+        _ => PdScheduleOwnership::Closed,
+    }
+}
+
+/// The operator handoff for a job that may have closed PD's schedule
+/// limits: they are left as they are, and the job's warning (kept in its
+/// history, `ADMIN SHOW DDL JOB QUERIES` / `mysql.tidb_ddl_history`) and an
+/// error log name the job and the value to restore by hand.
+fn hand_off_pd_schedule(job: &mut Job, args: &FlashbackClusterArgs) {
+    let saved = serde_json::to_string(&args.pd_schedule_value).unwrap_or_default();
+    // A read only, for the report: the limits are not written.
+    let current = tidb_domain_infosync::info_syncer::get_pd_schedule_config().map_or_else(
+        |error| format!("unknown ({error})"),
+        |config| {
+            let current: BTreeMap<_, _> = PD_SCHEDULE_KEY
+                .iter()
+                .map(|key| (*key, config.get(*key).cloned().unwrap_or(serde_json::Value::Null)))
+                .collect();
+            serde_json::to_string(&current).unwrap_or_default()
+        },
+    );
+    let message = format!(
+        "FLASHBACK CLUSTER job {} may have closed PD's schedule limits and cannot tell; they are left as they are \
+         (now {current}). If PD's {} still shows this job's 0, restore the value it saved: {saved}",
+        job.id,
+        PD_SCHEDULE_KEY.join(", "),
+    );
+    tidb_ddl_logutil::ddl_logger().error(
+        "flashback cluster left PD's schedule limits to the operator",
+        &[
+            tidb_log::Field::new("jobID", tidb_log::Value::I64(job.id)),
+            tidb_log::Field::new("savedPDSchedule", tidb_log::Value::Str(saved)),
+            tidb_log::Field::new("currentPDSchedule", tidb_log::Value::Str(current)),
+        ],
+    );
+    job.warning = Some(tidb_model::GoShared::new(tidb_terror::TerrorError::synthesize(
+        tidb_terror::TerrorClass::Ddl,
+        tidb_terror::TerrorCode::new(isize::from(tidb_mysql::errors::errcode::ErrUnknown as i16)),
+        message,
+    )));
 }
 
 /// Go `recoverPDSchedule`.
@@ -108,7 +202,7 @@ fn recover_pd_schedule(pd_schedule_param: Option<&BTreeMap<String, serde_json::V
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    tidb_domain_infosync::schedule_manager::set_pd_schedule_config(&config).map_err(unknown)
+    tidb_domain_infosync::info_syncer::set_pd_schedule_config(&config).map_err(unknown)
 }
 
 /// Go `oracle.GetTimeFromTS(ts)`'s instant, in milliseconds.
@@ -226,12 +320,14 @@ fn check_and_set_flashback_cluster_info(
     sessions: &DdlStepWorker,
     job_id: i64,
     flashback_ts: u64,
+    pd_schedule_state: &str,
+    pd_schedule_closed: impl FnOnce(),
 ) -> Result<(), DdlPlanError> {
     let pool = sessions.sess_pool.as_ref();
     validate_flashback_ts(pool, flashback_ts)?;
 
     tidb_gcutil::disable_gc(&mut WorkerGcContext::new(pool)).map_err(gc_error)?;
-    close_pd_schedule()?;
+    close_pd_schedule(pd_schedule_state, pd_schedule_closed)?;
     set_global_sys_var_from_bool(pool, tidb_vardef::tidb_vars::TIDB_ENABLE_AUTO_ANALYZE, false)?;
     set_global_sys_var_from_bool(pool, tidb_vardef::tidb_vars::TIDB_SUPER_READ_ONLY, true)?;
     set_global_sys_var_from_bool(pool, tidb_vardef::tidb_vars::TIDB_TTL_JOB_ENABLE, false)?;
@@ -576,14 +672,66 @@ pub(super) fn on_flashback_cluster(
             // keeps its raw arguments until `FillArgs`.
             checked.map_err(|error| cancel_ddl_job(active, error))?;
             *args.write() = saved;
+            fill_args(&mut active.job, &args)?;
             active.job.schema_state = SchemaState::DELETE_ONLY;
             Ok(args_step(job_only_write(active.job.id, Vec::new())))
         }
         // Stage 2, check flashbackTS, close GC and PD schedule, get flashback key ranges.
         SchemaState::DELETE_ONLY => {
             let flashback_ts = args.read().flashback_ts;
-            check_and_set_flashback_cluster_info(txn, sessions, active.job.id, flashback_ts)
-                .map_err(|error| cancel_ddl_job(active, error))?;
+            // A job with a saved value and no record (a Go node's, or from
+            // before the record) cannot tell whether PD's current limits
+            // are its saved baseline, its own close or an operator's
+            // setting since, and PD's schedule configuration has no
+            // compare-and-set to close them only while they still hold the
+            // saved value. Closing would take ownership of a value it does
+            // not own; advancing without closing would later be taken for a
+            // job that closed them. It is cancelled here instead, writing
+            // nothing to PD, and `finish_flashback_cluster` hands the saved
+            // and current values to the operator.
+            let unrecorded = {
+                let args = args.read();
+                args.pd_schedule_state.is_empty() && args.pd_schedule_value.as_ref().is_some_and(|value| !value.is_empty())
+            };
+            if unrecorded {
+                return Err(cancel_ddl_job(
+                    active,
+                    unknown(
+                        "FLASHBACK CLUSTER job has no record of PD's schedule limits it saved; it is cancelled and \
+                         hands them off to the operator"
+                            .to_owned(),
+                    ),
+                ));
+            }
+            // The intent to close PD's schedule limits is persisted, in a
+            // step of its own, before the close: a job that stops between
+            // the two is then known to be ambiguous rather than untouched
+            // (`pd_schedule_ownership`).
+            if args.read().pd_schedule_state == PD_SCHEDULE_SAVED {
+                if !super::step_pd_write("FLASHBACK CLUSTER").map_err(|error| cancel_ddl_job(active, error))? {
+                    // The saved limits cannot be closed here: the flashback
+                    // would run with PD scheduling on.
+                    return Err(cancel_ddl_job(
+                        active,
+                        unknown("FLASHBACK CLUSTER saved PD's schedule limits but cannot close them on this node".to_owned()),
+                    ));
+                }
+                validate_flashback_ts(pool, flashback_ts).map_err(|error| cancel_ddl_job(active, error))?;
+                PD_SCHEDULE_CLOSING.clone_into(&mut args.write().pd_schedule_state);
+                fill_args(&mut active.job, &args)?;
+                return Ok(args_step(job_only_write(active.job.id, Vec::new())));
+            }
+            let pd_schedule_state = args.read().pd_schedule_state.clone();
+            let job_id = active.job.id;
+            let mut closed = false;
+            let checked = check_and_set_flashback_cluster_info(txn, sessions, job_id, flashback_ts, &pd_schedule_state, || {
+                closed = true;
+            });
+            if closed {
+                PD_SCHEDULE_CLOSED.clone_into(&mut args.write().pd_schedule_state);
+                fill_args(&mut active.job, &args)?;
+            }
+            checked.map_err(|error| cancel_ddl_job(active, error))?;
             // We should get startTS here to avoid lost startTS when TiDB
             // crashed during send prepare flashback RPC.
             let start_ts = pool
@@ -607,6 +755,7 @@ pub(super) fn on_flashback_cluster(
                         .collect(),
                 );
             }
+            fill_args(&mut active.job, &args)?;
             active.job.schema_state = SchemaState::WRITE_ONLY;
             flashback_schema_version_step(txn, active, Vec::new())
         }
@@ -620,7 +769,7 @@ pub(super) fn on_flashback_cluster(
             let (flashback_ts, start_ts, key_ranges) = flashback_rpc_args(&args.read());
             // Split region by keyRanges, make sure no unrelated key ranges be locked.
             let region_store = flashback_region_store(sessions)?;
-            let concurrency = tidb_vardef::get_ddl_flashback_concurrency() as usize;
+            let concurrency = tidb_vardef::snapshot::current().ddl_flashback_concurrency().load(std::sync::atomic::Ordering::SeqCst) as usize;
             split_regions_by_key_ranges(region_store.as_ref(), &key_ranges);
             let mut total_regions = 0_u64;
             for (start_key, end_key) in &key_ranges {
@@ -636,6 +785,7 @@ pub(super) fn on_flashback_cluster(
                 args.locked_region_cnt = total_regions;
                 args.commit_ts = commit_ts;
             }
+            fill_args(&mut active.job, &args)?;
             active.job.schema_state = SchemaState::WRITE_REORGANIZATION;
             Ok(args_step(job_only_write(active.job.id, Vec::new())))
         }
@@ -652,7 +802,7 @@ pub(super) fn on_flashback_cluster(
             let (flashback_ts, start_ts, key_ranges) = flashback_rpc_args(&args.read());
             let commit_ts = args.read().commit_ts;
             let region_store = flashback_region_store(sessions)?;
-            let concurrency = tidb_vardef::get_ddl_flashback_concurrency() as usize;
+            let concurrency = tidb_vardef::snapshot::current().ddl_flashback_concurrency().load(std::sync::atomic::Ordering::SeqCst) as usize;
             for (start_key, end_key) in &key_ranges {
                 // Use same startTS as prepare phase to simulate 1PC txn.
                 region_store
@@ -708,7 +858,10 @@ fn split_regions_by_key_ranges(region_store: &dyn tidb_kv::region_map::RegionSto
 }
 
 /// Go `finishFlashbackCluster`: whatever the job closed is restored, however
-/// the job ended.
+/// the job ended. PD's schedule limits are restored only when the job owns
+/// their closed value (`pd_schedule_ownership`); when that is unknown they
+/// are handed off to the operator instead (Go restores whenever the job left
+/// `StateNone`, which can write a stale saved value over a newer setting).
 pub(super) fn finish_flashback_cluster(job: &mut Job, sessions: &DdlStepWorker) -> Result<(), DdlPlanError> {
     if job.type_ != ActionType::ACTION_FLASHBACK_CLUSTER {
         return Ok(());
@@ -723,7 +876,11 @@ pub(super) fn finish_flashback_cluster(job: &mut Job, sessions: &DdlStepWorker) 
     let args = args.read().clone();
     let pool = sessions.sess_pool.as_ref();
 
-    recover_pd_schedule(args.pd_schedule_value.as_ref())?;
+    match pd_schedule_ownership(job.schema_state, &args) {
+        PdScheduleOwnership::Closed => recover_pd_schedule(args.pd_schedule_value.as_ref())?,
+        PdScheduleOwnership::Ambiguous => hand_off_pd_schedule(job, &args),
+        PdScheduleOwnership::Untouched => {}
+    }
     if args.enable_gc {
         tidb_gcutil::enable_gc(&mut WorkerGcContext::new(pool)).map_err(gc_error)?;
     }

@@ -17,7 +17,7 @@
 //! the one-retry worker contract.
 
 use std::collections::HashMap;
-use std::sync::{mpsc, Arc, LazyLock, Mutex, Weak};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tidb_stats_handle_types::stats_cache::StatsCache;
@@ -72,11 +72,17 @@ struct NeededItemTask {
 
 type Listener = mpsc::SyncSender<SyncLoadOutcome>;
 
-static GLOBAL_SINGLEFLIGHT: LazyLock<Mutex<HashMap<String, Vec<Listener>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 /// One statistics handle's synchronous-load queues and workers.
 pub struct StatisticsLoadWorkers {
+    /// Go's package-level `globalStatsSyncLoadSingleFlight`, kept with the
+    /// domain's pool: its keys are table and column IDs, which collide
+    /// across the keyspaces of a node serving several (design §6.4), so one
+    /// keyspace's request must not join another's load.
+    flights: Mutex<HashMap<String, Vec<Listener>>>,
+    /// Go's process-wide `AsyncLoadHistogramNeededItems`, kept with the
+    /// domain's pool for the same reason: what the domain's sessions leave
+    /// for its asynchronous loader, which drains it.
+    needed: Arc<tidb_stats_asyncload::NeededStatsMap>,
     needed_items: crossbeam_channel::Sender<NeededItemTask>,
     _needed_items_receiver: crossbeam_channel::Receiver<NeededItemTask>,
     _timeout_items_receiver: crossbeam_channel::Receiver<NeededItemTask>,
@@ -127,12 +133,62 @@ impl StatisticsLoadWorkers {
             );
         }
         Arc::new(Self {
+            flights: Mutex::default(),
+            needed: Arc::default(),
             needed_items: needed_tx,
             _needed_items_receiver: needed_rx,
             _timeout_items_receiver: timeout_rx,
             stop: Some(stop),
             workers,
         })
+    }
+}
+
+impl StatisticsLoadWorkers {
+    /// Go `AsyncLoadHistogramNeededItems.Insert`: queues `item` for the
+    /// domain's asynchronous loader (only an upgrade to a full load replaces
+    /// a queued item).
+    pub fn queue_async_load(&self, item: tidb_model::TableItemID, full_load: bool) {
+        self.needed.insert(item, full_load);
+    }
+
+    /// Go `AsyncLoadHistogramNeededItems.AllItems`: the domain's queued
+    /// asynchronous loads.
+    #[must_use]
+    pub fn async_load_items(&self) -> Vec<tidb_model::StatsLoadItem> {
+        self.needed.all_items()
+    }
+
+    /// Go `AsyncLoadHistogramNeededItems.Delete`: `item` no longer needs an
+    /// asynchronous load.
+    pub fn finish_async_load(&self, item: tidb_model::TableItemID) {
+        self.needed.delete(item);
+    }
+
+    /// Go `singleflight.Group.DoChan`'s join: `listener` waits for the load
+    /// of `key` in flight on this pool (`true`), or starts the flight, which
+    /// the caller then runs (`false`).
+    fn join_flight(&self, key: &str, listener: Listener) -> bool {
+        let mut flights = self.flights.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(listeners) = flights.get_mut(key) {
+            listeners.push(listener);
+            return true;
+        }
+        flights.insert(key.to_owned(), vec![listener]);
+        false
+    }
+
+    /// Ends the flight of `key`, handing `outcome` to every listener.
+    fn finish_flight(&self, key: &str, outcome: &SyncLoadOutcome) {
+        let listeners = self
+            .flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key)
+            .unwrap_or_default();
+        for listener in listeners {
+            let _ = listener.send(outcome.clone());
+        }
     }
 }
 
@@ -157,6 +213,22 @@ impl SyncLoadService {
     #[must_use]
     pub fn pool(&self) -> &Arc<StatisticsLoadWorkers> {
         &self.pool
+    }
+
+    /// [`StatisticsLoadWorkers::queue_async_load`] on the domain's pool.
+    pub fn queue_async_load(&self, item: tidb_model::TableItemID, full_load: bool) {
+        self.pool.queue_async_load(item, full_load);
+    }
+
+    /// [`StatisticsLoadWorkers::async_load_items`] of the domain's pool.
+    #[must_use]
+    pub fn async_load_items(&self) -> Vec<tidb_model::StatsLoadItem> {
+        self.pool.async_load_items()
+    }
+
+    /// [`StatisticsLoadWorkers::finish_async_load`] on the domain's pool.
+    pub fn finish_async_load(&self, item: tidb_model::TableItemID) {
+        self.pool.finish_async_load(item);
     }
 
     #[cfg(test)]
@@ -209,11 +281,15 @@ impl SyncLoadService {
     /// # Errors
     /// Go's messages: the timer fired, a channel closed, or an item was not
     /// delivered in time.
+    ///
+    /// An item that failed is queued on `needed` (the statement's domain
+    /// loaders) for their asynchronous loader.
     pub fn sync_wait_stats_load(
         result_ch: Vec<mpsc::Receiver<SyncLoadOutcome>>,
         needed_items: &[tidb_model::StatsLoadItem],
         timeout: Duration,
         load_start_time: Instant,
+        needed: Option<&SyncLoadService>,
     ) -> Result<(), &'static str> {
         use tidb_stats_handle_metrics::{SYNC_LOAD_HISTOGRAM, SYNC_LOAD_TIMEOUT_TOTAL, SYNC_LOAD_TOTAL};
 
@@ -273,11 +349,13 @@ impl SyncLoadService {
             SYNC_LOAD_TIMEOUT_TOTAL.inc();
             result = Err("sync load stats failed: some requested items are not loaded in time");
         }
-        for needed in needed_items {
-            if result_check_map.contains(&needed.table_item_id) {
-                let mut item = needed.table_item_id;
+        for needed_item in needed_items {
+            if result_check_map.contains(&needed_item.table_item_id) {
+                let mut item = needed_item.table_item_id;
                 item.is_sync_load_failed = true;
-                tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS.insert(item, needed.full_load);
+                if let Some(service) = needed {
+                    service.pool.queue_async_load(item, needed_item.full_load);
+                }
             }
         }
         result
@@ -290,27 +368,14 @@ impl SyncLoadService {
     ) -> mpsc::Receiver<SyncLoadOutcome> {
         let (listener_tx, listener_rx) = mpsc::sync_channel(1);
         let key = item.key();
-        {
-            let mut flights = GLOBAL_SINGLEFLIGHT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(listeners) = flights.get_mut(&key) {
-                listeners.push(listener_tx);
-                return listener_rx;
-            }
-            flights.insert(key.clone(), vec![listener_tx]);
+        if self.pool.join_flight(&key, listener_tx) {
+            return listener_rx;
         }
 
         let service = Arc::clone(self);
         std::thread::spawn(move || {
             let outcome = service.run_flight(item, timeout);
-            let mut flights = GLOBAL_SINGLEFLIGHT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let listeners = flights.remove(&key).unwrap_or_default();
-            for listener in listeners {
-                let _ = listener.send(outcome.clone());
-            }
+            service.pool.finish_flight(&key, &outcome);
         });
         listener_rx
     }
@@ -569,6 +634,45 @@ mod tests {
         let service =
             SyncLoadService::with_settings(loader, Arc::downgrade(&cache) as Weak<dyn StatsCache>, 1, 8, Duration::ZERO);
         (cache, service)
+    }
+
+    /// Two domains (two keyspaces of one node, design §6.4) request the same
+    /// table item ID at once: each runs its own load, rather than one
+    /// joining the other's flight and taking its outcome for its own cache.
+    #[test]
+    fn two_domains_do_not_share_a_load_of_the_same_item_id() {
+        let (started_tx, started_rx) = mpsc::sync_channel(2);
+        let (release_tx, release_rx) = mpsc::sync_channel(2);
+        let loader = Arc::new(BlockingLoader {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+            finished: Arc::new(AtomicBool::new(false)),
+        });
+        let (a_cache, b_cache) = (Arc::new(TestCache), Arc::new(TestCache));
+        let a = SyncLoadService::with_settings(
+            loader.clone(),
+            Arc::downgrade(&a_cache) as Weak<dyn StatsCache>,
+            1,
+            8,
+            Duration::ZERO,
+        );
+        let b = SyncLoadService::with_settings(
+            Arc::new(TestLoader::default()),
+            Arc::downgrade(&b_cache) as Weak<dyn StatsCache>,
+            1,
+            8,
+            Duration::ZERO,
+        );
+        let a_result = a.request(&[item(7, true)], Duration::from_secs(10));
+        started_rx.recv_timeout(Duration::from_secs(10)).expect("A's load started");
+        // A's load is still running; B's request of the same ID is B's own.
+        let b_result = b.request(&[item(7, true)], Duration::from_secs(10));
+        assert!(
+            b_result[0].recv_timeout(Duration::from_secs(10)).is_ok(),
+            "B waited on A's flight"
+        );
+        release_tx.send(()).unwrap();
+        assert!(a_result[0].recv_timeout(Duration::from_secs(10)).is_ok());
     }
 
     #[test]

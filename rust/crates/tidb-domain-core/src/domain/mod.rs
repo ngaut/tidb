@@ -215,30 +215,67 @@ impl TableStorageStatsProvider for ClusterTableStorageStatsProvider {
         &self,
         physical_ids: &[i64],
     ) -> Result<tidb_stats_handle_cache::table_size_stats::TableRowStatsSnapshot, String> {
-        let cache = &*tidb_stats_handle_cache::TABLE_ROW_STATS_CACHE;
-        // Go `updateStatsCacheIfNeed` + `TableRowStatsCache.UpdateByID`
-        // (`executor/infoschema_reader.go:671`): refresh the cache for every
-        // physical ID the statement's schema holds first. A failed read only
-        // warns -- the reader then serves the cache's previous values.
-        let domain = self.domain.upgrade();
-        let pool = domain.as_ref().map(|domain| domain.advanced_sys_session_pool());
+        Ok(self
+            .domain
+            .upgrade()
+            .map(|domain| domain.load_table_row_stats(physical_ids))
+            .unwrap_or_default())
+    }
+}
+
+impl Domain {
+    /// Go `updateStatsCacheIfNeed` + `TableRowStatsCache.UpdateByID`
+    /// (`executor/infoschema_reader.go:671`) over this domain's cache:
+    /// refresh every physical ID the statement's schema holds first, then
+    /// read the cache. A failed read only warns -- the reader then serves
+    /// the cache's previous values.
+    fn load_table_row_stats(
+        self: &Arc<Self>,
+        physical_ids: &[i64],
+    ) -> tidb_stats_handle_cache::table_size_stats::TableRowStatsSnapshot {
+        let pool = Some(self.advanced_sys_session_pool());
         let source = SessionSizeReads {
             pool: &crate::sys_session::StatsPool {
                 session_pool: pool.as_ref(),
             },
         };
-        if let Err(error) = cache.update_by_id(&source, physical_ids) {
+        if let Err(error) = self.table_row_stats.update_by_id(&source, physical_ids) {
             // Go `updateStatsCacheIfNeed`.
             tidb_logutil::bg_logger().warn(
                 "cannot update stats cache for tables",
                 &[tidb_logutil::zap_error(error)],
             );
         }
-        let (rows, lengths) = cache.snapshot();
-        Ok(tidb_stats_handle_cache::table_size_stats::TableRowStatsSnapshot {
+        let (rows, lengths) = self.table_row_stats.snapshot();
+        tidb_stats_handle_cache::table_size_stats::TableRowStatsSnapshot {
             table_rows: rows.into_iter().collect(),
             column_lengths: lengths.into_iter().collect(),
-        })
+        }
+    }
+
+    /// The domain's statistics-load pool, which keeps its sessions'
+    /// asynchronous-load demand for its asynchronous loader (design §6.4).
+    #[must_use]
+    pub fn load_workers(&self) -> Arc<tidb_stats_handle_syncload::sync_load::StatisticsLoadWorkers> {
+        Arc::clone(
+            self.stats_load_workers
+                .get_or_init(tidb_stats_handle_syncload::sync_load::StatisticsLoadWorkers::new),
+        )
+    }
+
+    /// Go `Domain.Store().GetCodec().GetKeyspaceID()` (`u32::MAX` for an
+    /// API-V1 store): what the domain's process-wide state is keyed by
+    /// beside its own IDs (design §6.4).
+    #[must_use]
+    pub fn keyspace_id(&self) -> u32 {
+        self.transactions.keyspace_id()
+    }
+
+    /// Pins snapshot timestamp `ts` against this domain's keyspace's GC
+    /// (its min-start-ts report) until the guard drops (design §6.5).
+    #[must_use]
+    pub fn hold_start_ts(&self, ts: u64) -> tidb_txnkv::StartTsGuard {
+        tidb_txnkv::ACTIVE_START_TS.of(self.transactions.keyspace_id()).hold(ts)
     }
 }
 
@@ -638,7 +675,13 @@ pub type BindingHandleSlot =
 pub struct Domain {
     /// Go `Domain.store.GetKeyspace`: installed from the opened store.
     store_keyspace: std::sync::OnceLock<String>,
+    /// The keyspace this domain's sessions act for (design §6.1): the one
+    /// its runtime bound, else its store's; see [`Self::keyspace_context`].
+    keyspace: std::sync::OnceLock<Option<Arc<tidb_keyspace::KeyspaceContext>>>,
     cross_ks_runtimes: std::sync::OnceLock<cross_ks::CrossKsRuntimes>,
+    /// Go `Domain.info` (`infosync.InfoSyncer`): the PD managers this
+    /// domain's sessions and DDL use (multi-keyspace design §6.2).
+    info_syncer: std::sync::OnceLock<Arc<tidb_domain_infosync::info_syncer::InfoSyncer>>,
     /// Go `Domain.unprefixedEtcdCli`: cluster-wide metadata client.
     unprefixed_etcd_client: std::sync::OnceLock<Arc<tidb_pd_client::EtcdClient>>,
     /// The session package's opener of this domain's internal sessions.
@@ -654,6 +697,10 @@ pub struct Domain {
     /// The `SHOW STATUS` providers this domain registered as it started its
     /// DDL and binding handle, unregistered when it closes.
     statistics: std::sync::Mutex<Vec<Arc<dyn tidb_variable::statusvar::Statistics>>>,
+    /// Go's package-level `TableRowStatsCache`, kept per domain: it is keyed
+    /// by physical table ID, which collides across the keyspaces of a node
+    /// serving several (design §6.4).
+    table_row_stats: tidb_stats_handle_cache::StatsTableRowCache,
     /// The write/read capability every connection's statements open their
     /// snapshots and publish their commits through.
     pub transactions: Arc<dyn ClusterTransactions>,
@@ -910,6 +957,13 @@ impl Domain {
     pub fn global_vars(&self) -> GlobalSysvars {
         self.global_vars.clone()
     }
+
+    /// The values this domain's keyspace reads the vardef global statics
+    /// from (multi-keyspace design §6.3): its background loops' counterpart
+    /// of `SessionVars::vardef`.
+    pub fn vardef(&self) -> Arc<tidb_vardef::VardefSnapshot> {
+        self.global_vars.vardef()
+    }
 }
 
 impl Domain {
@@ -1030,10 +1084,18 @@ impl Domain {
         sys_session_opener: SysSessionOpener,
     ) -> Self {
         // Go `initDomainSysVars`: `variable.SetExternalTimestamp` /
-        // `GetExternalTimestamp`.
-        tidb_variable::domain_slots::set_external_timestamp_funcs(Arc::new(ClusterExternalTimestamp(
-            Arc::clone(&transactions),
-        )));
+        // `GetExternalTimestamp` over this domain's store. The process slot
+        // is the configured keyspace's; a keyspace that owns its vardef values
+        // reads `tidb_external_ts` through its own store (design §6.3), so a
+        // later keyspace's domain does not take the slot over. PD keeps one
+        // external timestamp per cluster, so only the configured keyspace
+        // writes it: for every other keyspace it is a process variable.
+        let external_timestamp = Arc::new(ClusterExternalTimestamp(Arc::clone(&transactions)));
+        if global_vars.vardef().is_per_keyspace() {
+            global_vars.set_external_timestamp_provider(external_timestamp);
+        } else {
+            tidb_variable::domain_slots::set_external_timestamp_funcs(external_timestamp);
+        }
         let boot_skipped =
             cluster_session_catalog(&catalog.get_latest(), &stats.load(), auto_ids.as_ref())
                 .skipped;
@@ -1089,6 +1151,7 @@ impl Domain {
                 Ok(())
             }
         }));
+        let vardef = global_vars.vardef();
         let stats_usage = Arc::new(tidb_stats_handle_usage::StatsUsageHandle::new());
         stats_usage.start_worker();
         let data_lock_waits = Arc::new(ClusterDataLockWaits {
@@ -1100,12 +1163,15 @@ impl Domain {
         ));
         Self {
             store_keyspace: std::sync::OnceLock::new(),
+            keyspace: std::sync::OnceLock::new(),
+            info_syncer: std::sync::OnceLock::new(),
             cross_ks_runtimes: std::sync::OnceLock::new(),
             unprefixed_etcd_client: std::sync::OnceLock::new(),
             sys_session_opener,
             transactions,
             bindings: BindingHandleSlot::default(),
             statistics: std::sync::Mutex::default(),
+            table_row_stats: tidb_stats_handle_cache::StatsTableRowCache::new(),
             global_config_syncer: None,
             binding_session_factory: Weak::new(),
             schema_builder_domain,
@@ -1116,7 +1182,12 @@ impl Domain {
             catalog,
             privileges,
             pushdown_blacklists: Default::default(),
-            processes: ProcessRegistry::default(),
+            // TRX_SUMMARY per keyspace on a multi-keyspace node (§6.8).
+            processes: if tidb_keyspace::is_multi_keyspace_mode() {
+                ProcessRegistry::with_own_transaction_history()
+            } else {
+                ProcessRegistry::default()
+            },
             auto_ids,
             mpp_client: None,
             kv_client: None,
@@ -1164,9 +1235,9 @@ impl Domain {
             ttl_job_manager: std::sync::OnceLock::new(),
             mv_service: std::sync::OnceLock::new(),
             signing_cert_loop: std::sync::OnceLock::new(),
-            expensive_query_handle: Arc::new(tidb_expensivequery::Handle::new(
-                expensive_query_exited,
-            )),
+            expensive_query_handle: Arc::new(
+                tidb_expensivequery::Handle::new(expensive_query_exited).with_vardef(vardef),
+            ),
             expensive_query_exit: Mutex::new(Some(expensive_query_exit)),
             closed: std::sync::atomic::AtomicBool::new(false),
             approximate_table_counts,
@@ -1832,12 +1903,49 @@ impl Domain {
 
     /// Go `Domain.store.GetKeyspace`: set from the actual store during initialization.
     pub fn install_store_keyspace(&self, keyspace: String) {
+        if !keyspace.is_empty() {
+            self.bind_statistics(&keyspace);
+        }
         self.store_keyspace.set(keyspace).expect("store identity installed once");
     }
 
     /// Go `Domain.Store().GetKeyspace`; embedded API-V1 stores have no name.
     pub fn store_keyspace(&self) -> &str {
         self.store_keyspace.get().map_or("", String::as_str)
+    }
+
+    /// Binds the keyspace identity this domain's runtime serves, once,
+    /// before its sessions open.
+    pub fn install_keyspace_context(&self, keyspace: tidb_keyspace::KeyspaceContext) {
+        self.bind_statistics(keyspace.name());
+        self.keyspace.set(Some(Arc::new(keyspace))).expect("keyspace identity installed once");
+    }
+
+    /// The keyspace this domain's sessions and background work act for:
+    /// their slow-log and statement-summary keyspace, resource-group tags,
+    /// username policy and IMPORT INTO keys. A domain its runtime bound no
+    /// identity to (an internal domain over a store: the DDL and system
+    /// session pools, the bootstrap's variable loader, a cross-keyspace
+    /// domain) acts for its store's keyspace. `None` only over an API-V1
+    /// store, which names no keyspace; its readers fall back to the
+    /// process's configured keyspace
+    /// ([`tidb_keyspace::KeyspaceContext::unbound`]).
+    pub fn keyspace_context(&self) -> Option<&Arc<tidb_keyspace::KeyspaceContext>> {
+        self.keyspace
+            .get_or_init(|| tidb_keyspace::KeyspaceContext::of_store(&*self.transactions.store_keyspace(), self.transactions.keyspace_id()).map(Arc::new))
+            .as_ref()
+    }
+
+    /// Installs the domain's info syncer, once.
+    pub fn install_info_syncer(&self, syncer: Arc<tidb_domain_infosync::info_syncer::InfoSyncer>) {
+        let _ = self.info_syncer.set(syncer);
+    }
+
+    /// Go `Domain.InfoSyncer`: the info syncer its runtime installed. An
+    /// internal domain over a store (the DDL and system session pools, a
+    /// cross-keyspace domain) has none, and reads the process's.
+    pub fn info_syncer(&self) -> Option<&Arc<tidb_domain_infosync::info_syncer::InfoSyncer>> {
+        self.info_syncer.get()
     }
 
     /// Go `Domain.Init`: retains a handle without a keyspace namespace.
@@ -1971,17 +2079,54 @@ impl Domain {
         ));
         // Go `ddl.Start`: `variable.RegisterStatistics(d)`, whose id is this
         // server's.
+        let mut id = syncer.get_local_server_info().static_info.id.clone();
         self.register_statistics(Arc::new(tidb_ddl::stat::DdlStatistics {
-            id: syncer.get_local_server_info().static_info.id.clone(),
+            id: id.clone(),
             catalog: Arc::clone(&self.catalog),
         }));
+        // A test's hold on a runtime's startup with its DDL statuses
+        // registered and its keyspace identity not yet bound; the argument
+        // is their `server_id`.
+        tidb_failpoint::inject_call("github.com/pingcap/tidb/pkg/domain/afterRegisterDDLStatistics", &mut id);
         self.server_info = Some(syncer);
         self
     }
 
+    /// The domain's status providers are its keyspace's: a node serving
+    /// several keyspaces shows them to that keyspace only (design §6.8).
+    /// Binds the ones registered before the keyspace was known.
+    fn bind_statistics(&self, keyspace: &str) {
+        for statistics in self
+            .statistics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            tidb_variable::statusvar::bind_statistics_to_keyspace(statistics, keyspace);
+        }
+    }
+
     /// Go `variable.RegisterStatistics`, kept for the domain's close.
     fn register_statistics(&self, statistics: Arc<dyn tidb_variable::statusvar::Statistics>) {
-        tidb_variable::statusvar::register_statistics(Arc::clone(&statistics));
+        // Under the domain's keyspace from the first registration: its
+        // runtime's identity once bound, otherwise its store's, which a
+        // domain has from construction. A provider registered with no owner
+        // would be every keyspace's until its runtime bound it (design
+        // §6.8); only an API-V1 store, which names no keyspace, registers
+        // one.
+        let keyspace = match self.keyspace.get().and_then(Option::as_ref) {
+            Some(keyspace) => keyspace.name().to_owned(),
+            None => self
+                .store_keyspace
+                .get()
+                .cloned()
+                .unwrap_or_else(|| self.transactions.store_keyspace()),
+        };
+        if keyspace.is_empty() {
+            tidb_variable::statusvar::register_statistics(Arc::clone(&statistics));
+        } else {
+            tidb_variable::statusvar::register_keyspace_statistics(&keyspace, Arc::clone(&statistics));
+        }
         self.statistics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2093,8 +2238,9 @@ impl AutoAnalyzeWorker {
                 let Some(factory) = weak.upgrade() else {
                     return;
                 };
+                // The keyspace's auto-analyze switch (design §6.3).
                 factory.handle_auto_analyze_tick(
-                    tidb_vardef::RUN_AUTO_ANALYZE.load(std::sync::atomic::Ordering::SeqCst),
+                    factory.vardef().run_auto_analyze().load(std::sync::atomic::Ordering::SeqCst),
                     stats_lease,
                 );
             })

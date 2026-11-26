@@ -260,6 +260,42 @@ fn init_global_var_from_system_db_loads_the_collation_switch() {
     assert!(tidb_datatype::new_collation_enabled());
 }
 
+/// Every session acts for a keyspace it carries (multi-keyspace design §6.1),
+/// including the internal ones no runtime bound an identity to: the
+/// bootstrap's variable loader runs on a domain of its own over the store
+/// (`init_global_var_from_system_db`), and that domain and its sessions act
+/// for the store's keyspace. Without it, a multi-keyspace node refused the
+/// loader's session at startup (the unbound-identity debug assertion). The
+/// test reads the identities directly, so it leaves the process's mode and
+/// configuration alone.
+#[test]
+fn internal_domains_act_for_their_store_keyspace() {
+    if !tidb_config_kerneltype::is_next_gen() {
+        // A classic store names no keyspace; multi-keyspace serving is nextgen only.
+        return;
+    }
+    let (stack, _users) = cop_backed_stack();
+    let pool = crate::ddl_session_pool::NodeDdlSessionPool::for_global_var_init(
+        stack.opener.clone(),
+        std::time::Duration::from_secs(10),
+    )
+    .expect("the variable loader's pool opens");
+    let domain = pool.store_domain().expect("the variable loader's domain");
+    assert_eq!(
+        domain.keyspace_context().map(|keyspace| keyspace.name().to_owned()).as_deref(),
+        Some(tidb_keyspace::SYSTEM)
+    );
+    let context = crate::domain::cluster_session_node::open_pool_session(&domain, 0).expect("a pool session opens");
+    crate::domain::cluster_session_node::sessions::cluster_stats_session(&*context)
+        .with_session(|session| {
+            assert_eq!(session.session.keyspace.as_deref().map(|keyspace| keyspace.name()), Some(tidb_keyspace::SYSTEM));
+            Ok(())
+        })
+        .unwrap();
+    drop(context);
+    domain.close();
+}
+
 #[test]
 fn upgrade_to_ver242_writes_the_cluster_id_like_go() {
     let (stack, _users) = cop_backed_stack();

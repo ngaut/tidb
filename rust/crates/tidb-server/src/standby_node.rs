@@ -71,14 +71,11 @@ pub(crate) fn get_normal_closed_conn(keyspace_name: &str, conn_id: &str) -> Stri
 }
 
 /// Go `Server.kill`: a killed connection's `normalCloseMsg` is recorded
-/// under its gateway connection id when the server has a standby controller.
-pub(crate) fn record_killed_conn_normal_close(gateway_conn_id: &str, normal_close_msg: &str) {
+/// under its keyspace (`keyspace_name`, the one it was routed to) and
+/// gateway connection id when the server has a standby controller.
+pub(crate) fn record_killed_conn_normal_close(keyspace_name: &str, gateway_conn_id: &str, normal_close_msg: &str) {
     if !normal_close_msg.is_empty() && server_standby_controller().is_some() {
-        set_normal_closed_conn(
-            &tidb_keyspace::get_keyspace_name_by_settings(),
-            gateway_conn_id,
-            normal_close_msg,
-        );
+        set_normal_closed_conn(keyspace_name, gateway_conn_id, normal_close_msg);
     }
 }
 
@@ -233,6 +230,17 @@ static CONTROLLER: OnceLock<Arc<LoadKeyspaceController>> = OnceLock::new();
 #[must_use]
 pub fn standby_controller() -> Option<&'static Arc<LoadKeyspaceController>> {
     CONTROLLER.get()
+}
+
+/// Go `main`'s `initConfig` then kernel check: the loaded configuration is
+/// stored globally first, and the check reads it from there.
+///
+/// # Errors
+///
+/// The message Go prints before exiting, as [`check_kernel_config`].
+pub fn install_and_check_kernel_config(config: &crate::NodeConfig) -> Result<(), &'static str> {
+    crate::install_process_globals(config);
+    check_kernel_config()
 }
 
 /// Go `main`'s check after the configuration is loaded ("we cannot add this
@@ -660,6 +668,29 @@ pub(crate) fn auto_id_owner_status(is_auto_id_owner: bool) -> Result<String, ()>
 mod tests {
     use super::*;
 
+    /// A nextgen node whose keyspace comes from the command line (or its
+    /// config file) passes the kernel check: the parsed configuration is
+    /// installed before the check reads it. Before this ordering, the check
+    /// saw the default empty keyspace and the node exited at startup.
+    #[cfg(feature = "nextgen")]
+    #[test]
+    fn nextgen_kernel_check_reads_the_parsed_keyspace() {
+        let config = crate::parse_node_config(["tidb-server", "--keyspace-name", "keyspace1"])
+            .expect("parse flags");
+        assert_eq!(install_and_check_kernel_config(&config), Ok(()));
+    }
+
+    /// Go: a nextgen node with neither a keyspace nor standby mode is refused.
+    #[cfg(feature = "nextgen")]
+    #[test]
+    fn nextgen_kernel_check_requires_a_keyspace() {
+        let config = crate::parse_node_config(["tidb-server"]).expect("parse flags");
+        assert_eq!(
+            install_and_check_kernel_config(&config),
+            Err("invalid config: keyspace name or standby mode is required for nextgen TiDB")
+        );
+    }
+
     /// Go `AutoIDOwnerHandler`.
     #[test]
     fn auto_id_owner_status_answers_as_go() {
@@ -706,7 +737,11 @@ mod tests {
         // The connection's kill handle as `serve_connection_inner` binds it.
         let new_conn = |conn_id: u64, gw_conn_id: &'static str| {
             let close = ConnectionClose::with_wake(move |normal_close_msg| {
-                record_killed_conn_normal_close(gw_conn_id, normal_close_msg);
+                record_killed_conn_normal_close(
+                    &tidb_keyspace::get_keyspace_name_by_settings(),
+                    gw_conn_id,
+                    normal_close_msg,
+                );
             });
             let guard = registry.register(
                 conn_id,

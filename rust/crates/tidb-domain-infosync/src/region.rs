@@ -17,94 +17,24 @@
 //! (`is.pdHTTPCli`), which a test replaces (`SetPDHttpCliForTest`).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use tikv_client::pd_http;
 
-/// The info syncer's `pdHTTPCli` (Go `pd.Client`), for the calls
-/// `region.go` makes.
-pub trait PdHttpClient: Send + Sync {
-    /// Go `GetRegionDistributionByKeyRange`.
-    fn get_region_distribution_by_key_range(
-        &self,
-        key_range: &pd_http::KeyRange,
-        engine: &str,
-    ) -> Result<pd_http::RegionDistributions, String>;
-    /// Go `GetSchedulerConfig`.
-    fn get_scheduler_config(&self, scheduler_name: &str) -> Result<serde_json::Value, String>;
-    /// Go `CreateSchedulerWithInput`.
-    fn create_scheduler_with_input(
-        &self,
-        name: &str,
-        input: &mut HashMap<String, serde_json::Value>,
-    ) -> Result<(), String>;
-    /// Go `CancelSchedulerJob`.
-    fn cancel_scheduler_job(&self, scheduler_name: &str, job_id: u64) -> Result<(), String>;
-}
+use crate::pd_http::PdHttpClient;
 
-impl PdHttpClient for pd_http::Client {
-    fn get_region_distribution_by_key_range(
-        &self,
-        key_range: &pd_http::KeyRange,
-        engine: &str,
-    ) -> Result<pd_http::RegionDistributions, String> {
-        tidb_store_driver_txn::cluster_http::block_on_pd_http(
-            pd_http::Client::get_region_distribution_by_key_range(self, key_range, engine),
-        )
-    }
-
-    fn get_scheduler_config(&self, scheduler_name: &str) -> Result<serde_json::Value, String> {
-        tidb_store_driver_txn::cluster_http::block_on_pd_http(pd_http::Client::get_scheduler_config(
-            self,
-            scheduler_name,
-        ))
-    }
-
-    fn create_scheduler_with_input(
-        &self,
-        name: &str,
-        input: &mut HashMap<String, serde_json::Value>,
-    ) -> Result<(), String> {
-        tidb_store_driver_txn::cluster_http::block_on_pd_http(
-            pd_http::Client::create_scheduler_with_input(self, name, input),
-        )
-    }
-
-    fn cancel_scheduler_job(&self, scheduler_name: &str, job_id: u64) -> Result<(), String> {
-        tidb_store_driver_txn::cluster_http::block_on_pd_http(pd_http::Client::cancel_scheduler_job(
-            self,
-            scheduler_name,
-            job_id,
-        ))
-    }
-}
-
-/// The info syncer's `pdHTTPCli`; `None` on a node without PD.
-static PD_HTTP_CLI: Mutex<Option<Arc<dyn PdHttpClient>>> = Mutex::new(None);
-
-/// Go `GlobalInfoSyncerInit`'s `pdHTTPCli`: the store's PD HTTP client as the
-/// info syncer derives it, or none.
-pub fn init_pd_http_cli(cli: Option<&pd_http::Client>) {
-    *PD_HTTP_CLI.lock().unwrap_or_else(PoisonError::into_inner) = cli.map(|cli| {
-        Arc::new(crate::pd_http::info_syncer_pd_http_client(cli)) as Arc<dyn PdHttpClient>
-    });
-}
-
-/// Go `SetPDHttpCliForTest`: installs `cli` and answers the function that
-/// puts the previous client back.
+/// Go `SetPDHttpCliForTest` on the info syncer this thread reads: installs
+/// `cli` and answers the function that puts the previous client back.
 pub fn set_pd_http_cli_for_test(cli: Arc<dyn PdHttpClient>) -> impl FnOnce() {
-    let original = PD_HTTP_CLI
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .replace(cli);
-    move || *PD_HTTP_CLI.lock().unwrap_or_else(PoisonError::into_inner) = original
+    let syncer = crate::info_syncer::get();
+    let original = syncer.pd_http_cli();
+    syncer.init_pd_http_cli(Some(cli));
+    move || syncer.init_pd_http_cli(original)
 }
 
 fn pd_http_cli(name: &str) -> Result<Arc<dyn PdHttpClient>, String> {
-    PD_HTTP_CLI
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
+    crate::info_syncer::get()
+        .pd_http_cli()
         // PD client `errs.ErrClientGetLeader.FastGenByArgs(name)`.
         .ok_or_else(|| format!("[PD:client:ErrClientGetLeader]get leader failed, {name}"))
 }

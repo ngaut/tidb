@@ -60,6 +60,11 @@ pub struct DdlStepWorker {
 }
 
 impl DdlStepWorker {
+    /// Job `job_id`'s key in the process: its DDL's keyspace and the job.
+    pub(crate) fn job_key(&self, job_id: i64) -> crate::job_ctx::JobKey {
+        crate::job_ctx::JobKey::new(self.sess_pool.keyspace_id(), job_id)
+    }
+
     /// Go `w.sess.GetAdvisoryLock(name, timeout)`: a lock this delivery
     /// already holds is held again.
     pub fn get_advisory_lock(
@@ -763,7 +768,9 @@ fn recover_table(
     let label_table = LabelRuleTable::from_table_info(&table.read());
     let old_rules = label_rules::get_old_label_rules(
         label_rules.manager(),
+        label_rules.codec(),
         &label_table,
+        &label_table.ids(),
         &old_schema_name,
         &old_table_name,
     )
@@ -805,10 +812,11 @@ fn recover_table(
     label_rules
         .push(
             label_rules::update_label_rules(
+                label_rules.codec(),
                 &active.job.schema_name.to_string(),
                 &label_table,
                 &old_rules,
-                old_rules.old_rule_ids(),
+                &old_rules.old_rule_ids(),
                 table_info.id,
             ),
             Some("failed to update the label rule to PD"),

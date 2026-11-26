@@ -554,7 +554,9 @@ impl Session {
         // Go `StmtCtx.SQLDigest`: a statement with no normalized text tags
         // no SQL digest.
         let sql_digest = (!normalized.is_empty()).then(|| digest.as_bytes().to_vec());
-        let keyspace_name = tidb_keyspace::get_keyspace_name_bytes_by_settings();
+        // Go `keyspace.GetKeyspaceNameBytesBySettings()`, for the session's
+        // keyspace.
+        let keyspace = self.keyspace_context();
         // Go `StmtCtx.GetPlanDigest`: empty until the plan is published.
         // Held weakly: the session owns its plan cell, and the tagger lives in
         // the KV context its transactions and plan contexts share.
@@ -569,6 +571,7 @@ impl Session {
         };
         let lock_plan_digest = plan_digest.clone();
         let lock_sql_digest = sql_digest.clone();
+        let lock_keyspace = Arc::clone(&keyspace);
         self.statement_kv_context
             .publish(tidb_txnkv::StatementKvContext {
                 caller_context: Some(tikv_client::trace::current_trace_context()),
@@ -581,7 +584,7 @@ impl Session {
                 exec_details: Some(Arc::clone(exec_details)),
                 txn_start_ts: None,
                 resource_group_tagger: Some(Arc::new(move || {
-                    let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(keyspace_name);
+                    let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(keyspace.name_bytes());
                     tagger.set_plan_digest(&plan_digest());
                     if let Some(sql_digest) = &sql_digest {
                         tagger.set_sql_digest(sql_digest);
@@ -592,7 +595,7 @@ impl Session {
                     let Some(sql_digest) = &lock_sql_digest else {
                         return Vec::new();
                     };
-                    let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(keyspace_name);
+                    let mut tagger = tidb_txnkv::ResourceGroupTagBuilder::new(lock_keyspace.name_bytes());
                     tagger
                         .set_plan_digest(&lock_plan_digest())
                         .set_sql_digest(sql_digest);
@@ -1323,11 +1326,15 @@ mod tests {
 impl tidb_executor::exec_stmt_observation::ExecStmtObservation for Session {
     /// Go `ExecStmt.FinishExecuteStmt`: use the session's store codec, not global identity.
     fn observed_keyspace_id(&self) -> u32 {
-        if tidb_keyspace::is_keyspace_name_empty(&tidb_keyspace::get_keyspace_name_by_settings()) {
+        if tidb_keyspace::is_keyspace_name_empty(self.keyspace_context().name()) {
             0
         } else {
             self.store_keyspace_id
         }
+    }
+
+    fn observed_keyspace_name(&self) -> String {
+        self.keyspace_context().name().to_owned()
     }
 
     fn observed_connection_id(&self) -> u64 {

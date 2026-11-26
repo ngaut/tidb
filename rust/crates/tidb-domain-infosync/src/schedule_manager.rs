@@ -16,7 +16,7 @@
 //! which FLASHBACK CLUSTER closes and restores.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 
 use tikv_client::pd_http;
 
@@ -85,37 +85,6 @@ impl ScheduleManager for MockScheduleManager {
             .extend(config.iter().map(|(key, value)| (key.clone(), value.clone())));
         Ok(())
     }
-}
-
-/// The `InfoSyncer`'s `scheduleManager`.
-static SCHEDULE_MANAGER: Mutex<Option<Arc<dyn ScheduleManager>>> = Mutex::new(None);
-
-/// Go `InfoSyncer.initScheduleManager`: PD's manager, or a fresh mock when
-/// the node has no PD.
-pub fn init_schedule_manager(manager: Option<Arc<dyn ScheduleManager>>) {
-    *SCHEDULE_MANAGER
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) =
-        Some(manager.unwrap_or_else(|| Arc::new(MockScheduleManager::default())));
-}
-
-fn schedule_manager() -> Arc<dyn ScheduleManager> {
-    Arc::clone(
-        SCHEDULE_MANAGER
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert_with(|| Arc::new(MockScheduleManager::default())),
-    )
-}
-
-/// Go `GetPDScheduleConfig`: the schedule information from PD.
-pub fn get_pd_schedule_config() -> Result<HashMap<String, serde_json::Value>, String> {
-    schedule_manager().get_schedule_config()
-}
-
-/// Go `SetPDScheduleConfig`: sets the schedule information for PD.
-pub fn set_pd_schedule_config(config: &HashMap<String, serde_json::Value>) -> Result<(), String> {
-    schedule_manager().set_schedule_config(config)
 }
 
 #[cfg(test)]

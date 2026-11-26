@@ -13712,18 +13712,18 @@ fn historical_read_batch_schema_data_and_timestamp_lifetime() {
         )),
         vec![vec!["1", "10"]]
     );
-    assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&ts));
+    assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&ts));
     session
         .node_conn()
         .control_transaction(&format!("START TRANSACTION READ ONLY AS OF TIMESTAMP {ts}"))
         .unwrap();
-    assert!(tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&ts));
+    assert!(tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&ts));
     assert_eq!(
         displayed(rows(&mut session, "SELECT * FROM t")),
         vec![vec!["1", "10"]]
     );
     assert!(
-        tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&ts),
+        tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&ts),
         "transaction protects time between reads"
     );
     for sql in [
@@ -13755,7 +13755,7 @@ fn historical_read_batch_schema_data_and_timestamp_lifetime() {
         .execute("EXPLAIN ANALYZE UPDATE t SET v=30")
         .is_err());
     session.node_conn().control_transaction("ROLLBACK").unwrap();
-    assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&ts));
+    assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&ts));
     assert_eq!(
         displayed(rows(&mut session, "SELECT * FROM t")),
         vec![vec!["1", "20", "7"]]
@@ -13765,7 +13765,7 @@ fn historical_read_batch_schema_data_and_timestamp_lifetime() {
         .node_conn()
         .execute(&format!("SELECT * FROM t AS OF TIMESTAMP {future}"))
         .is_err());
-    assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&future));
+    assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&future));
     assert!(session
         .node_conn()
         .execute(&format!("SET tidb_snapshot='{ts}'"))
@@ -13779,7 +13779,7 @@ fn historical_read_batch_schema_data_and_timestamp_lifetime() {
     );
     rows(&mut session, &format!("SET tidb_snapshot='{ts}'"));
     assert!(
-        !tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&ts),
+        !tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&ts),
         "idle snapshot SET retains schema, not an active native timestamp"
     );
     assert!(session
@@ -13864,9 +13864,9 @@ fn historical_read_batch_schema_data_and_timestamp_lifetime() {
         vec![vec!["1", "10"]]
     );
     let held = session.historical_read_ts().unwrap();
-    assert!(tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&held));
+    assert!(tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&held));
     session.node_conn().control_transaction("ROLLBACK").unwrap();
-    assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&held));
+    assert!(!tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&held));
     rows(&mut session, "UPDATE t SET v=20 WHERE id=1");
     assert!(
         session.historical_read_ts().is_none(),
@@ -13890,7 +13890,7 @@ fn historical_read_batch_schema_data_and_timestamp_lifetime() {
         .unwrap();
     session.node_conn().control_transaction("ROLLBACK").unwrap();
     assert!(
-        !tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&ts),
+        !tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&ts),
         "rollback without a read retires the metadata snapshot"
     );
     session
@@ -13899,7 +13899,7 @@ fn historical_read_batch_schema_data_and_timestamp_lifetime() {
         .unwrap();
     drop(session);
     assert!(
-        !tidb_txnkv::ACTIVE_START_TS.snapshot().contains(&ts),
+        !tidb_txnkv::ACTIVE_START_TS.snapshot_all().contains(&ts),
         "disconnect retires the historical owner"
     );
 }
@@ -13979,7 +13979,7 @@ fn timestamp_entrypoints_batch_one_shot_and_external_share_history() {
     session.node_conn().control_transaction("ROLLBACK").unwrap();
     assert_eq!(session.vars().txn_read_ts(), 0);
     assert!(!tidb_txnkv::ACTIVE_START_TS
-        .snapshot()
+        .snapshot_all()
         .contains(&((ts >> 18) << 18)));
     rows(&mut session, &format!("SET GLOBAL tidb_external_ts={ts}"));
     assert_eq!(
@@ -14102,7 +14102,7 @@ fn snapshot_provider_batch_real_storage_switches_without_exposing_buffered_write
         assert_eq!(session.current_tso().value(), ordinary_ts);
         assert!(
             !tidb_txnkv::ACTIVE_START_TS
-                .snapshot()
+                .snapshot_all()
                 .contains(&historical_ts)
         );
         rows(&mut session, "SET tidb_snapshot=''");
@@ -16445,7 +16445,7 @@ fn label_rule_ddl_writes_the_nodes_label_manager() {
         .execute_write("DROP DATABASE d2")
         .unwrap();
     assert_eq!(
-        tidb_domain_infosync::label_manager::label_rule_manager()
+        tidb_domain_infosync::info_syncer::label_rule_manager()
             .get_label_rules(&["schema/d2/x".to_owned()])
             .unwrap()
             .len(),
@@ -28619,8 +28619,8 @@ fn the_async_load_drains_the_demand_on_the_domains_sessions_as_go() {
         is_index: false,
         is_sync_load_failed: false,
     };
-    let needed = &tidb_stats_asyncload::ASYNC_LOAD_HISTOGRAM_NEEDED_ITEMS;
-    needed.insert(item, true);
+    let needed = stack.factory.load_workers();
+    needed.queue_async_load(item, true);
 
     let catalog = stack.factory.catalog.get_latest();
     let table = catalog
@@ -28634,9 +28634,10 @@ fn the_async_load_drains_the_demand_on_the_domains_sessions_as_go() {
         },
         &targets,
         stats,
+        &needed,
     )
     .expect("the demand drains on the domain's sessions");
-    assert!(needed.all_items().iter().all(|requested| requested.table_item_id != item));
+    assert!(needed.async_load_items().iter().all(|requested| requested.table_item_id != item));
     let table = stats.get(table_id).unwrap();
     let column = table.hist_coll.get_column(v_column).unwrap();
     let column = column.read().unwrap();

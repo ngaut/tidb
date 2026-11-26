@@ -115,6 +115,25 @@ pub trait DdlSessionPool: Send + Sync {
         None
     }
 
+    /// The keyspace ID of the store the DDL runs on (`u32::MAX` for an
+    /// API-V1 store). Job IDs are per keyspace: what the DDL keys by job
+    /// in the process it keys by this too (design §6.4).
+    fn keyspace_id(&self) -> u32;
+
+    /// The keyspace values of the vardef global statics the DDL runs with
+    /// (multi-keyspace design §6.3): its domain's. `None` where no node is
+    /// bound, which reads the process statics.
+    fn vardef(&self) -> Option<std::sync::Arc<tidb_vardef::VardefSnapshot>> {
+        None
+    }
+
+    /// The PD managers of the keyspace the DDL serves (design §6.2): its
+    /// domain's info syncer. `None` where no node is bound, which reads the
+    /// process's.
+    fn info_syncer(&self) -> Option<std::sync::Arc<tidb_domain_infosync::info_syncer::InfoSyncer>> {
+        None
+    }
+
     /// Go `sessionctx.Context.GetAdvisoryLock`'s backend for the DDL
     /// worker's session (`w.sess`): each lock is an internal session of the
     /// domain. `None` where no node is bound.
