@@ -407,7 +407,7 @@ impl<C: Columns + Send + Sync + 'static> HashAggExec<C> {
     }
 
     /// Go `prepare4ParallelExec`: the fetcher, the partial workers and the
-    /// final workers, each on its own thread.
+    /// final workers, each on its own lane (Go's goroutine).
     fn prepare_4_parallel_exec(&mut self) {
         let Some(pending) = self.parallel.as_mut().and_then(|parallel| parallel.pending.take()) else {
             return;
@@ -442,7 +442,7 @@ impl<C: Columns + Send + Sync + 'static> HashAggExec<C> {
                         .map(|state| {
                             let (state, agg_funcs, spill_helper, mem_tracker, final_output_sender) =
                                 (Arc::clone(state), Arc::clone(&agg_funcs), Arc::clone(&spill_helper), Arc::clone(&mem_tracker), final_output_sender.clone());
-                            std::thread::spawn(move || {
+                            tidb_goruntime::worker_pool::spawn_lane("hashagg-spill", move || {
                                 let output = final_output_sender.clone();
                                 recover_hash_agg(&output, || {
                                     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -455,7 +455,7 @@ impl<C: Columns + Send + Sync + 'static> HashAggExec<C> {
                         })
                         .collect();
                     for handle in handles {
-                        let _ = handle.join();
+                        let _ = handle.recv();
                     }
                     spill_helper.set_spill_triggered();
                 }
@@ -519,13 +519,13 @@ impl<C: Columns + Send + Sync + 'static> HashAggExec<C> {
                 }
             }
         };
-        std::thread::spawn(fetcher);
+        tidb_goruntime::worker_pool::spawn_lane_detached("hashagg-fetch", fetcher);
 
         let partial_wait_group = WaitGroup::new(partial_workers.len());
         let partial_start = Instant::now();
         for worker in partial_workers {
             let wait_group = Arc::clone(&partial_wait_group);
-            std::thread::spawn(move || {
+            tidb_goruntime::worker_pool::spawn_lane_detached("hashagg-partial", move || {
                 worker.run();
                 wait_group.done();
             });
@@ -536,7 +536,7 @@ impl<C: Columns + Send + Sync + 'static> HashAggExec<C> {
             let wait_group = Arc::clone(&partial_wait_group);
             let mem_tracker = Arc::clone(&self.mem_tracker);
             let stats = self.stats.clone();
-            std::thread::spawn(move || {
+            tidb_goruntime::worker_pool::spawn_lane_detached("hashagg-wait", move || {
                 wait_group.wait();
                 while let Ok(input) = input_ch.try_recv() {
                     mem_tracker.consume(-input.chk.memory_usage());
@@ -552,7 +552,7 @@ impl<C: Columns + Send + Sync + 'static> HashAggExec<C> {
         for worker in final_workers {
             let wait_group = Arc::clone(&final_wait_group);
             let partial_wait_group = Arc::clone(&partial_wait_group);
-            std::thread::spawn(move || {
+            tidb_goruntime::worker_pool::spawn_lane_detached("hashagg-final", move || {
                 // Go: a final worker starts once every partial worker ends.
                 partial_wait_group.wait();
                 worker.run();
@@ -561,7 +561,7 @@ impl<C: Columns + Send + Sync + 'static> HashAggExec<C> {
         }
         if let Some(stats) = self.stats.clone() {
             let wait_group = Arc::clone(&final_wait_group);
-            std::thread::spawn(move || {
+            tidb_goruntime::worker_pool::spawn_lane_detached("hashagg-wait", move || {
                 wait_group.wait();
                 stats.add_final_wall_time(final_start);
             });
