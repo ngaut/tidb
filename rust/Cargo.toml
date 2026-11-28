@@ -601,14 +601,18 @@ debug = false
 debug = false
 opt-level = 2
 
+# A statement's hot path crosses many generic-heavy crates (the client plan
+# pipeline, statement context, executor and session); whole-program LTO over
+# one codegen unit lets the optimiser inline across those boundaries.
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 
 # Benchmarks are rebuilt on every edit while a measurement is in progress, and
-# `tidb-executor` alone is 114k lines: thin LTO with release's single codegen
-# unit costs about four minutes per edit, for cross-crate optimisation that an
-# A/B of the same code shape does not need. Keep release's `opt-level` and let
-# the crate compile in parallel.
+# `tidb-executor` alone is 114k lines: release's fat LTO over one codegen unit
+# re-optimises the whole program on every edit (a clean build takes about half
+# an hour), for cross-crate optimisation that an A/B of the same code shape does
+# not need. Keep release's `opt-level` and let the crate compile in parallel.
 [profile.bench]
 inherits = "release"
 lto = false
