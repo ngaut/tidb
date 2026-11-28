@@ -991,9 +991,12 @@ impl StaticSysVarIndex {
 
 /// The registry's names are unique (the sortedness test rejects duplicates),
 /// so a hash table keyed by the entry's own name answers exactly what the old
-/// binary search answered -- just without the per-probe comparisons.
-fn sys_var_index() -> &'static std::collections::HashMap<&'static str, usize> {
-    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, usize>> =
+/// binary search answered -- just without the per-probe comparisons. Its keys
+/// are the registry's fixed names, so it hashes with foldhash, a fast
+/// non-cryptographic hash like the one Go's `sysVars` map uses; a statement
+/// resolves dozens of names through it.
+fn sys_var_index() -> &'static foldhash::HashMap<&'static str, usize> {
+    static INDEX: std::sync::OnceLock<foldhash::HashMap<&'static str, usize>> =
         std::sync::OnceLock::new();
     INDEX.get_or_init(|| {
         SYS_VARS
